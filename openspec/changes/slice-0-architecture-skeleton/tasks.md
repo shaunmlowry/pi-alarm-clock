@@ -2,8 +2,8 @@
 
 - [x] 1.1 Create the Cargo workspace: a binary crate (`alarm-clock`) and a library crate (`mopidy-client`). Pin a Rust edition and toolchain.
 - [x] 1.2 Add core dependencies: `tokio`, `slint`, `axum`, `rusqlite`, `tracing`, `tracing-subscriber`, `tracing-journald`, `anyhow`, `thiserror`, `serde`, `toml`, `tokio-tungstenite`, `serde_json`. Add the Slint build tooling (`.slint` files or `slint::slint!`).
-- [ ] 1.3 Define the `Config` struct (`db_path`, `mopidy_ws_url`, `axum_bind_addr`, `log_level`, `data_dir`) with `serde` defaults, parse from `config.toml` (path: `/etc/alarm-clock/config.toml` in release, `./config.toml` in dev), and fall back to compiled defaults on missing file/fields.
-- [ ] 1.4 Create a sample `config.toml` committed for dev.
+- [x] 1.3 Define the `Config` struct (`db_path`, `mopidy_ws_url`, `axum_bind_addr`, `log_level`, `data_dir`) with `serde` defaults, parse from `config.toml` (path: `/etc/alarm-clock/config.toml` in release, `./config.toml` in dev), and fall back to compiled defaults on missing file/fields.
+- [x] 1.4 Create a sample `config.toml` committed for dev.
 
 ## 2. Process runtime
 
