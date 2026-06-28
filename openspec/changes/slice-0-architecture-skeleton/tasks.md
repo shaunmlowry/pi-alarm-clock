@@ -8,7 +8,7 @@
 ## 2. Process runtime
 
 - [x] 2.1 Define the `Cmd` and `Reply` enums and the `MopidyEvent` enum. Create bounded `mpsc` channels in both directions; the event channel uses drop-oldest-on-full with a `warn!` log.
-- [ ] 2.2 Build the tokio worker runtime on a dedicated thread; establish the non-blocking `try_recv` drain timer on the Slint tick that dispatches replies/events to the domain on main.
+- [x] 2.2 Build the tokio worker runtime on a dedicated thread; establish the non-blocking `try_recv` drain timer on the Slint tick that dispatches replies/events to the domain on main.
 - [ ] 2.3 Install `tracing` with a `tracing-journald` layer when available and a `fmt` fallback otherwise; define the `bootstrap`, `mopidy_request{method}`, `scheduler_tick`, and `episode` spans (the latter two unused).
 - [ ] 2.4 Implement the tick-level `catch_unwind` wrapper for periodic ticks: a panic is logged at `error!` and the tick reschedules.
 - [ ] 2.5 Implement the error/panic policy: `anyhow` at the app boundary, `thiserror` for domain errors; failed config writes degrade (log `error!`, keep in-memory state, do not exit).

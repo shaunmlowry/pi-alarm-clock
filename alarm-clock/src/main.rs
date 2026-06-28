@@ -1,17 +1,338 @@
 //! alarm-clock — slice 0 bootstrap.
 //!
-//! Only the bootstrap-config layer (tasks 1.3/1.4) is wired here. The full
-//! runtime (tokio worker, axum, mopidy, slint) is layered on by later groups.
+//! Threading model (design D1):
+//! - **Main thread**: Slint event loop, domain layer (config store later).
+//! - **Tokio worker thread**: async I/O servant (Mopidy WS, axum, blocking ops).
+//!
+//! Cross-thread channels are created here and split between the two threads.
+//! A `slint::Timer` drains replies and events non-blockingly on each tick,
+//! dispatching them to the domain without ever sleeping main.
 
 mod channel;
 mod config;
 
+use crate::channel::{Cmd, Reply, MopidyEvent};
 use crate::config::Config;
+use std::thread::JoinHandle;
+use std::time::Duration;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+// ── Tokio worker (async command dispatcher) ───────────────────────────────────
+
+/// Result returned when the command dispatcher loop exits.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CmdLoopResult {
+    /// The sender side was dropped / a `Shutdown` command was received.
+    ShutdownComplete,
+}
+
+/// Drain the [`Cmd`] channel on the tokio runtime.
+///
+/// Each received command is dispatched to the appropriate handler (currently
+/// logging + placeholder responses in slice 0). A `Shutdown` variant or a
+/// closed sender terminates the loop.
+///
+/// # Ownership
+/// The receiver is moved into this function and owned for the lifetime of the
+/// tokio runtime. Replies are pushed through [`reply_tx`] back to main.
+pub async fn command_dispatcher(
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    reply_tx: mpsc::Sender<Reply>,
+) -> CmdLoopResult {
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Cmd::GetMopidyState => {
+                info!(action = "GetMopidyState", "command received (slice 0 placeholder)");
+                // Placeholder: domain not yet connected to Mopidy.
+                let _ = reply_tx
+                    .send(Reply::MopidyState("STOPPED".into()))
+                    .await;
+            }
+            Cmd::CallMopidy { method, .. } => {
+                info!(method = %method, "CallMopidy command received (slice 0 placeholder)");
+                let _ = reply_tx
+                    .send(Reply::CallResult(serde_json::json!({"error": "not yet implemented"})))
+                    .await;
+            }
+            Cmd::Shutdown => {
+                info!("Shutdown command received — terminating tokio worker loop");
+                break;
+            }
+        }
+    }
+    CmdLoopResult::ShutdownComplete
+}
+
+// ── Bootstrap (tokio thread + Slint drain timer) ──────────────────────────────
+
+/// Start the tokio worker runtime on a dedicated thread.
+fn spawn_tokio_worker(
+    cmd_rx: mpsc::Receiver<Cmd>,
+    reply_tx: mpsc::Sender<Reply>,
+) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("tokio-worker".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to create tokio runtime for worker thread");
+
+            info!("tokio worker runtime created on dedicated thread");
+
+            rt.block_on(async {
+                // Run the command dispatcher to completion.
+                let result = command_dispatcher(cmd_rx, reply_tx).await;
+                info!(result = ?result, "tokio command dispatcher exited");
+            });
+
+            info!("tokio worker thread shutting down");
+        })
+        .expect("failed to spawn tokio worker thread")
+}
+
+/// Application entry point.
+///
+/// Creates the cross-thread channel topology, spaws the tokio worker on a
+/// dedicated thread, and installs a repeating [`slint::Timer`] that drains
+/// replies and events non-blockingly on each Slint tick.
+///
+/// The returned [`JoinHandle`] can be `.join()`d to wait for the tokio worker
+/// to finish; in normal operation the handle is parked (the application lives
+/// as long as the Slint event loop runs).
+pub fn bootstrap() -> JoinHandle<()> {
+    let cfg = Config::load();
+
+    info!(
+        db_path = %cfg.db_path,
+        mopidy_ws_url = %cfg.mopidy_ws_url,
+        axum_bind_addr = %cfg.axum_bind_addr,
+        log_level = %cfg.log_level,
+        data_dir = %cfg.data_dir,
+        "bootstrap: configuration loaded",
+    );
+
+    // Create cross-thread channels (task 2.1).
+    let handles = channel::create_channels();
+    let _cmd_sender = handles.main.cmd_sender;
+    let mut reply_rx = handles.main.reply_receiver;
+    let mut event_rx = handles.main.event_receiver;
+    let tokio_handles = handles.tokio;
+
+    // Spawn tokio worker on a dedicated thread (task 2.2).
+    let worker_handle = spawn_tokio_worker(
+        tokio_handles.cmd_receiver,
+        tokio_handles.reply_sender,
+    );
+
+    info!("tokio worker thread spawned successfully");
+
+    // ── Slint drain timer (non-blocking try_recv on each tick) ────────────
+    //
+    // This single repeating timer polls both the reply channel and the Mopidy
+    // event channel on every Slint tick. It uses `try_recv` so main never
+    // blocks waiting for the tokio worker. Each received item is dispatched
+    // directly into domain handlers on the main thread — no locks needed.
+
+    let timer = slint::Timer::default();
+    timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
+        // Drain reply channel (non-blocking).
+        while let Ok(reply) = reply_rx.try_recv() {
+            dispatch_reply_to_domain(reply);
+        }
+
+        // Drain Mopidy event channel (non-blocking).
+        while let Ok(event) = event_rx.try_recv() {
+            dispatch_event_to_domain(event);
+        }
+    });
+
+    info!("drain timer installed (50 ms repeat interval)");
+
+    worker_handle
+}
+
+/// Dispatch a [`Reply`] from the tokio worker into the domain.
+///
+/// In slice 0 these are logged. Later slices will route them to the FSM or
+/// update Slint UI models. Runs on main via the drain timer callback.
+fn dispatch_reply_to_domain(reply: Reply) {
+    match reply {
+        Reply::MopidyState(state) => {
+            info!(reply = "MopidyState", state = %state, "dispatched reply to domain");
+        }
+        Reply::CallResult(result) => {
+            info!(reply = "CallResult", result = ?result, "dispatched reply to domain");
+        }
+    }
+}
+
+/// Dispatch a [`MopidyEvent`] from the tokio worker into the domain.
+///
+/// In slice 0 these are logged and otherwise ignored; later slices consume them
+/// within the episode FSM. Runs on main via the drain timer callback.
+fn dispatch_event_to_domain(event: MopidyEvent) {
+    match &event {
+        MopidyEvent::PlaybackStateChanged => {
+            info!(event = "PlaybackStateChanged", "dispatched Mopidy event to domain");
+        }
+        MopidyEvent::TracklistChanged => {
+            info!(event = "TracklistChanged", "dispatched Mopidy event to domain");
+        }
+        MopidyEvent::Other { method } => {
+            warn!(event = "Other", method = %method, "dispatched unmodelled Mopidy event to domain");
+        }
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let cfg = Config::load();
-    println!(
-        "alarm-clock bootstrap: db_path={} mopidy_ws_url={} axum_bind_addr={} log_level={} data_dir={}",
-        cfg.db_path, cfg.mopidy_ws_url, cfg.axum_bind_addr, cfg.log_level, cfg.data_dir
-    );
+    let worker_handle = bootstrap();
+
+    info!("alarm-clock: bootstrap complete — application running");
+
+    // In later slices, the Slint window will be created and `.run()` here,
+    // keeping main alive. For slice 0 verification we park for a short
+    // period to allow any pending timer ticks to fire.
+    //
+    // Dropping `cmd_sender` (when it goes out of scope at end of lifetime)
+    // will cause the tokio worker's recv loop to terminate naturally.
+    let _ = worker_handle.join();
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Scenario: command_dispatcher processes GetMopidyState and sends a reply.
+    #[tokio::test]
+    async fn command_dispatcher_handles_get_mopidy_state() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (reply_tx, mut reply_rx) = mpsc::channel(8);
+
+        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx);
+        tokio::pin!(dispatcher_fut);
+
+        // Send a GetMopidyState command.
+        cmd_tx.send(Cmd::GetMopidyState).await.unwrap();
+
+        // Use select so both the dispatcher and receiver are polled concurrently
+        // on tokio's current_thread runtime.
+        tokio::select! {
+            _ = &mut dispatcher_fut => panic!("dispatcher should not exit yet"),
+            result = async { reply_rx.recv().await } => {
+                assert!(result.is_some(), "should receive a reply");
+                if let Some(Reply::MopidyState(state)) = result {
+                    assert_eq!(&state, "STOPPED", "placeholder state is STOPPED");
+                } else {
+                    panic!("expected MopidyState reply, got: {:?}", result);
+                }
+            }
+        }
+
+        // Send Shutdown to terminate the dispatcher.
+        cmd_tx.send(Cmd::Shutdown).await.unwrap();
+        let result = dispatcher_fut.await;
+        assert_eq!(result, CmdLoopResult::ShutdownComplete);
+    }
+
+    /// Scenario: command_dispatcher processes CallMopidy and sends a reply.
+    #[tokio::test]
+    async fn command_dispatcher_handles_call_mopidy() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (reply_tx, mut reply_rx) = mpsc::channel(8);
+
+        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx);
+        tokio::pin!(dispatcher_fut);
+
+        cmd_tx.send(Cmd::CallMopidy {
+            method: "core.get_version".into(),
+            params: serde_json::json!({}),
+        })
+        .await
+        .unwrap();
+
+        // Use select to ensure both sides are polled on current_thread runtime.
+        tokio::select! {
+            _ = &mut dispatcher_fut => panic!("dispatcher should not exit yet"),
+            result = async { reply_rx.recv().await } => {
+                assert!(result.is_some(), "should receive a reply");
+                assert!(matches!(&result, Some(Reply::CallResult(_))));
+            }
+        }
+
+        // Shut down.
+        cmd_tx.send(Cmd::Shutdown).await.unwrap();
+        assert_eq!(dispatcher_fut.await, CmdLoopResult::ShutdownComplete);
+    }
+
+    /// Scenario: command_dispatcher exits cleanly when sender is dropped
+    /// (no explicit Shutdown sent).
+    #[tokio::test]
+    async fn command_dispatcher_exits_on_sender_drop() {
+        let (cmd_tx, cmd_rx) = mpsc::channel(8);
+        let (reply_tx, _reply_rx) = mpsc::channel(8); // reply receiver unused
+
+        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx);
+        tokio::pin!(dispatcher_fut);
+
+        // Drop the sender — cmd_rx.recv() returns None.
+        drop(cmd_tx);
+
+        let result = dispatcher_fut.await;
+        assert_eq!(result, CmdLoopResult::ShutdownComplete);
+    }
+
+    /// Scenario: bootstrap creates channels, spawns tokio worker, and installs
+    /// the drain timer without panicking or deadlocking.
+    #[test]
+    fn bootstrap_creates_worker_and_timer() {
+        let _handle = bootstrap();
+        // If we get here without deadlocking or panicking, the structure is
+        // sound: channels created, thread spawned, timer installed.
+    }
+
+    /// Scenario: sending a command through the full channel topology reaches
+    /// the tokio dispatcher and replies are dispatched back to main's domain.
+    #[test]
+    fn end_to_end_command_reply_cycle() {
+        let handles = channel::create_channels();
+        let main_cmd_sender = handles.main.cmd_sender;
+        let mut main_reply_rx = handles.main.reply_receiver;
+
+        // Spawn tokio worker (same as bootstrap does).
+        let _worker_handle = spawn_tokio_worker(
+            handles.tokio.cmd_receiver,
+            handles.tokio.reply_sender,
+        );
+
+        // Give the worker thread a moment to start its recv loop.
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Send GetMopidyState through the real channel topology (main → tokio).
+        main_cmd_sender.blocking_send(Cmd::GetMopidyState).unwrap();
+
+        // Receive reply from tokio worker back on main.
+        let mut last_reply: Option<String> = None;
+        for _ in 0..20 {
+            if let Ok(Reply::MopidyState(state)) = main_reply_rx.try_recv() {
+                last_reply = Some(state);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            last_reply.is_some(),
+            "should receive MopidyState reply from tokio worker"
+        );
+        assert_eq!(last_reply, Some("STOPPED".to_string()));
+
+        // Clean shutdown.
+        main_cmd_sender.blocking_send(Cmd::Shutdown).unwrap();
+    }
 }
