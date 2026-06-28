@@ -1,0 +1,29 @@
+# alarm-clock — development config (task 1.4).
+#
+# This file is parsed by `serde` + `toml` at boot (see `src/config.rs`).
+# In development the resolved path is `./config.toml` (this file, relative to
+# the working directory); in release builds it is
+# `/etc/alarm-clock/config.toml`.
+#
+# Every field is optional: omit a key to fall back to its compiled default.
+# Compiled defaults are shown commented next to each key.
+
+# SQLite database path.
+# default: ./data/alarm-clock.db
+db_path = "./data/alarm-clock.db"
+
+# Mopidy JSON-RPC WebSocket endpoint.
+# default: ws://localhost:6680/mopidy/ws
+mopidy_ws_url = "ws://localhost:6680/mopidy/ws"
+
+# axum HTTP server bind address.
+# default: 127.0.0.1:8080
+axum_bind_addr = "127.0.0.1:8080"
+
+# tracing log level directive.
+# default: info
+log_level = "info"
+
+# Runtime data directory (database, scratch).
+# default: ./data
+data_dir = "./data"
