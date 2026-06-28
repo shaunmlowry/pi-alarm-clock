@@ -163,6 +163,7 @@ dependencies = [
  "mopidy-client",
  "rusqlite",
  "serde",
+ "serde_json",
  "slint",
  "thiserror 2.0.18",
  "tokio",

@@ -3,6 +3,7 @@
 //! Only the bootstrap-config layer (tasks 1.3/1.4) is wired here. The full
 //! runtime (tokio worker, axum, mopidy, slint) is layered on by later groups.
 
+mod channel;
 mod config;
 
 use crate::config::Config;
