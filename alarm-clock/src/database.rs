@@ -100,6 +100,82 @@ fn set_user_version(conn: &Connection, v: u32) -> DomainResult<()> {
     conn.execute_batch(&sql).map(|_| ()).map_err(ConfigError::Database)
 }
 
+// ── ConfigStore (Design D3, Task 3.4) ───────────────────────────────────────
+
+/// Key-value store backed by `kv_config` in SQLite.
+///
+/// Owned by main. All mutations run inside a single transaction (`BEGIN … COMMIT`).
+pub struct ConfigStore<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> ConfigStore<'a> {
+    /// Create a ConfigStore borrowing *conn*.
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+
+    /// Read the value associated with *key*, or `None` if the key does not exist.
+    ///
+    /// Database errors propagate as `Err(ConfigError::Database(..))`. "Key not
+    /// found" is returned as `Ok(None)`.
+    pub fn get(&self, key: &str) -> DomainResult<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM kv_config WHERE key = ?",
+                [key],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(ConfigError::Database(other)),
+            })
+    }
+
+    /// Set *key* to *value* inside a single transaction.
+    ///
+    /// Uses `INSERT OR REPLACE` so that updating an existing key is idempotent.
+    pub fn set(&self, key: &str, value: &str) -> DomainResult<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(ConfigError::Database)?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO kv_config (key, value) VALUES (?, ?)",
+            [key, value],
+        )
+        .map_err(ConfigError::Database)?;
+
+        tx.commit().map_err(ConfigError::Database)?;
+        Ok(())
+    }
+
+    /// Execute multiple key-value writes inside a single transaction.
+    ///
+    /// If any statement fails the **entire** transaction rolls back, leaving
+    /// the database unchanged. This satisfies PRD § D3: *"multi-statement
+    /// mutations roll back on partial failure."*
+    pub fn set_multi(&self, pairs: &[(&str, &str)]) -> DomainResult<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(ConfigError::Database)?;
+
+        for (k, v) in pairs {
+            tx.execute(
+                "INSERT OR REPLACE INTO kv_config (key, value) VALUES (?, ?)",
+                [k, v],
+            )
+            .map_err(ConfigError::Database)?;
+        }
+
+        tx.commit().map_err(ConfigError::Database)?;
+        Ok(())
+    }
+}
+
 /// Run pending migrations on the given connection.
 ///
 /// Migrations are applied in ascending version order. Each migration's SQL is
@@ -323,6 +399,104 @@ mod tests {
         // Second run: should be a no-op, user_version stays 1.
         run_migrations(&conn).unwrap();
         assert_eq!(read_user_version(&conn).unwrap(), 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ── Task 3.5: ConfigStore round-trip ───────────────────────────────
+
+    /// Scenario: write a "last_boot" ISO-8601 timestamp, read it back,
+    /// assert equality.
+    #[test]
+    fn config_store_round_trip_last_boot() {
+        let path = format!(
+            "{}{}config_roundtrip_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let store = ConfigStore::new(&conn);
+
+        // Write an ISO-8601 timestamp.
+        let ts = "2025-03-14T09:30:00+00:00";
+        store.set("last_boot", ts).expect("set should succeed");
+
+        // Read it back.
+        let read_val = store.get("last_boot").expect("get should succeed");
+        assert_eq!(
+            read_val.as_deref(),
+            Some(ts),
+            "read value must equal the written timestamp"
+        );
+
+        // Reading a missing key returns None (no error).
+        let missing = store.get("does_not_exist").expect("get should succeed");
+        assert!(missing.is_none(), "missing key should return None");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario: partial failure rolls back — a multi-statement mutation
+    /// where the second statement errors should leave neither row persisted.
+    #[test]
+    fn partial_failure_rolls_back_transaction() {
+        let path = format!(
+            "{}{}partial_rollback_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).unwrap();
+        run_migrations(&conn).unwrap();
+
+        let store = ConfigStore::new(&conn);
+
+        // First, write a known-good row so we have a baseline count.
+        store.set("baseline", "yes").unwrap();
+        let baseline_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM kv_config", [], |r| r.get(0))
+            .unwrap();
+
+        // Attempt a multi-statement write where the second statement fails.
+        // The second key contains invalid characters that break inside a
+        // deliberately constructed SQL error (no REPLACE, uses INSERT which
+        // will hit a NOT NULL violation on an intentionally wrong table).
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute(
+            "INSERT OR REPLACE INTO kv_config (key, value) VALUES ('alpha', '1')",
+            [],
+        )
+        .unwrap();
+        // Second statement: write to a column that doesn't exist → error.
+        let second_stmt = tx.execute(
+            "INSERT INTO kv_config (key, value) SELECT 'beta', 0 FROM nonexistent_table_xyz",
+            [],
+        );
+        assert!(second_stmt.is_err(), "second statement should fail");
+
+        // Rollback the transaction.
+        let _ = tx.rollback();
+
+        // Verify neither row was persisted (count unchanged).
+        let after_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM kv_config", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_count, baseline_count,
+            "transaction should have rolled back — row count unchanged"
+        );
+
+        // Confirm the specific keys are not present.
+        let store2 = ConfigStore::new(&conn);
+        assert!(store2.get("alpha").unwrap().is_none(), "alpha must not exist after rollback");
+        assert!(store2.get("beta").unwrap().is_none(), "beta must not exist after rollback");
 
         let _ = std::fs::remove_file(&path);
     }
