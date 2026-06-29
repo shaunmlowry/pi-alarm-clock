@@ -1,0 +1,28 @@
+# apply-groups.tsv — slice-1 task groups for apply-loop.sh
+#
+# Format (pipe-delimited, one group per line; lines starting with # are ignored):
+#   num|name|taskids|design_ids|spec_refs|files|verify
+#     taskids, design_ids : comma-separated
+#     spec_refs           : ';' separated 'cap>Requirement name' (name = exact heading text after 'Requirement: ')
+#     files               : ';' separated repo-relative paths (empty = greenfield)
+#     verify              : shell command run from repo root, or MANUAL
+#
+# The script extracts design sections by '### D<n>.' anchor and spec sections
+# by '### Requirement: <name>' anchor — never hand-quoted, always current.
+01|scheduler-tick|1.1,1.2,1.3,1.4|D1|alarm-scheduling>Scheduler tick with recompute;process-runtime>Scheduler tick span active|alarm-clock/src/scheduler.rs;alarm-clock/src/main.rs|cargo test -p alarm-clock
+02|schedule-rrule|2.1,2.2,2.3,2.4,2.5|D2|alarm-scheduling>Schedule next-fire over RRULE with timezone;alarm-scheduling>Schedule presets|alarm-clock/src/schedule.rs;alarm-clock/Cargo.toml|cargo test -p alarm-clock
+03|migration-v2|3.1,3.2|D3|persistence>Migration v2 adds alarms table|alarm-clock/src/database.rs|cargo test -p alarm-clock
+04|alarm-store|3.3,3.4,3.5|D3|persistence>AlarmStore CRUD on main with atomic writes;persistence>next_fire caching recomputed from the rule|alarm-clock/src/alarm_store.rs;alarm-clock/src/database.rs|cargo test -p alarm-clock
+05|mopidy-playback|4.1,4.2|D7|mopidy-playback>Typed playback method surface|mopidy-client/src/methods.rs|cargo test -p mopidy-client
+06|mopidy-tracklist|4.3,4.4,4.5|D7|mopidy-playback>Typed tracklist method surface;mopidy-playback>Method calls fail gracefully when disconnected|mopidy-client/src/methods.rs;alarm-clock/src/error.rs|cargo test -p mopidy-client
+07|episode-fsm|5.1,5.2,5.3,5.4|D4,D5|alarm-episode>Episode FSM with Idle, Firing, Dismissed states;alarm-episode>Mopidy snapshot capture and restore|alarm-clock/src/episode.rs;alarm-clock/src/channel.rs|cargo test -p alarm-clock
+08|episode-control|5.5,5.6,5.7|D4|alarm-episode>Episode FSM with Idle, Firing, Dismissed states|alarm-clock/src/episode.rs|cargo test -p alarm-clock
+09|degradation|6.1,6.2,6.3|D10|alarm-episode>Graceful degradation on source failure without fallback chain|alarm-clock/src/episode.rs|cargo test -p alarm-clock
+10|shutdown-restore|6.4,6.5,6.6|D6|process-runtime>shutdown_restore implemented by episode controller;alarm-episode>Shutdown restores snapshot before exit|alarm-clock/src/episode.rs;alarm-clock/src/main.rs|cargo test -p alarm-clock
+11|alarm-ui|7.1,7.2,7.3,7.4|D8|alarm-episode>Alarm episode UI with tap-anywhere-to-dismiss|alarm-clock/ui.slint;alarm-clock/src/main.rs|cargo check -p alarm-clock
+12|dev-seed|8.1,8.2,8.3|D9|alarm-episode>Dev alarm seeding via TOML|alarm-clock/src/seed.rs;config.toml|cargo test -p alarm-clock
+13|integration|9.1|D1,D4|alarm-episode>Episode FSM with Idle, Firing, Dismissed states;alarm-scheduling>Scheduler tick with recompute|alarm-clock/src/main.rs|cargo check --workspace && cargo test --workspace
+14|e2e-mopidy|9.2,9.3|D5,D10|alarm-episode>Mopidy snapshot capture and restore;alarm-episode>Graceful degradation on source failure without fallback chain|alarm-clock/src/|MANUAL
+15|e2e-shutdown|9.4|D6|alarm-episode>Shutdown restores snapshot before exit|alarm-clock/src/|MANUAL
+16|e2e-dst|9.5|D2|alarm-scheduling>Schedule next-fire over RRULE with timezone|alarm-clock/src/schedule.rs|cargo test -p alarm-clock
+17|pi-acceptance|9.6|D1,D5|process-runtime>Scheduler tick span active;process-runtime>Episode span active during firing|alarm-clock/src/|MANUAL
