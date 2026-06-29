@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Liquid Glass Theme Wireframes</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #0f0c29;
+            background: linear-gradient(to right, #24243e, #302b63, #0f0c29);
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+
+        h1 {
+            color: white;
+            margin-bottom: 30px;
+            font-size: 2rem;
+            text-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .wireframe-container {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .wireframe {
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.1) 0%, rgba(255, 255, 255, 0.05) 100%);
+            backdrop-filter: blur(20px);
+            -webkit-backdrop-filter: blur(20px);
+            border-radius: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+            padding: 30px;
+            width: 400px;
+            height: 713px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .wireframe::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at top left, rgba(255, 255, 255, 0.1), transparent 60%);
+            pointer-events: none;
+        }
+
+        .wireframe h2 {
+            color: #ffffff;
+            font-size: 1.2rem;
+            margin-bottom: 20px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.2);
+            padding-bottom: 10px;
+        }
+
+        /* Clock Face */
+        .clock-face {
+            width: 280px;
+            height: 280px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, rgba(255, 255, 255, 0.15) 0%, rgba(255, 255, 255, 0.08) 100%);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            margin: 0 auto 30px;
+            position: relative;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }
+
+        .clock-face::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 10px;
+            height: 10px;
+            background: rgba(255, 255, 255, 0.8);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 10;
+        }
+
+        .clock-face .hand {
+            position: absolute;
+            bottom: 50%;
+            left: 50%;
+            transform-origin: bottom center;
+            background: rgba(255, 255, 255, 0.9);
+            border-radius: 2px;
+        }
+
+        .clock-face .hour-hand {
+            width: 6px;
+            height: 80px;
+            z-index: 5;
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+        }
+
+        .clock-face .minute-hand {
+            width: 4px;
+            height: 110px;
+            z-index: 4;
+            box-shadow: 0 0 10px rgba(255, 255, 255, 0.5);
+        }
+
+        .clock-face .second-hand {
+            width: 2px;
+            height: 120px;
+            background: rgba(255, 100, 100, 0.8);
+            z-index: 3;
+            box-shadow: 0 0 5px rgba(255, 100, 100, 0.5);
+        }
+
+        /* Clock Labels */
+        .clock-label {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.9);
+            margin-bottom: 15px;
+        }
+
+        .clock-label .date {
+            font-size: 1rem;
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        .clock-label .day {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        /* Weather */
+        .weather-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 15px;
+            margin-bottom: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .weather-icon {
+            font-size: 2rem;
+            text-align: center;
+        }
+
+        .weather-info {
+            flex: 1;
+        }
+
+        .weather-info .temp {
+            font-size: 1.5rem;
+            font-weight: 300;
+            color: white;
+        }
+
+        .weather-info .high {
+            font-size: 0.9rem;
+            color: rgba(255, 255, 255, 0.7);
+        }
+
+        /* Calendar Event */
+        .calendar-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }
+
+        .calendar-card h3 {
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 0.9rem;
+            margin-bottom: 10px;
+        }
+
+        .calendar-event {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: rgba(255, 255, 255, 0.8);
+        }
+
+        .calendar-time {
+            color: rgba(255, 100, 100, 0.9);
+            font-weight: 600;
+        }
+
+        /* Cards in Daily Data & Media */
+        .card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 15px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+        }
+
+        .card h3 {
+            color: rgba(255, 255, 255, 0.9);
+            font-size: 1rem;
+            margin-bottom: 12px;
+        }
+
+        .card p {
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        .card .time {
+            color: rgba(255, 100, 100, 0.8);
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+
+        /* Navigation Dots */
+        .nav-dots {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 20px;
+        }
+
+        .nav-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: rgba(255, 255, 255, 0.3);
+        }
+
+        .nav-dot.active {
+            background: rgba(255, 255, 255, 0.9);
+            width: 20px;
+            border-radius: 4px;
+        }
+
+        /* Panel Tabs */
+        .panel-tabs {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .panel-tab {
+            padding: 8px 20px;
+            border-radius: 20px;
+            color: rgba(255, 255, 255, 0.6);
+            font-size: 0.9rem;
+            transition: all 0.3s;
+        }
+
+        .panel-tab.active {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            backdrop-filter: blur(10px);
+        }
+    </style>
+</head>
+<body>
+    <h1>Liquid Glass Theme Wireframes</h1>
+    
+    <div class="wireframe-container">
+        <!-- Clock Panel -->
+        <div class="wireframe">
+            <h2> Clock Panel </h2>
+            
+            <div class="clock-label">
+                <div class="day">Monday</div>
+                <div class="date">June 30, 2026</div>
+            </div>
+            
+            <div class="clock-face">
+                <div class="hand hour-hand" style="transform: rotate(225deg)"></div>
+                <div class="hand minute-hand" style="transform: rotate(180deg)"></div>
+                <div class="hand second-hand" style="transform: rotate(90deg)"></div>
+            </div>
+            
+            <div class="weather-card">
+                <div class="weather-icon">☀️</div>
+                <div class="weather-info">
+                    <div class="temp">22°C</div>
+                    <div class="high">High: 25°C</div>
+                </div>
+            </div>
+            
+            <div class="calendar-card">
+                <h3>Up Next</h3>
+                <div class="calendar-event">
+                    <span class="calendar-time">08:00</span>
+                    <span>Team Standup</span>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot active"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+            </div>
+        </div>
+
+        <!-- Daily Data Panel -->
+        <div class="wireframe">
+            <div class="panel-tabs">
+                <div class="panel-tab">Clock</div>
+                <div class="panel-tab active">Data</div>
+                <div class="panel-tab">Media</div>
+                <div class="panel-tab">Settings</div>
+            </div>
+            
+            <h2>Daily Data Panel</h2>
+            
+            <div class="card">
+                <h3>Today's Agenda</h3>
+                <div class="calendar-event" style="margin-bottom: 8px; color: rgba(255, 255, 255, 0.5);">
+                    <span class="calendar-time">Past</span>
+                    <span>Morning Jog (30 min)</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span class="calendar-time">08:00</span>
+                    <span>Team Standup</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span class="calendar-time">09:30</span>
+                    <span>Project Review</span>
+                </div>
+                <div class="calendar-event">
+                    <span class="calendar-time">11:00</span>
+                    <span>Client Call</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Weather Tomorrow</h3>
+                <div style="display: flex; justify-content: space-between; margin-top: 10px;">
+                    <span style="color: rgba(255, 255, 255, 0.7);">Tuesday</span>
+                    <span style="color: white;">24°C</span>
+                </div>
+                <div style="color: rgba(255, 255, 255, 0.6); margin-top: 5px;">Partly Cloudy</div>
+            </div>
+            
+            <div class="card">
+                <h3>Current Conditions</h3>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                    <div>
+                        <div style="color: rgba(255, 255, 255, 0.7); font-size: 0.85rem;">Wind</div>
+                        <div style="color: white; font-size: 0.9rem;">12 km/h</div>
+                    </div>
+                    <div>
+                        <div style="color: rgba(255, 255, 255, 0.7); font-size: 0.85rem;">Humidity</div>
+                        <div style="color: white; font-size: 0.9rem;">65%</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot"></div>
+                <div class="nav-dot active"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+            </div>
+        </div>
+
+        <!-- Media Panel -->
+        <div class="wireframe">
+            <div class="panel-tabs">
+                <div class="panel-tab">Clock</div>
+                <div class="panel-tab">Data</div>
+                <div class="panel-tab active">Media</div>
+                <div class="panel-tab">Settings</div>
+            </div>
+            
+            <h2>Media Panel</h2>
+            
+            <div class="card">
+                <h3>Now Playing</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: white; font-size: 0.95rem;">Blinding Lights</span>
+                </div>
+                <div class="calendar-event">
+                    <span>The Weeknd</span>
+                </div>
+            </div>
+            
+            <div style="display: flex; justify-content: center; gap: 20px; margin: 20px 0;">
+                <div style="font-size: 1.5rem; color: rgba(255, 255, 255, 0.8);">⏮</div>
+                <div style="font-size: 2rem; color: white; background: rgba(255, 255, 255, 0.2); padding: 10px 20px; border-radius: 50%;">▶</div>
+                <div style="font-size: 1.5rem; color: rgba(255, 255, 255, 0.8);">⏭</div>
+            </div>
+            
+            <div class="card">
+                <h3>Favorites</h3>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span style="color: rgba(255, 255, 255, 0.8);">CKUA Radio</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span style="color: rgba(255, 255, 255, 0.8);">CBC Radio 1</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span style="color: rgba(255, 255, 255, 0.8);">Spotify Jazz</span>
+                </div>
+                <div class="calendar-event">
+                    <span style="color: rgba(255, 255, 255, 0.8);">Local Files</span>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot active"></div>
+                <div class="nav-dot"></div>
+            </div>
+        </div>
+
+        <!-- Settings Panel -->
+        <div class="wireframe">
+            <div class="panel-tabs">
+                <div class="panel-tab">Clock</div>
+                <div class="panel-tab">Data</div>
+                <div class="panel-tab">Media</div>
+                <div class="panel-tab active">Settings</div>
+            </div>
+            
+            <h2>Settings Panel</h2>
+            
+            <div class="card">
+                <h3>Theme</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: rgba(255, 255, 255, 0.9);">Active Theme</span>
+                    <span style="color: white;">Liquid Glass</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: rgba(255, 255, 255, 0.9);">Mode</span>
+                    <span style="color: white;">Follow Bedtime</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Alarms</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: rgba(255, 255, 255, 0.9);">Active Alarms</span>
+                    <span style="color: white;">3</span>
+                </div>
+                <div class="calendar-event">
+                    <span style="color: rgba(255, 255, 255, 0.9);">Next Alarm</span>
+                    <span style="color: white;">07:30 AM</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Display</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: rgba(255, 255, 255, 0.9);">Brightness</span>
+                    <span style="color: white;">Auto (75%)</span>
+                </div>
+                <div class="calendar-event">
+                    <span style="color: rgba(255, 255, 255, 0.9);">Bedtime</span>
+                    <span style="color: white;">10:00 PM - 6:00 AM</span>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot active"></div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

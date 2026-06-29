@@ -41,6 +41,22 @@ fn migrations() -> &'static [Migration] {
                 );
             ",
         },
+        Migration {
+            version: 2,
+            sql: "
+                CREATE TABLE IF NOT EXISTS alarms (
+                    id              INTEGER PRIMARY KEY,
+                    enabled         INTEGER NOT NULL DEFAULT 1,
+                    name            TEXT NOT NULL,
+                    preset          TEXT NOT NULL,
+                    time_local      TEXT NOT NULL,
+                    timezone        TEXT NOT NULL,
+                    source_uri      TEXT NOT NULL,
+                    max_volume      INTEGER NOT NULL,
+                    next_fire       TEXT
+                );
+            ",
+        },
     ]
 }
 
@@ -268,8 +284,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Scenario: Fresh database migrates to v1 — schema_meta and kv_config
-    /// tables exist, user_version is 1.
+    /// Scenario: Fresh database migrates to the latest version — schema_meta
+    /// and kv_config tables exist, user_version is the highest known migration.
     #[test]
     fn fresh_database_migrates_to_v1() {
         let path = format!(
@@ -287,8 +303,9 @@ mod tests {
 
         run_migrations(&conn).expect("migrations should succeed");
 
-        // After migration user_version == 1.
-        assert_eq!(read_user_version(&conn).unwrap(), 1);
+        // After migration user_version is the latest known migration version.
+        let latest = migrations().last().unwrap().version;
+        assert_eq!(read_user_version(&conn).unwrap(), latest);
 
         // schema_meta table exists.
         let has_schema_meta: bool = conn.query_row(
@@ -323,14 +340,15 @@ mod tests {
 
         let conn = open_connection(&path).expect("open connection");
 
-        // Manually set user_version to 1 (simulate prior migration).
-        set_user_version(&conn, 1).unwrap();
+        // Manually set user_version to the latest (simulate a fully-migrated DB).
+        let latest = migrations().last().unwrap().version;
+        set_user_version(&conn, latest).unwrap();
 
         // Running migrations should succeed but apply nothing.
         run_migrations(&conn).expect("should succeed even with no pending work");
 
-        // user_version remains 1.
-        assert_eq!(read_user_version(&conn).unwrap(), 1);
+        // user_version remains at the latest.
+        assert_eq!(read_user_version(&conn).unwrap(), latest);
 
         let _ = std::fs::remove_file(&path);
     }
@@ -392,13 +410,15 @@ mod tests {
 
         let conn = open_connection(&path).unwrap();
 
-        // First run: applies v1.
-        run_migrations(&conn).unwrap();
-        assert_eq!(read_user_version(&conn).unwrap(), 1);
+        let latest = migrations().last().unwrap().version;
 
-        // Second run: should be a no-op, user_version stays 1.
+        // First run: applies all pending migrations.
         run_migrations(&conn).unwrap();
-        assert_eq!(read_user_version(&conn).unwrap(), 1);
+        assert_eq!(read_user_version(&conn).unwrap(), latest);
+
+        // Second run: should be a no-op, user_version stays at the latest.
+        run_migrations(&conn).unwrap();
+        assert_eq!(read_user_version(&conn).unwrap(), latest);
 
         let _ = std::fs::remove_file(&path);
     }

@@ -12,12 +12,15 @@ mod channel;
 mod config;
 mod database;
 mod error;
+mod schedule;
+mod scheduler;
 
 use crate::channel::{Cmd, Reply, MopidyEvent};
 use mopidy_client::state::MopidyConnectionState;
 use tokio::sync::mpsc as tokio_mpsc;
 use crate::config::Config;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal as unix_signal};
@@ -44,12 +47,6 @@ fn init_tracing() {
                 .init();
         }
     }
-}
-
-/// Placeholder: `scheduler_tick` span (defined for later slices, currently unused).
-#[allow(dead_code)]
-fn _create_scheduler_tick_span() -> tracing::Span {
-    tracing::info_span!("scheduler_tick")
 }
 
 /// Placeholder: `episode` span (defined for later slices, currently unused).
@@ -122,6 +119,14 @@ pub async fn command_dispatcher(
                         info!("Shutdown command received — terminating tokio worker loop");
                         break;
                     }
+                    Cmd::FireAlarm { alarm_id } => {
+                        // Slice-1 placeholder: alarm firing is driven by the
+                        // scheduler/episode FSM on main (task 1.1). The real
+                        // handling of a FireAlarm command belongs to a later
+                        // task group; this arm exists so the match stays
+                        // exhaustive.
+                        info!(alarm_id, "FireAlarm command received (slice 1 placeholder)");
+                    }
                 }
             }
 
@@ -134,10 +139,17 @@ pub async fn command_dispatcher(
 // ── Bootstrap (tokio thread + Slint drain timer) ──────────────────────────────
 
 /// Start the tokio worker runtime on a dedicated thread.
+///
+/// The Mopidy WS client and its connection-state-forwarding task are spawned
+/// *inside* the worker runtime (via `block_on`) — `MopidyWsClient::spawn`
+/// calls `tokio::spawn`, which requires an active runtime context, so it must
+/// run on the worker thread, not on main.
 fn spawn_tokio_worker(
     cmd_rx: mpsc::Receiver<Cmd>,
     reply_tx: mpsc::Sender<Reply>,
-    state_rx: tokio_mpsc::Receiver<MopidyConnectionState>,
+    mopidy_ws_url: String,
+    mopidy_event_tx: tokio_mpsc::Sender<mopidy_client::MopidyEvent>,
+    mopidy_reply_tx: tokio_mpsc::Sender<mopidy_client::transport::JsonRpcMessage>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("tokio-worker".into())
@@ -149,20 +161,34 @@ fn spawn_tokio_worker(
 
             info!("tokio worker runtime created on dedicated thread");
 
-            // Task 4.3: Mopidy client state forwarding — spawn a background task
-            // that reads MopidyConnectionState transitions and forwards them
-            // through the Reply channel as Reply::MopidyConnectionState.
-            let mut state_rx_local = state_rx;
-            let reply_tx_forward = reply_tx.clone();
-            tokio::spawn(async move {{
-                while let Some(state) = state_rx_local.recv().await {{
-                    let _ = reply_tx_forward
-                        .send(Reply::MopidyConnectionState(state))
-                        .await;
-                }}
-            }});
+            rt.block_on(async move {{
+                // ── Mopidy WS client (runs on the worker runtime) ────────────
+                //
+                // `MopidyWsClient::spawn` calls `tokio::spawn` internally, so it
+                // must run inside a runtime context — hence here, inside
+                // `block_on`, rather than on main.
+                let (mopidy_state_tx, mut mopidy_state_rx) =
+                    tokio_mpsc::channel::<MopidyConnectionState>(16);
+                let _mopidy_client = mopidy_client::transport::MopidyWsClient::spawn(
+                    mopidy_ws_url,
+                    None, // use default backoff policy
+                    mopidy_event_tx,
+                    mopidy_reply_tx,
+                    mopidy_state_tx,
+                );
 
-            rt.block_on(async {{
+                // Task 4.3: Mopidy client state forwarding — spawn a background
+                // task that reads MopidyConnectionState transitions and forwards
+                // them through the Reply channel as Reply::MopidyConnectionState.
+                let reply_tx_forward = reply_tx.clone();
+                tokio::spawn(async move {{
+                    while let Some(state) = mopidy_state_rx.recv().await {{
+                        let _ = reply_tx_forward
+                            .send(Reply::MopidyConnectionState(state))
+                            .await;
+                    }}
+                }});
+
                 // Run the command dispatcher to completion.
                 let result = command_dispatcher(cmd_rx, reply_tx).await;
                 info!(result = ?result, "tokio command dispatcher exited");
@@ -201,28 +227,24 @@ pub fn bootstrap() -> JoinHandle<()> {
     let mut event_rx = handles.main.event_receiver;
     let tokio_handles = handles.tokio;
 
-    // ── Mopidy client with connection-state channel (task 4.3) ──────────────
-    let (mopidy_state_tx, mopidy_state_rx) = tokio_mpsc::channel::<MopidyConnectionState>(16);
-    
-    // Mopidy event channel: typed MopidyEvent from the WS read loop.
-    // In slice 0 these are logged; later slices consume them in the episode FSM.
-    // Mopidy reply channel for typed-call responses (task 4.5).
-    let (mopidy_event_tx, _mopidy_event_rx) = tokio_mpsc::channel::<mopidy_client::MopidyEvent>(16);
-    let (mopidy_reply_tx, _mopidy_reply_rx) = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
-    
-    let _mopidy_client = mopidy_client::transport::MopidyWsClient::spawn(
-        cfg.mopidy_ws_url.clone(),
-        None, // use default backoff policy
-        mopidy_event_tx,
-        mopidy_reply_tx,
-        mopidy_state_tx,
-    );
+    // ── Mopidy client channels (task 4.3 / 4.5) ────────────────────────
+    //
+    // The WS client itself is spawned *inside* the tokio worker runtime (see
+    // `spawn_tokio_worker`) because `MopidyWsClient::spawn` calls
+    // `tokio::spawn`.  These senders are handed to the worker; the receiver
+    // ends are retained on main for later slices (slice 0 only logs).
+    let (mopidy_event_tx, _mopidy_event_rx) =
+        tokio_mpsc::channel::<mopidy_client::MopidyEvent>(16);
+    let (mopidy_reply_tx, _mopidy_reply_rx) =
+        tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
 
     // Spawn tokio worker on a dedicated thread (task 2.2).
     let worker_handle = spawn_tokio_worker(
         tokio_handles.cmd_receiver,
         tokio_handles.reply_sender,
-        mopidy_state_rx,
+        cfg.mopidy_ws_url.clone(),
+        mopidy_event_tx,
+        mopidy_reply_tx,
     );
 
     info!("tokio worker thread spawned successfully");
@@ -271,6 +293,46 @@ pub fn bootstrap() -> JoinHandle<()> {
     });
 
     info!("drain timer installed (50 ms repeat interval)");
+
+    // ── Scheduler tick timer (slice 1, task 1.1) ────────────────────────────
+    //
+    // A repeating `slint::Timer` at the default 5 s interval drives the
+    // alarm scheduler. Each tick re-reads `Local::now()`, asks the alarm
+    // source for due alarms, enters the `scheduler_tick` span, and fires the
+    // episode FSM for each due alarm (recomputing next_fire afterwards). See
+    // design D1 and `scheduler.rs`.
+    //
+    // Until the real `AlarmStore` (group 3) and `EpisodeController` (group 5)
+    // are wired in by group 9.1, the scheduler runs over no-op seam impls —
+    // the tick machinery and span are exercised, but no real alarms fire yet.
+    let scheduler_state = Mutex::new(scheduler::Scheduler::new(
+        scheduler::NoopAlarmSource,
+        scheduler::NoopEpisodeFsm,
+        scheduler::LocalClock,
+    ));
+    let scheduler_timer = slint::Timer::default();
+    scheduler_timer.start(
+        slint::TimerMode::Repeated,
+        scheduler::DEFAULT_TICK_INTERVAL,
+        move || {
+            // Design D6: isolate the tick body so a bug never sinks the alarm
+            // guarantee; the timer reschedules on its next interval.
+            protected_tick(|| {
+                if let Ok(mut state) = scheduler_state.lock() {
+                    state.tick();
+                }
+            });
+        },
+    );
+    info!(
+        interval_secs = scheduler::DEFAULT_TICK_INTERVAL.as_secs(),
+        "scheduler timer installed",
+    );
+
+    // Keep the scheduler timer alive for the bootstrap scope (same lifetime
+    // model as the drain timer above; group 9.1 will host both across the
+    // Slint event loop).
+    let _scheduler_timer = scheduler_timer;
 
     worker_handle
 }
@@ -547,13 +609,19 @@ mod tests {
         let main_cmd_sender = handles.main.cmd_sender;
         let mut main_reply_rx = handles.main.reply_receiver;
 
-        // Spawn tokio worker (same as bootstrap does).
-        // Provide a state_rx for spawn_tokio_worker (task 4.3).
-        let (_test_state_tx, test_state_rx) = tokio_mpsc::channel::<MopidyConnectionState>(16);
+        // Spawn tokio worker (same as bootstrap does). The Mopidy WS client is
+        // spawned inside the worker runtime; provide dummy Mopidy event/reply
+        // channels (unused in this test) and a placeholder WS URL.
+        let (test_event_tx, _test_event_rx) =
+            tokio_mpsc::channel::<mopidy_client::MopidyEvent>(16);
+        let (test_reply_tx, _test_reply_rx) =
+            tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
         let _worker_handle = spawn_tokio_worker(
             handles.tokio.cmd_receiver,
             handles.tokio.reply_sender,
-            test_state_rx,
+            "ws://127.0.0.1:6680/mopidy/ws".to_string(),
+            test_event_tx,
+            test_reply_tx,
         );
 
         // Give the worker thread a moment to start its recv loop.

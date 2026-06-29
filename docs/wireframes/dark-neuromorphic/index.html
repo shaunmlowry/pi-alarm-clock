@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dark Neuromorphic Theme Wireframes</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background: #1a1a1a;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 20px;
+        }
+
+        h1 {
+            color: #ffffff;
+            margin-bottom: 30px;
+            font-size: 2rem;
+        }
+
+        .wireframe-container {
+            display: flex;
+            gap: 20px;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+
+        .wireframe {
+            background: #1a1a1a;
+            padding: 30px;
+            width: 400px;
+            height: 713px;
+            position: relative;
+            /* Dark Neuromorphic styling */
+            box-shadow: 
+                9px 9px 16px rgba(50, 50, 50, 0.5),
+                -9px -9px 16px rgba(40, 40, 40, 0.8);
+            border-radius: 30px;
+        }
+
+        .wireframe h2 {
+            color: #ffffff;
+            font-size: 1.2rem;
+            margin-bottom: 20px;
+            border-bottom: 1px solid #3a3a3a;
+            padding-bottom: 10px;
+            letter-spacing: 1px;
+        }
+
+        /* Clock Face */
+        .clock-face {
+            width: 280px;
+            height: 280px;
+            border-radius: 50%;
+            margin: 0 auto 30px;
+            position: relative;
+            background: #1a1a1a;
+            box-shadow: 
+                inset 5px 5px 10px rgba(50, 50, 50, 0.5),
+                inset -5px -5px 10px rgba(40, 40, 40, 0.8);
+        }
+
+        .clock-face::after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 12px;
+            height: 12px;
+            background: #ffffff;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 10;
+            box-shadow: 
+                2px 2px 5px rgba(50, 50, 50, 0.5),
+                -2px -2px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        .clock-face .hand {
+            position: absolute;
+            bottom: 50%;
+            left: 50%;
+            transform-origin: bottom center;
+            border-radius: 2px;
+        }
+
+        .clock-face .hour-hand {
+            width: 8px;
+            height: 80px;
+            z-index: 5;
+            background: #ffffff;
+            box-shadow: 
+                2px 2px 5px rgba(50, 50, 50, 0.5),
+                -2px -2px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        .clock-face .minute-hand {
+            width: 6px;
+            height: 110px;
+            z-index: 4;
+            background: #ffffff;
+            box-shadow: 
+                2px 2px 5px rgba(50, 50, 50, 0.5),
+                -2px -2px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        .clock-face .second-hand {
+            width: 3px;
+            height: 120px;
+            background: #ff6b6b;
+            z-index: 3;
+            box-shadow: 
+                2px 2px 5px rgba(50, 50, 50, 0.5),
+                -2px -2px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        /* Clock Labels */
+        .clock-label {
+            text-align: center;
+            color: #ffffff;
+            margin-bottom: 15px;
+        }
+
+        .clock-label .date {
+            font-size: 1rem;
+            color: #a0a0a0;
+        }
+
+        .clock-label .day {
+            font-size: 1.1rem;
+            font-weight: 600;
+        }
+
+        /* Weather */
+        .weather-card {
+            background: #1a1a1a;
+            border-radius: 15px;
+            padding: 15px;
+            margin-bottom: 20px;
+            box-shadow: 
+                5px 5px 10px rgba(50, 50, 50, 0.5),
+                -5px -5px 10px rgba(40, 40, 40, 0.8);
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .weather-icon {
+            font-size: 2rem;
+            text-align: center;
+            color: #ffffff;
+        }
+
+        .weather-info {
+            flex: 1;
+        }
+
+        .weather-info .temp {
+            font-size: 1.5rem;
+            font-weight: 300;
+            color: #ffffff;
+        }
+
+        .weather-info .high {
+            font-size: 0.9rem;
+            color: #a0a0a0;
+        }
+
+        /* Calendar Event */
+        .calendar-card {
+            background: #1a1a1a;
+            border-radius: 15px;
+            padding: 15px;
+            box-shadow: 
+                5px 5px 10px rgba(50, 50, 50, 0.5),
+                -5px -5px 10px rgba(40, 40, 40, 0.8);
+        }
+
+        .calendar-card h3 {
+            color: #ffffff;
+            font-size: 0.9rem;
+            margin-bottom: 10px;
+            letter-spacing: 0.5px;
+        }
+
+        .calendar-event {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #ffffff;
+        }
+
+        .calendar-time {
+            color: #ff6b6b;
+            font-weight: 600;
+        }
+
+        /* Cards in Daily Data & Media */
+        .card {
+            background: #1a1a1a;
+            border-radius: 15px;
+            padding: 15px;
+            margin-bottom: 15px;
+            box-shadow: 
+                5px 5px 10px rgba(50, 50, 50, 0.5),
+                -5px -5px 10px rgba(40, 40, 40, 0.8);
+        }
+
+        .card h3 {
+            color: #ffffff;
+            font-size: 1rem;
+            margin-bottom: 12px;
+            letter-spacing: 0.5px;
+        }
+
+        .card p {
+            color: #a0a0a0;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        .card .time {
+            color: #ff6b6b;
+            font-weight: 600;
+            font-size: 0.85rem;
+        }
+
+        /* Navigation Dots */
+        .nav-dots {
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+            margin-top: 20px;
+        }
+
+        .nav-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #3a3a3a;
+            box-shadow: 
+                2px 2px 5px rgba(50, 50, 50, 0.5),
+                -2px -2px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        .nav-dot.active {
+            background: #ffffff;
+            width: 20px;
+            border-radius: 4px;
+            box-shadow: 
+                2px 2px 5px rgba(50, 50, 50, 0.5),
+                -2px -2px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        /* Panel Tabs */
+        .panel-tabs {
+            display: flex;
+            justify-content: center;
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .panel-tab {
+            padding: 8px 20px;
+            border-radius: 20px;
+            color: #a0a0a0;
+            font-size: 0.9rem;
+            transition: all 0.3s;
+            background: #1a1a1a;
+            box-shadow: 
+                3px 3px 5px rgba(50, 50, 50, 0.5),
+                -3px -3px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        .panel-tab.active {
+            background: #ffffff;
+            color: black;
+            box-shadow: inset 3px 3px 5px rgba(50, 50, 50, 0.5),
+                        inset -3px -3px 5px rgba(40, 40, 40, 0.8);
+        }
+
+        /* Button Styles */
+        .neumorphic-button {
+            background: #1a1a1a;
+            border-radius: 50%;
+            padding: 15px 25px;
+            cursor: pointer;
+            box-shadow: 
+                5px 5px 10px rgba(50, 50, 50, 0.5),
+                -5px -5px 10px rgba(40, 40, 40, 0.8);
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .neumorphic-button:active {
+            box-shadow: inset 5px 5px 10px rgba(50, 50, 50, 0.5),
+                        inset -5px -5px 10px rgba(40, 40, 40, 0.8);
+        }
+
+        /* Snooze Button */
+        .snooze-container {
+            display: flex;
+            justify-content: center;
+            margin-top: 30px;
+        }
+    </style>
+</head>
+<body>
+    <h1>Dark Neuromorphic Theme Wireframes</h1>
+    
+    <div class="wireframe-container">
+        <!-- Clock Panel -->
+        <div class="wireframe">
+            <h2> Clock Panel </h2>
+            
+            <div class="clock-label">
+                <div class="day">Monday</div>
+                <div class="date">June 30, 2026</div>
+            </div>
+            
+            <div class="clock-face">
+                <div class="hand hour-hand" style="transform: rotate(225deg)"></div>
+                <div class="hand minute-hand" style="transform: rotate(180deg)"></div>
+                <div class="hand second-hand" style="transform: rotate(90deg)"></div>
+            </div>
+            
+            <div class="weather-card">
+                <div class="weather-icon">☀️</div>
+                <div class="weather-info">
+                    <div class="temp">22°C</div>
+                    <div class="high">High: 25°C</div>
+                </div>
+            </div>
+            
+            <div class="calendar-card">
+                <h3>Up Next</h3>
+                <div class="calendar-event">
+                    <span class="calendar-time">08:00</span>
+                    <span>Team Standup</span>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot active"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+            </div>
+        </div>
+
+        <!-- Daily Data Panel -->
+        <div class="wireframe">
+            <div class="panel-tabs">
+                <div class="panel-tab">Clock</div>
+                <div class="panel-tab active">Data</div>
+                <div class="panel-tab">Media</div>
+                <div class="panel-tab">Settings</div>
+            </div>
+            
+            <h2>Daily Data Panel</h2>
+            
+            <div class="card">
+                <h3>Today's Agenda</h3>
+                <div class="calendar-event" style="margin-bottom: 8px; color: #8a8a8a;">
+                    <span class="calendar-time">Past</span>
+                    <span>Morning Jog (30 min)</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span class="calendar-time">08:00</span>
+                    <span>Team Standup</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span class="calendar-time">09:30</span>
+                    <span>Project Review</span>
+                </div>
+                <div class="calendar-event">
+                    <span class="calendar-time">11:00</span>
+                    <span>Client Call</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Weather Tomorrow</h3>
+                <div style="display: flex; justify-content: space-between; margin-top: 10px;">
+                    <span style="color: #a0a0a0;">Tuesday</span>
+                    <span style="color: #ffffff;">24°C</span>
+                </div>
+                <div style="color: #a0a0a0; margin-top: 5px;">Partly Cloudy</div>
+            </div>
+            
+            <div class="card">
+                <h3>Current Conditions</h3>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+                    <div>
+                        <div style="color: #a0a0a0; font-size: 0.85rem;">Wind</div>
+                        <div style="color: #ffffff; font-size: 0.9rem;">12 km/h</div>
+                    </div>
+                    <div>
+                        <div style="color: #a0a0a0; font-size: 0.85rem;">Humidity</div>
+                        <div style="color: #ffffff; font-size: 0.9rem;">65%</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot"></div>
+                <div class="nav-dot active"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+            </div>
+        </div>
+
+        <!-- Media Panel -->
+        <div class="wireframe">
+            <div class="panel-tabs">
+                <div class="panel-tab">Clock</div>
+                <div class="panel-tab">Data</div>
+                <div class="panel-tab active">Media</div>
+                <div class="panel-tab">Settings</div>
+            </div>
+            
+            <h2>Media Panel</h2>
+            
+            <div class="card">
+                <h3>Now Playing</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: #ffffff; font-size: 0.95rem;">Blinding Lights</span>
+                </div>
+                <div class="calendar-event">
+                    <span>The Weeknd</span>
+                </div>
+            </div>
+            
+            <div style="display: flex; justify-content: center; gap: 20px; margin: 20px 0;">
+                <div class="neumorphic-button" style="font-size: 1.5rem;">⏮</div>
+                <div class="neumorphic-button" style="font-size: 2rem;">▶</div>
+                <div class="neumorphic-button" style="font-size: 1.5rem;">⏭</div>
+            </div>
+            
+            <div class="card">
+                <h3>Favorites</h3>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span style="color: #ffffff;">CKUA Radio</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span style="color: #ffffff;">CBC Radio 1</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 8px;">
+                    <span style="color: #ffffff;">Spotify Jazz</span>
+                </div>
+                <div class="calendar-event">
+                    <span style="color: #ffffff;">Local Files</span>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot active"></div>
+                <div class="nav-dot"></div>
+            </div>
+        </div>
+
+        <!-- Settings Panel -->
+        <div class="wireframe">
+            <div class="panel-tabs">
+                <div class="panel-tab">Clock</div>
+                <div class="panel-tab">Data</div>
+                <div class="panel-tab">Media</div>
+                <div class="panel-tab active">Settings</div>
+            </div>
+            
+            <h2>Settings Panel</h2>
+            
+            <div class="card">
+                <h3>Theme</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: #ffffff;">Active Theme</span>
+                    <span style="color: #ffffff; font-weight: 600;">Dark Neuromorphic</span>
+                </div>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: #ffffff;">Mode</span>
+                    <span style="color: #ffffff; font-weight: 600;">Follow Bedtime</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Alarms</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: #ffffff;">Active Alarms</span>
+                    <span style="color: #ffffff; font-weight: 600;">3</span>
+                </div>
+                <div class="calendar-event">
+                    <span style="color: #ffffff;">Next Alarm</span>
+                    <span style="color: #ffffff; font-weight: 600;">07:30 AM</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>Display</h3>
+                <div class="calendar-event" style="margin-bottom: 5px;">
+                    <span style="color: #ffffff;">Brightness</span>
+                    <span style="color: #ffffff; font-weight: 600;">Auto (50%)</span>
+                </div>
+                <div class="calendar-event">
+                    <span style="color: #ffffff;">Bedtime</span>
+                    <span style="color: #ffffff; font-weight: 600;">10:00 PM - 6:00 AM</span>
+                </div>
+            </div>
+            
+            <div class="nav-dots">
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot"></div>
+                <div class="nav-dot active"></div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

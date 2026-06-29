@@ -270,13 +270,14 @@ $task_lines
 ACCEPTANCE CRITERIA (spec scenarios — check the code actually satisfies these):
 ${spec_text:-(none for this group)}
 
-EXPECTED TOUCHED FILES (the diff should be limited to these plus $TASKS):
+EXPECTED TOUCHED FILES (these are the primary files expected for this group, but adjacent changes may occur):
 $(files_block "$files")
 
 CHECKS TO PERFORM:
-1. Run \`git diff --stat\` AND \`git status --short\` at the repo root. Confirm changes are limited to the expected files plus $TASKS. Unrelated files = scope violation.
+1. Run \`git diff --stat\` AND \`git status --short\` at the repo root. Note any files outside the expected set — these may be adjacent changes or preparatory work for future groups.
 2. Read $TASKS and confirm the checkboxes for this group's task ids are "- [x]".
 3. Skim the diff for: obvious bugs, missing error handling, deviations from the SPEC scenarios above, code that doesn't actually satisfy a scenario's THEN clause.
+4. Flag any unexpected changes that suggest work from other task groups has been accidentally included (e.g., unchecked tasks in tasks.md).
 
 OUTPUT:
 End your response with EXACTLY one final line:
@@ -284,7 +285,7 @@ End your response with EXACTLY one final line:
 or
     VERDICT: FAIL
 Precede it with a one-line reason. Example: "All checks passed. VERDICT: PASS"
-If scope is violated, a checkbox is still [ ], or a spec scenario is not actually satisfied by the code, you MUST output VERDICT: FAIL.
+Only output VERDICT: FAIL if the group's own tasks are not complete, spec scenarios are not satisfied, or there are obvious bugs.
 EOF
 }
 

@@ -7,11 +7,11 @@
 
 ## 2. Schedule & next-fire computation
 
-- [ ] 2.1 Add dependencies `rrule`, `chrono-tz`, and make `chrono` explicit in `alarm-clock/Cargo.toml`.
-- [ ] 2.2 Implement the `Schedule` struct wrapping an `rrule` + `time_local` + `timezone`, with `next_fire(after: DateTime<Tz>) -> Option<DateTime<Tz>>` evaluating in the alarm's stored IANA timezone.
-- [ ] 2.3 Implement the preset → RRULE mapping: `Once` (no rrule), `Daily` (`FREQ=DAILY`), `Weekdays` (`FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR`), `Weekends` (`FREQ=WEEKLY;BYDAY=SA,SU`), `Specific-days` (`FREQ=WEEKLY;BYDAY=<selected>`). Accept (parse) complex RRULE but do not construct it.
-- [ ] 2.4 Unit-test `next_fire` across a DST spring-forward and fall-back boundary (daily alarm fires at the same wall-clock time on both sides).
-- [ ] 2.5 Unit-test a `Once` alarm returns its `once_at` time then `None`; a `Weekdays` alarm skips Sat/Sun.
+- [x] 2.1 Add dependencies `rrule`, `chrono-tz`, and make `chrono` explicit in `alarm-clock/Cargo.toml`.
+- [x] 2.2 Implement the `Schedule` struct wrapping an `rrule` + `time_local` + `timezone`, with `next_fire(after: DateTime<Tz>) -> Option<DateTime<Tz>>` evaluating in the alarm's stored IANA timezone.
+- [x] 2.3 Implement the preset → RRULE mapping: `Once` (no rrule), `Daily` (`FREQ=DAILY`), `Weekdays` (`FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR`), `Weekends` (`FREQ=WEEKLY;BYDAY=SA,SU`), `Specific-days` (`FREQ=WEEKLY;BYDAY=<selected>`). Accept (parse) complex RRULE but do not construct it.
+- [x] 2.4 Unit-test `next_fire` across a DST spring-forward and fall-back boundary (daily alarm fires at the same wall-clock time on both sides).
+- [x] 2.5 Unit-test a `Once` alarm returns its `once_at` time then `None`; a `Weekdays` alarm skips Sat/Sun.
 
 ## 3. Alarm data model & persistence
 

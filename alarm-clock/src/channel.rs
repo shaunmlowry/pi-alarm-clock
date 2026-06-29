@@ -39,6 +39,9 @@ pub enum Cmd {
 
     /// Instruct the tokio worker to shut down gracefully.
     Shutdown,
+
+    /// Fire an alarm by ID (for alarm scheduling in slice 1).
+    FireAlarm { alarm_id: i64 },
 }
 
 /// Replies sent from the tokio worker back to main.
