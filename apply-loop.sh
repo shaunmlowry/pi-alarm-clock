@@ -34,7 +34,7 @@ TASKS="$CHANGE/tasks.md"
 APPLYDIR="$CHANGE/.apply"
 PROMPTDIR="$APPLYDIR/prompts"
 LOGDIR="$APPLYDIR/logs"
-PI_MODEL="qwen3.6-64k"
+PI_MODEL=${PI_MODEL:-"z-ai/glm-5.2"}
 MAX_ITER=5
 mkdir -p "$PROMPTDIR" "$LOGDIR"
 

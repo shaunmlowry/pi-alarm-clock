@@ -34,14 +34,14 @@
 
 ## 5. UI shell
 
-- [ ] 5.1 Create the Slint application (`.slint` file) in vertical 9:16 orientation, touch-only, no text input, no scrolling; run the Slint event loop on main.
-- [ ] 5.2 Implement the horizontal panel navigation container with hard stops at both ends (no wraparound); ship exactly one panel.
-- [ ] 5.3 Ensure vertical gestures on the Clock panel are not consumed by navigation (reserved for the future quick-controls overlay).
-- [ ] 5.4 Implement the Clock panel rendering a placeholder clock face; expose theme-relevant properties (`clock_color`, `font_family`) fed by hardcoded values as the theme seam.
+- [x] 5.1 Create the Slint application (`.slint` file) in vertical 9:16 orientation, touch-only, no text input, no scrolling; run the Slint event loop on main.
+- [x] 5.2 Implement the horizontal panel navigation container with hard stops at both ends (no wraparound); ship exactly one panel.
+- [x] 5.3 Ensure vertical gestures on the Clock panel are not consumed by navigation (reserved for the future quick-controls overlay).
+- [x] 5.4 Implement the Clock panel rendering a placeholder clock face; expose theme-relevant properties (`clock_color`, `font_family`) fed by hardcoded values as the theme seam.
 
 ## 6. Integration & acceptance
 
-- [ ] 6.1 Author the systemd unit file (`Type=notify`, `Restart=on-failure` with backoff, `After/Wants=network-online.target`, `After/Wants=mopidy.service`, no blocking on either).
+- [x] 6.1 Author the systemd unit file (`Type=notify`, `Restart=on-failure` with backoff, `After/Wants=network-online.target`, `After/Wants=mopidy.service`, no blocking on either).
 - [ ] 6.2 Verify on the Pi: `systemctl start` brings the unit to `active (running)` with `READY=1` even when Mopidy is down.
 - [ ] 6.3 Verify on the Pi: the screen shows the placeholder Clock panel in vertical orientation.
 - [ ] 6.4 Verify on the Pi: `journalctl` shows structured entries with span context and fields; Mopidy state transitions and events are logged.

@@ -1,0 +1,29 @@
+[Unit]
+Description=Alarm Clock Application
+Documentation=https://github.com/earendil-works/pi-alarm-clock
+# Ordering only — the app does NOT block on either target (Design D10).
+# It reaches READY=1 even when the network is down or Mopidy is unreachable;
+# both retry in the background.
+After=network-online.target mopidy.service
+Wants=network-online.target mopidy.service
+# Restart backoff (Design D10): up to `StartLimitBurst` starts within
+# `StartLimitIntervalSec` before systemd gives up. `RestartSec` spaces the
+# individual attempts.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=notify
+# On the Pi this is installed to /usr/local/bin/alarm-clock. The path below
+# points at the workspace build so `systemd-analyze verify` can resolve the
+# binary in the dev/CI sandbox; replace with the install path on deployment.
+ExecStart=/home/shaun/pi-alarm-clock/target/debug/alarm-clock
+Restart=on-failure
+RestartSec=5s
+# No WatchdogSec in slice 0 — wiring sd_notify(WATCHDOG=1) into the Slint
+# tick is a separate, deferred decision (Design D10).
+User=alarm-clock
+Group=alarm-clock
+
+[Install]
+WantedBy=multi-user.target

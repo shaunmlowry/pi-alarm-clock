@@ -1,0 +1,97 @@
+// alarm-clock — UI shell (slice 0).
+//
+// Vertical 9:16 Slint application, touch-only, no text input, no scrolling.
+// Horizontal panel container with hard stops at both ends (no wraparound).
+// Slice 0 ships exactly one Clock panel; the scaffold is structured so that
+// later slices add panels without touching the navigation code.
+
+// ── ClockFace (task 5.2 + 5.4): placeholder with theme seam ────────────────
+// Exposes `clock-color` and `font-family` as in-properties so that a future
+// theming slice swaps the hardcoded feeder for a token system without
+// rewriting this component's internal structure.
+component ClockFace {
+    in property <color> clock-color;
+    in property <string> font-family;
+
+    Rectangle {
+        background: clock-color;
+        width: parent.width;
+        height: parent.height;
+
+        Text {
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            text: "12:00";
+            font-size: 140px;
+            color: #f8fafc;
+            font-family: font-family;
+        }
+    }
+}
+
+// ── PanelContainer (task 5.2): horizontal navigation scaffold ──────────────
+// Tracks `current-panel` index with hard stops at both ends (no wraparound).
+// Uses TouchArea's built-in pressed/mouse position properties for swipe
+// detection via the `moved` callback.
+//
+// Slice 0: only panel 0 (ClockFace) exists — swiping left or right is
+// immediately clamped by hard-stop guards, producing no visible change.
+// Vertical moves > 15 px cancel the gesture (reserved for future
+// quick-controls overlay per task 5.3).
+component PanelContainer {
+    property <int> current-panel: 0;
+    // Number of panels in the container. Set by whoever instantiates this
+    // component so the hard-stop guards self-adjust when panels are added.
+    property <int> max-panels: 1;
+
+    _ta := TouchArea {
+        width: parent.width;
+        height: parent.height;
+
+        moved => {
+            // TouchArea's mouse_x / pressed_x are <length> types.
+            // Divide by 1px to convert to plain float numbers.
+            let dx: float = (_ta.mouse_x - _ta.pressed_x) / (1px);
+            let dy: float = (_ta.mouse_y - _ta.pressed_y) / (1px);
+
+            // Vertical bail-out (task 5.3): if vertical displacement > 15 px,
+            // do not consume the gesture — reserved for future quick-controls
+            // overlay.
+            if dy > 15 { return; }
+            if dy < (-15) { return; }
+
+            let threshold: float = 25;
+
+            // Swipe right → previous panel (hard stop at 0).
+            if dx < (-threshold) {
+                if current-panel == 0 {
+                    return;
+                }
+                current-panel -= 1;
+            }
+
+            // Swipe left → next panel (hard stop at max_panels - 1).
+            if dx > threshold {
+                if current-panel >= (max-panels - 1) {
+                    return;
+                }
+                current-panel += 1;
+            }
+        }
+    }
+
+    // ClockFace is the sole panel in slice 0.
+    ClockFace {
+        clock-color: #334155;
+        font-family: "sans-serif";
+    }
+}
+
+// ── AppWindow: application shell (task 5.1) ────────────────────────────────
+export component AppWindow inherits Window {
+    preferred-width: 480px;
+    preferred-height: 854px;
+    title: "Alarm Clock";
+
+    PanelContainer {}
+}

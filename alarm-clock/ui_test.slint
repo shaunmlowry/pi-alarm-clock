@@ -1,0 +1,13 @@
+export component TestApp inherits Window {
+    in-out property <int> _val = 0;
+    
+    TouchArea {
+        pointer-event => {
+            if (event.kind == PointerEventKind.Press) {
+                self._val = cast<int>(event.x);
+            } else if (event.kind == PointerEventKind.Release) {
+                self._val = 0;
+            }
+        }
+    }
+}
