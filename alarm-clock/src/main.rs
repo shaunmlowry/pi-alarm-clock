@@ -16,7 +16,41 @@ use crate::config::Config;
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{info, info_span, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
+// ── Observability (tracing → journald / fmt fallback) ────────────────────────
+
+/// Initialize structured logging.
+///
+/// Prefers a `tracing-journald` layer when systemd journald is available on the Pi.
+/// Falls back to a pretty-printed `fmt` layer in dev/test environments.
+fn init_tracing() {
+    match tracing_journald::layer() {
+        Ok(jl) => {
+            tracing_subscriber::registry().with(jl).init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .pretty()
+                .with_target(true)
+                .init();
+        }
+    }
+}
+
+/// Placeholder: `scheduler_tick` span (defined for later slices, currently unused).
+#[allow(dead_code)]
+fn _create_scheduler_tick_span() -> tracing::Span {
+    tracing::info_span!("scheduler_tick")
+}
+
+/// Placeholder: `episode` span (defined for later slices, currently unused).
+#[allow(dead_code)]
+fn _create_episode_span() -> tracing::Span {
+    tracing::info_span!("episode")
+}
 
 // ── Tokio worker (async command dispatcher) ───────────────────────────────────
 
@@ -50,7 +84,8 @@ pub async fn command_dispatcher(
                     .await;
             }
             Cmd::CallMopidy { method, .. } => {
-                info!(method = %method, "CallMopidy command received (slice 0 placeholder)");
+                let _guard = info_span!("mopidy_request", method = %method).entered();
+                info!("CallMopidy command received (slice 0 placeholder)");
                 let _ = reply_tx
                     .send(Reply::CallResult(serde_json::json!({"error": "not yet implemented"})))
                     .await;
@@ -189,7 +224,9 @@ fn dispatch_event_to_domain(event: MopidyEvent) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    let worker_handle = bootstrap();
+    init_tracing();
+
+    let worker_handle = info_span!("bootstrap").in_scope(|| bootstrap());
 
     info!("alarm-clock: bootstrap complete — application running");
 
