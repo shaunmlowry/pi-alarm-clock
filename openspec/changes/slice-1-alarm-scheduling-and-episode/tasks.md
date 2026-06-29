@@ -15,8 +15,8 @@
 
 ## 3. Alarm data model & persistence
 
-- [ ] 3.1 Write migration `v2`: create the `alarms` table (columns per design D3); bump `user_version` to `2`; leave `v1`'s `schema_meta`/`kv_config` untouched.
-- [ ] 3.2 Verify migration `v2` is idempotent (starting at `user_version=2` skips re-application; `alarms` intact).
+- [x] 3.1 Write migration `v2`: create the `alarms` table (columns per design D3); bump `user_version` to `2`; leave `v1`'s `schema_meta`/`kv_config` untouched.
+- [x] 3.2 Verify migration `v2` is idempotent (starting at `user_version=2` skips re-application; `alarms` intact).
 - [ ] 3.3 Implement the `Alarm` model (serde struct matching the columns) and `AlarmStore` (owned by main, `&Connection`) with `list()`, `get(id)`, `upsert(alarm)`, `delete(id)`, `set_enabled(id, bool)`.
 - [ ] 3.4 Implement `AlarmStore::recompute_next_fires(now)` that recomputes `next_fire` from each alarm's rule and writes it back in a single transaction.
 - [ ] 3.5 Verify each `AlarmStore` mutation is a single transaction (rollback on partial failure; `error!` logged; in-memory state authoritative). Unit-test upsert idempotency by `id`.

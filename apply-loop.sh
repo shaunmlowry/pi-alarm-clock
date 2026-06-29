@@ -77,7 +77,7 @@ mkdir -p "$PROMPTDIR" "$LOGDIR"
 # Model strings use pi's "provider/id" prefix form so each model targets its
 # own provider (Qwen is local via ollama; GLM-5.2 via openrouter). No --provider
 # flag is passed unless PI_PROVIDER is explicitly set.
-PRIMARY_MODEL="${PRIMARY_MODEL:-ollama/erbanku/Qwen3-Coder-Next-GGUF-UD-IQ4_XS:latest}"
+PRIMARY_MODEL="${PRIMARY_MODEL:-ollama/qwen3.6-64k}"
 PRIMARY_ATTEMPTS="${PRIMARY_ATTEMPTS:-3}"
 ESCALATION_MODEL="${ESCALATION_MODEL:-openrouter/z-ai/glm-5.2}"
 ESCALATION_ATTEMPTS="${ESCALATION_ATTEMPTS:-2}"

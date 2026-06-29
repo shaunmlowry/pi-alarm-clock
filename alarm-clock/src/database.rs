@@ -45,15 +45,18 @@ fn migrations() -> &'static [Migration] {
             version: 2,
             sql: "
                 CREATE TABLE IF NOT EXISTS alarms (
-                    id              INTEGER PRIMARY KEY,
-                    enabled         INTEGER NOT NULL DEFAULT 1,
-                    name            TEXT NOT NULL,
-                    preset          TEXT NOT NULL,
-                    time_local      TEXT NOT NULL,
-                    timezone        TEXT NOT NULL,
-                    source_uri      TEXT NOT NULL,
-                    max_volume      INTEGER NOT NULL,
-                    next_fire       TEXT
+                    id           TEXT PRIMARY KEY,
+                    enabled      INTEGER NOT NULL DEFAULT 1,
+                    name         TEXT NOT NULL,
+                    time_local   TEXT NOT NULL,
+                    timezone     TEXT NOT NULL,
+                    rrule        TEXT,
+                    once_at      TEXT,
+                    source_uri   TEXT NOT NULL,
+                    max_volume    INTEGER NOT NULL DEFAULT 40,
+                    next_fire    TEXT,
+                    created_at   TEXT NOT NULL,
+                    updated_at   TEXT NOT NULL
                 );
             ",
         },
@@ -419,6 +422,86 @@ mod tests {
         // Second run: should be a no-op, user_version stays at the latest.
         run_migrations(&conn).unwrap();
         assert_eq!(read_user_version(&conn).unwrap(), latest);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ── Task 3.2: Migration v2 idempotency ─────────────────────────────
+
+    /// Scenario: Starting at user_version=2 skips migration v2 and leaves
+    /// alarms table intact.
+    #[test]
+    fn migration_v2_idempotent_skips_when_already_at_v2() {
+        let path = format!(
+            "{}{}v2_idempotent_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).expect("open connection");
+
+        // Manually apply v1 migration SQL so schema_meta + kv_config exist.
+        let v1_mig = migrations().iter().find(|m| m.version == 1).unwrap();
+        conn.execute_batch(v1_mig.sql)
+            .expect("v1 migration should succeed");
+
+        // Manually apply v2 migration SQL so alarms table exists.
+        let v2_mig = migrations().iter().find(|m| m.version == 2).unwrap();
+        conn.execute_batch(v2_mig.sql)
+            .expect("v2 migration should succeed");
+
+        // Set user_version to 2 (simulate a fully-migrated DB at v2).
+        set_user_version(&conn, 2).unwrap();
+
+        // Insert a test row into alarms so we can verify it survives.
+        conn.execute(
+            "INSERT INTO alarms (id, name, time_local, timezone, source_uri, max_volume, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["test-uuid", "Morning Alarm", "07:00:00", "America/Edmonton", "coreaudio://alarm.mp3", "50", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"],
+        )
+        .expect("should insert alarm row");
+
+        // Verify alarms count before run_migrations.
+        let alarm_count_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM alarms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(alarm_count_before, 1);
+
+        // Run migrations — v2 should be skipped (user_version already 2).
+        run_migrations(&conn).expect("migrations should succeed with no work");
+
+        // user_version remains at 2.
+        assert_eq!(read_user_version(&conn).unwrap(), 2);
+
+        // alarms table intact — row count unchanged.
+        let alarm_count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM alarms", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(alarm_count_after, alarm_count_before, "alarms data must be intact after idempotent skip");
+
+        // Verify the specific row is still there.
+        let name: String = conn.query_row(
+            "SELECT name FROM alarms WHERE id = ?",
+            ["test-uuid"],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(name, "Morning Alarm", "alarm row must survive idempotent skip");
+
+        // schema_meta and kv_config from v1 are untouched.
+        let has_schema_meta: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='schema_meta'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert!(has_schema_meta, "schema_meta must still exist after v2 idempotent skip");
+
+        let has_kv_config: bool = conn.query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='kv_config'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert!(has_kv_config, "kv_config must still exist after v2 idempotent skip");
 
         let _ = std::fs::remove_file(&path);
     }
