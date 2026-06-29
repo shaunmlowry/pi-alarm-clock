@@ -10,6 +10,7 @@
 
 mod channel;
 mod config;
+mod database;
 mod error;
 
 use crate::channel::{Cmd, Reply, MopidyEvent};
@@ -362,6 +363,21 @@ fn execute_shutdown() {
 /// thiserror for domain-specific error types internally.
 fn main() -> anyhow::Result<()> {
     init_tracing();
+
+    // ── Task 3.1 + 3.2: SQLite connection on main + migrations ────────────
+    let cfg = crate::config::Config::load();
+    info!(db_path = %cfg.db_path, "opening SQLite database");
+
+    let db_path = cfg.db_path.clone();
+    let conn = database::open_connection(&db_path)
+        .expect("failed to open database connection");
+
+    info!("SQLite connection opened, running migrations");
+
+    database::run_migrations(&conn)
+        .expect("migration runner failed");
+
+    info!("database: migrations complete");
 
     let worker_handle = info_span!("bootstrap").in_scope(|| bootstrap());
 

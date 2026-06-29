@@ -17,8 +17,8 @@
 
 ## 3. Persistence
 
-- [ ] 3.1 Open a single `rusqlite::Connection` on main; set `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL`.
-- [ ] 3.2 Implement the `user_version`-based migration runner; migrations applied in order, skipped when `user_version` is already at the target.
+- [x] 3.1 Open a single `rusqlite::Connection` on main; set `PRAGMA journal_mode=WAL` and `PRAGMA synchronous=NORMAL`.
+- [x] 3.2 Implement the `user_version`-based migration runner; migrations applied in order, skipped when `user_version` is already at the target.
 - [ ] 3.3 Write migration `v1`: create `schema_meta` and `kv_config(key TEXT PRIMARY KEY, value TEXT NOT NULL)`; bump `user_version` to `1`.
 - [ ] 3.4 Implement `ConfigStore` (owned by main) with `get(key)` / `set(key, value)` over `kv_config`, each as a single transaction; multi-statement mutations roll back on partial failure.
 - [ ] 3.5 Verify the round-trip: write `("last_boot", "<iso8601>")`, read it back, assert equality.
