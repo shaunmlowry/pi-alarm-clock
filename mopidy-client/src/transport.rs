@@ -3,7 +3,9 @@
 //! Provides:
 //! - JSON-RPC 2.0 request/response framing (task 4.1)
 //! - Reconnecting loop with exponential backoff + jitter (task 4.2)
+//! - Connection-state signals published on every transition (task 4.3)
 
+use crate::state::MopidyConnectionState;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
@@ -227,11 +229,17 @@ impl MopidyWsClient {
     /// `method` field).  In slice 0 these are logged; later slices consume them.
     ///
     /// The `on_reply_tx` sender delivers typed replies correlated by request ID.
+    ///
+    /// The `state_tx` sender publishes [`MopidyConnectionState`] transitions
+    /// (Disconnected → BackingOff → Connecting → Connected).  In slice 0 these
+    /// are forwarded through the reply channel and logged; later slices consume
+    /// them for fallback-chain and mid-episode-restart logic.
     pub fn spawn(
         url: String,
         policy: Option<BackoffPolicy>,
         on_event_tx: mpsc::Sender<JsonRpcMessage>,
         on_reply_tx: mpsc::Sender<JsonRpcMessage>,
+        state_tx: mpsc::Sender<MopidyConnectionState>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(64);
 
@@ -240,6 +248,7 @@ impl MopidyWsClient {
             policy,
             on_event_tx,
             on_reply_tx,
+            state_tx,
             cmd_rx,
         ));
 
@@ -255,13 +264,14 @@ impl MopidyWsClient {
             .map_err(|_| TransportError::ChannelClosed)
     }
 
-    // ── Reconnect loop (task 4.2) ──────────────────────────────────────
+    // ── Reconnect loop (task 4.2 + 4.3) ──────────────────────────────────────
 
     async fn reconnect_loop(
         url: String,
         policy: Option<BackoffPolicy>,
         on_event_tx: mpsc::Sender<JsonRpcMessage>,
         on_reply_tx: mpsc::Sender<JsonRpcMessage>,
+        state_tx: mpsc::Sender<MopidyConnectionState>,
         cmd_rx: mpsc::Receiver<ClientCmd>,
     ) {
         let policy = policy.unwrap_or_default();
@@ -271,13 +281,23 @@ impl MopidyWsClient {
         // put it back (from run_session's return value) for the next loop pass.
         let mut cmd_rx = Some(cmd_rx);
 
+        // Initial state: Disconnected (task 4.3)
+        let state_change = MopidyConnectionState::Disconnected;
+        let _ = state_tx.send(state_change.clone()).await;
+        info!(state = ?state_change, "connection state transition" );
+
         loop {
-            // ── State: Connecting ──────────────────────
-            info!(url = %url, attempt, "connecting to Mopidy WebSocket");
+            // ── State: Connecting (task 4.3) ──────────────
+            let state_change = MopidyConnectionState::Connecting;
+            let _ = state_tx.send(state_change.clone()).await;
+            info!(url = %url, attempt, state = ?state_change, "connecting to Mopidy WebSocket");
 
             match connect_ws(&url).await {
                 Ok(ws_stream) => {
-                    info!(url = %url, "connected to Mopidy WebSocket");
+                    // ── State: Connected (task 4.3) ───────
+                    let state_change = MopidyConnectionState::Connected;
+                    let _ = state_tx.send(state_change.clone()).await;
+                    info!(url = %url, state = ?state_change, "connected to Mopidy WebSocket");
                     attempt = 0; // reset on successful connection
 
                     let rx = cmd_rx
@@ -298,7 +318,11 @@ impl MopidyWsClient {
                 Err(e) => {
                     error!(error = %e, attempt, "connection failed — backing off");
                     let delay = policy.jitter_delay(attempt);
-                    info!(delay_ms = delay.as_millis(), "backing off before reconnect");
+
+                    // ── State: BackingOff (task 4.3) ᐸ─────
+                    let state_change = MopidyConnectionState::BackingOff { retry_in: delay };
+                    let _ = state_tx.send(state_change.clone()).await;
+                    info!(delay_ms = delay.as_millis(), state = ?state_change, "backing off before reconnect");
                     tokio::time::sleep(delay).await;
 
                     attempt += 1;
@@ -640,7 +664,8 @@ mod tests {
         let (e_tx, _e_rx) = mpsc::channel::<JsonRpcMessage>(16);
         let (r_tx, _r_rx) = mpsc::channel::<JsonRpcMessage>(16);
 
-        let _client = MopidyWsClient::spawn(url.into(), None, e_tx, r_tx);
+        let (_stx, _srx) = mpsc::channel::<MopidyConnectionState>(16);
+        let _client = MopidyWsClient::spawn(url.into(), None, e_tx, r_tx, _stx);
 
         // The reconnect loop runs in the background.  We just keep the current
         // task alive and verify it doesn't panic or complete quickly.

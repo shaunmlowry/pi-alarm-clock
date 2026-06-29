@@ -50,6 +50,11 @@ pub enum Reply {
 
     /// Shutdown requested (via SIGTERM/SIGINT on the tokio worker).
     ShutdownRequested,
+
+    /// Mopidy client connection-state transition (task 4.3).
+    /// Published on every state change from `Disconnected` through
+    /// `BackingOff`, `Connecting` to `Connected`.
+    MopidyConnectionState(mopidy_client::MopidyConnectionState),
 }
 
 /// Mopidy domain events forwarded from tokio to main.
@@ -205,6 +210,9 @@ mod tests {
         let _r1 = Reply::MopidyState("PLAYING".into());
         let _r2 = Reply::CallResult(Value::String("3.0".into()));
         let _r3 = Reply::ShutdownRequested;
+        // Task 4.3: MopidyConnectionState variant
+        let _r4 =
+            Reply::MopidyConnectionState(mopidy_client::MopidyConnectionState::Connected);
     }
 
     #[test]

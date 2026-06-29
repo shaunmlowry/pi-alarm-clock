@@ -5,3 +5,6 @@
 
 pub mod transport;
 pub mod state;
+
+// Re-export for convenience in alarm-clock crate.
+pub use state::MopidyConnectionState;

@@ -14,6 +14,8 @@ mod database;
 mod error;
 
 use crate::channel::{Cmd, Reply, MopidyEvent};
+use mopidy_client::state::MopidyConnectionState;
+use tokio::sync::mpsc as tokio_mpsc;
 use crate::config::Config;
 use std::panic::{self, AssertUnwindSafe};
 use std::thread::JoinHandle;
@@ -135,6 +137,7 @@ pub async fn command_dispatcher(
 fn spawn_tokio_worker(
     cmd_rx: mpsc::Receiver<Cmd>,
     reply_tx: mpsc::Sender<Reply>,
+    state_rx: tokio_mpsc::Receiver<MopidyConnectionState>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("tokio-worker".into())
@@ -146,11 +149,24 @@ fn spawn_tokio_worker(
 
             info!("tokio worker runtime created on dedicated thread");
 
-            rt.block_on(async {
+            // Task 4.3: Mopidy client state forwarding — spawn a background task
+            // that reads MopidyConnectionState transitions and forwards them
+            // through the Reply channel as Reply::MopidyConnectionState.
+            let mut state_rx_local = state_rx;
+            let reply_tx_forward = reply_tx.clone();
+            tokio::spawn(async move {{
+                while let Some(state) = state_rx_local.recv().await {{
+                    let _ = reply_tx_forward
+                        .send(Reply::MopidyConnectionState(state))
+                        .await;
+                }}
+            }});
+
+            rt.block_on(async {{
                 // Run the command dispatcher to completion.
                 let result = command_dispatcher(cmd_rx, reply_tx).await;
                 info!(result = ?result, "tokio command dispatcher exited");
-            });
+            }});
 
             info!("tokio worker thread shutting down");
         })
@@ -185,10 +201,28 @@ pub fn bootstrap() -> JoinHandle<()> {
     let mut event_rx = handles.main.event_receiver;
     let tokio_handles = handles.tokio;
 
+    // ── Mopidy client with connection-state channel (task 4.3) ──────────────
+    let (mopidy_state_tx, mopidy_state_rx) = tokio_mpsc::channel::<MopidyConnectionState>(16);
+    
+    // Transport-level channels for raw JSON-RPC messages from the reconnect loop.
+    // In slice 0 these are consumed by command_dispatcher internally;
+    // later slices will wire them into real request handlers.
+    let (mopidy_event_tx, _mopidy_event_rx) = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
+    let (mopidy_reply_tx, _mopidy_reply_rx) = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
+    
+    let _mopidy_client = mopidy_client::transport::MopidyWsClient::spawn(
+        cfg.mopidy_ws_url.clone(),
+        None, // use default backoff policy
+        mopidy_event_tx,
+        mopidy_reply_tx,
+        mopidy_state_tx,
+    );
+
     // Spawn tokio worker on a dedicated thread (task 2.2).
     let worker_handle = spawn_tokio_worker(
         tokio_handles.cmd_receiver,
         tokio_handles.reply_sender,
+        mopidy_state_rx,
     );
 
     info!("tokio worker thread spawned successfully");
@@ -256,6 +290,10 @@ fn dispatch_reply_to_domain(reply: Reply) {
         Reply::ShutdownRequested => {
             info!("Shutdown requested (signal) — entering shutdown sequence");
             execute_shutdown();
+        }
+        // Task 4.3: log Mopidy connection-state transitions (not consumed beyond logging in slice 0).
+        Reply::MopidyConnectionState(state) => {
+            info!(reply = "MopidyConnectionState", state = ?state, "dispatched Mopidy connection state to domain");
         }
     }
 }
@@ -510,9 +548,12 @@ mod tests {
         let mut main_reply_rx = handles.main.reply_receiver;
 
         // Spawn tokio worker (same as bootstrap does).
+        // Provide a state_rx for spawn_tokio_worker (task 4.3).
+        let (_test_state_tx, test_state_rx) = tokio_mpsc::channel::<MopidyConnectionState>(16);
         let _worker_handle = spawn_tokio_worker(
             handles.tokio.cmd_receiver,
             handles.tokio.reply_sender,
+            test_state_rx,
         );
 
         // Give the worker thread a moment to start its recv loop.
