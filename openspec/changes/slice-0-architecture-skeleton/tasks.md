@@ -28,7 +28,7 @@
 - [x] 4.1 Implement the WebSocket transport with `tokio-tungstenite` to the configured `mopidy_ws_url`; implement JSON-RPC 2.0 framing (`{jsonrpc, id, method, params}`).
 - [x] 4.2 Implement the reconnect loop with exponential backoff + jitter (initial ~500ms, factor ~2, cap ~30s, ±20%), retrying indefinitely; do not block application boot.
 - [x] 4.3 Define `MopidyConnectionState { Disconnected, BackingOff { retry_in }, Connecting, Connected }` and publish it on every transition via the reply channel; log each transition.
-- [ ] 4.4 Implement typed wrappers for `core.get_version` and `core.get_state` (request struct + `call` + typed reply); structure so adding methods is mechanical.
+- [x] 4.4 Implement typed wrappers for `core.get_version` and `core.get_state` (request struct + `call` + typed reply); structure so adding methods is mechanical.
 - [ ] 4.5 Implement event parsing: incoming messages with a `method` field are parsed into `enum MopidyEvent` and forwarded to the bounded event channel; log every event.
 - [ ] 4.6 Verify end-to-end against a running Mopidy: `core.get_version` round-trips a typed reply; `core.get_state` returns a typed state; disconnecting/restarting Mopidy transitions through backoff to `Connected`.
 

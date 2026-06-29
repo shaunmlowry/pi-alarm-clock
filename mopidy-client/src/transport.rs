@@ -7,7 +7,10 @@
 
 use crate::state::MopidyConnectionState;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{
     MaybeTlsStream, tungstenite::Message, WebSocketStream,
 };
@@ -212,6 +215,10 @@ pub(crate) enum ClientCmd {
     SendMessage(Message),
 }
 
+/// Tracks pending oneshot senders so that typed call wrappers can await
+/// the matched reply by request ID.
+type PendingReplies = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<JsonRpcMessage, TransportError>>>>>;
+
 /// A reconnecting WebSocket JSON-RPC client for Mopidy.
 ///
 /// On construction the client spawns an async task on the current tokio runtime
@@ -220,6 +227,8 @@ pub(crate) enum ClientCmd {
 /// start, the loop enters BackingOff and retries indefinitely.
 pub struct MopidyWsClient {
     cmd_tx: mpsc::Sender<ClientCmd>,
+    id_counter: Arc<AtomicU64>,
+    pending_replies: PendingReplies,
 }
 
 impl MopidyWsClient {
@@ -242,6 +251,7 @@ impl MopidyWsClient {
         state_tx: mpsc::Sender<MopidyConnectionState>,
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(64);
+        let pending_replies: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
 
         tokio::spawn(Self::reconnect_loop(
             url,
@@ -250,9 +260,14 @@ impl MopidyWsClient {
             on_reply_tx,
             state_tx,
             cmd_rx,
+            pending_replies.clone(),
         ));
 
-        Self { cmd_tx }
+        Self {
+            cmd_tx,
+            id_counter: Arc::new(AtomicU64::new(0)),
+            pending_replies,
+        }
     }
 
     /// Send a JSON-RPC request over the active WebSocket (if connected).
@@ -264,6 +279,48 @@ impl MopidyWsClient {
             .map_err(|_| TransportError::ChannelClosed)
     }
 
+    /// Build a typed request, send it, and await the matched reply on the
+    /// pending-reply oneshot channel.  Returns the raw [`JsonRpcMessage`] so
+    /// callers (typically method wrappers in `methods` module) can deserialize
+    /// the result.
+    ///
+    /// This is the primitive all mechanical `call*` wrappers use:
+    /// 1. Allocate a unique request ID,
+    /// 2. Register an oneshot sender keyed by that ID,
+    /// 3. Dispatch the request frame through [`ClientCmd`] → the session,
+    /// 4. Await the matching reply or fail on channel drop.
+    pub async fn send_and_await(
+        &self,
+        method: impl Into<String>,
+        params: Option<Value>,
+    ) -> Result<JsonRpcMessage, TransportError> {
+        let request_id = self.id_counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+
+        // Register an oneshot receiver for this specific ID.
+        let (reply_tx, reply_rx) = oneshot::channel();
+        {
+            let mut map = self.pending_replies.lock().map_err(|_| TransportError::ChannelClosed)?;
+            map.insert(request_id, reply_tx);
+        }
+
+        // Build and dispatch the frame.
+        let msg = JsonRpcRequest {
+            jsonrpc: "2.0",
+            request_id,
+            method: method.into(),
+            params: Some(params.unwrap_or_else(|| Value::Array(vec![]))),
+        }
+        .to_message()?;
+
+        self.cmd_tx
+            .send(ClientCmd::SendMessage(msg))
+            .await
+            .map_err(|_| TransportError::ChannelClosed)?;
+
+        // Await the matched reply.
+        reply_rx.await.map_err(|_| TransportError::ChannelClosed)?
+    }
+
     // ── Reconnect loop (task 4.2 + 4.3) ──────────────────────────────────────
 
     async fn reconnect_loop(
@@ -273,6 +330,7 @@ impl MopidyWsClient {
         on_reply_tx: mpsc::Sender<JsonRpcMessage>,
         state_tx: mpsc::Sender<MopidyConnectionState>,
         cmd_rx: mpsc::Receiver<ClientCmd>,
+        pending_replies: PendingReplies,
     ) {
         let policy = policy.unwrap_or_default();
         let mut attempt: u32 = 0;
@@ -309,6 +367,7 @@ impl MopidyWsClient {
                         &on_event_tx,
                         &on_reply_tx,
                         rx,
+                        pending_replies.clone(),
                     )
                     .await;
 
@@ -349,12 +408,14 @@ async fn connect_ws(
 }
 
 /// Run a single WebSocket session: read messages, dispatch replies/events,
-/// and forward outbound writes from `cmd_rx`. Ends when the connection drops.
+/// resolve pending typed-call receivers, and forward outbound writes from
+/// `cmd_rx`. Ends when the connection drops.
 async fn run_session(
     mut ws_stream: WebSocketStream<MopidyStream>,
     on_event_tx: &mpsc::Sender<JsonRpcMessage>,
     on_reply_tx: &mpsc::Sender<JsonRpcMessage>,
     mut cmd_rx: mpsc::Receiver<ClientCmd>,
+    pending_replies: PendingReplies,
 ) -> mpsc::Receiver<ClientCmd> {
     use futures::{SinkExt, StreamExt};
 
@@ -382,6 +443,14 @@ async fn run_session(
                         );
 
                         if parsed.is_reply() {
+                            // Resolve any pending typed-call oneshot for this ID.
+                            if let Some(id) = parsed.request_id {
+                                let mut map = pending_replies.lock().unwrap();
+                                if let Some(tx) = map.remove(&id) {
+                                    let _ = tx.send(Ok(parsed.clone()));
+                                }
+                            }
+                            // Also forward through the reply channel for external consumers.
                             let _ = on_reply_tx.send(parsed).await;
                         } else if parsed.is_event() {
                             let _ = on_event_tx.send(parsed).await;
