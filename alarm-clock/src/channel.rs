@@ -47,6 +47,9 @@ pub enum Reply {
 
     /// Generic result from a `CallMopidy(method, params)` command.
     CallResult(Value),
+
+    /// Shutdown requested (via SIGTERM/SIGINT on the tokio worker).
+    ShutdownRequested,
 }
 
 /// Mopidy domain events forwarded from tokio to main.
@@ -201,6 +204,7 @@ mod tests {
     fn reply_variants_compile() {
         let _r1 = Reply::MopidyState("PLAYING".into());
         let _r2 = Reply::CallResult(Value::String("3.0".into()));
+        let _r3 = Reply::ShutdownRequested;
     }
 
     #[test]
