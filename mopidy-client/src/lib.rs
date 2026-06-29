@@ -11,3 +11,4 @@ pub mod methods;
 // Re-export for convenience in alarm-clock crate.
 pub use state::MopidyConnectionState;
 pub use methods::{PlaybackState, VersionInfo};
+pub use transport::MopidyEvent;

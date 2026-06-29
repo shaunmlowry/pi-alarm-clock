@@ -10,6 +10,9 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 
+// Re-export MopidyEvent from the mopidy-client crate (task 4.5).
+pub use mopidy_client::MopidyEvent;
+
 // ── Channel capacities ────────────────────────────────────────────────────────
 
 /// Upper bound for the command channel (main → tokio).
@@ -55,22 +58,6 @@ pub enum Reply {
     /// Published on every state change from `Disconnected` through
     /// `BackingOff`, `Connecting` to `Connected`.
     MopidyConnectionState(mopidy_client::MopidyConnectionState),
-}
-
-/// Mopidy domain events forwarded from tokio to main.
-///
-/// In slice 0 these are logged and otherwise ignored; later slices consume them
-/// within the Slint timer tick.
-#[derive(Debug, Clone)]
-pub enum MopidyEvent {
-    /// Playback state changed (play / pause / stop).
-    PlaybackStateChanged,
-
-    /// Tracklist has been modified.
-    TracklistChanged,
-
-    /// A known but unmodelled event variant (placeholder for later slices).
-    Other { method: String },
 }
 
 // ── Channel handles ───────────────────────────────────────────────────────────

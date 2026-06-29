@@ -4,6 +4,7 @@
 //! - JSON-RPC 2.0 request/response framing (task 4.1)
 //! - Reconnecting loop with exponential backoff + jitter (task 4.2)
 //! - Connection-state signals published on every transition (task 4.3)
+//! - Typed event parsing from JSON-RPC notifications (task 4.5)
 
 use crate::state::MopidyConnectionState;
 use serde_json::Value;
@@ -201,10 +202,51 @@ impl BackoffPolicy {
     }
 }
 
+/// Mopidy domain event types parsed from incoming JSON-RPC notifications.
+///
+/// Each inbound message that carries a `method` field (i.e. an event) is
+/// deserialized into one of these variants and forwarded through the bounded
+/// event channel.  Slice 0 logs every event; later slices consume them.
+#[derive(Debug, Clone)]
+pub enum MopidyEvent {
+    /// Playback state changed (play / pause / stop).
+    PlaybackStateChanged,
+    /// Tracklist has been modified.
+    TracklistChanged,
+    /// A known but unmodelled event variant (placeholder for later slices).
+    Other { method: String },
+}
+
 // ── Concrete stream alias ────────────────────────────────────────────────────
 
 /// The underlying I/O stream type carried by our WebSocket connections.
 type MopidyStream = MaybeTlsStream<tokio::net::TcpStream>;
+
+// ── Event parsing helper (task 4.5) ──────────────────────────────────────────
+
+/// Parse a JSON-RPC notification message into a typed [`MopidyEvent`].
+///
+/// Dispatches on the `method` string; matches known Mopidy event families
+/// and falls through to [`MopidyEvent::Other`] for anything unmodelled.
+pub fn parse_mopidy_event(msg: &JsonRpcMessage) -> Option<MopidyEvent> {
+    let method = msg.method.as_ref()?;
+
+    match method.as_str() {
+        // Playback state notifications emitted by mopidy/core.
+        "core.playbackstate.changes"
+        | "playback_state_changed"
+        | "core.playback.stateChanged" => Some(MopidyEvent::PlaybackStateChanged),
+
+        // Tracklist modification notifications.
+        "core.tracklist.changes"
+        | "tracklist_changed"
+        | "core.tracklist.changed" => Some(MopidyEvent::TracklistChanged),
+
+        // Everything else — forward with the raw method name for later
+        // slices to handle.
+        other => Some(MopidyEvent::Other { method: other.to_string() }),
+    }
+}
 
 // ── Mopidy WebSocket client (reconnect — task 4.2) ───────────────────────────
 
@@ -234,8 +276,9 @@ pub struct MopidyWsClient {
 impl MopidyWsClient {
     /// Create a new client and start the reconnect loop on the **current** tokio runtime.
     ///
-    /// The `on_event_tx` sender receives JSON-RPC event messages (those with a
-    /// `method` field).  In slice 0 these are logged; later slices consume them.
+    /// The `on_event_tx` sender receives typed [`MopidyEvent`] messages parsed
+    /// from JSON-RPC notifications (messages with a `method` field).  In slice 0
+    /// these are logged; later slices consume them.
     ///
     /// The `on_reply_tx` sender delivers typed replies correlated by request ID.
     ///
@@ -246,7 +289,7 @@ impl MopidyWsClient {
     pub fn spawn(
         url: String,
         policy: Option<BackoffPolicy>,
-        on_event_tx: mpsc::Sender<JsonRpcMessage>,
+        on_event_tx: mpsc::Sender<MopidyEvent>,
         on_reply_tx: mpsc::Sender<JsonRpcMessage>,
         state_tx: mpsc::Sender<MopidyConnectionState>,
     ) -> Self {
@@ -326,7 +369,7 @@ impl MopidyWsClient {
     async fn reconnect_loop(
         url: String,
         policy: Option<BackoffPolicy>,
-        on_event_tx: mpsc::Sender<JsonRpcMessage>,
+        on_event_tx: mpsc::Sender<MopidyEvent>,
         on_reply_tx: mpsc::Sender<JsonRpcMessage>,
         state_tx: mpsc::Sender<MopidyConnectionState>,
         cmd_rx: mpsc::Receiver<ClientCmd>,
@@ -412,7 +455,7 @@ async fn connect_ws(
 /// `cmd_rx`. Ends when the connection drops.
 async fn run_session(
     mut ws_stream: WebSocketStream<MopidyStream>,
-    on_event_tx: &mpsc::Sender<JsonRpcMessage>,
+    on_event_tx: &mpsc::Sender<MopidyEvent>,
     on_reply_tx: &mpsc::Sender<JsonRpcMessage>,
     mut cmd_rx: mpsc::Receiver<ClientCmd>,
     pending_replies: PendingReplies,
@@ -453,7 +496,11 @@ async fn run_session(
                             // Also forward through the reply channel for external consumers.
                             let _ = on_reply_tx.send(parsed).await;
                         } else if parsed.is_event() {
-                            let _ = on_event_tx.send(parsed).await;
+                            // Task 4.5: parse into typed event, log it, then forward.
+                            if let Some(event) = parse_mopidy_event(&parsed) {
+                                info!(event = ?event, "Mopidy event received");
+                                let _ = on_event_tx.send(event).await;
+                            }
                         }
                     }
                     Some(Err(e)) => {
@@ -730,7 +777,7 @@ mod tests {
         use tokio::time::{timeout, Instant};
 
         let url = "ws://localhost:65432/unlikely-mopidy";
-        let (e_tx, _e_rx) = mpsc::channel::<JsonRpcMessage>(16);
+        let (e_tx, _e_rx) = mpsc::channel::<MopidyEvent>(16);
         let (r_tx, _r_rx) = mpsc::channel::<JsonRpcMessage>(16);
 
         let (_stx, _srx) = mpsc::channel::<MopidyConnectionState>(16);
@@ -786,5 +833,106 @@ mod tests {
         assert!(io_err.source().is_some());
 
         let _parse_err = TransportError::Parse("bad json".into());
+    }
+
+    // ── Event parsing (task 4.5) ───────────────────────────────────
+
+    /// `parse_mopidy_event` maps playback state methods to PlaybackStateChanged.
+    #[test]
+    fn parse_mopidy_event_playback_state() {
+        let event_msg = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: None,
+            method: Some("core.playbackstate.changes".into()),
+            result: None,
+            error: None,
+        };
+        let parsed = parse_mopidy_event(&event_msg).expect("should parse");
+        assert!(matches!(parsed, MopidyEvent::PlaybackStateChanged));
+
+        // Also match the snake_case variant.
+        let event_msg2 = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: None,
+            method: Some("playback_state_changed".into()),
+            result: None,
+            error: None,
+        };
+        assert!(matches!(parse_mopidy_event(&event_msg2), Some(MopidyEvent::PlaybackStateChanged)));
+
+        // Also match the camelCase variant.
+        let event_msg3 = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: None,
+            method: Some("core.playback.stateChanged".into()),
+            result: None,
+            error: None,
+        };
+        assert!(matches!(parse_mopidy_event(&event_msg3), Some(MopidyEvent::PlaybackStateChanged)));
+    }
+
+    /// `parse_mopidy_event` maps tracklist methods to TracklistChanged.
+    #[test]
+    fn parse_mopidy_event_tracklist() {
+        let event_msgs = [
+            "core.tracklist.changes",
+            "tracklist_changed",
+            "core.tracklist.changed",
+        ];
+        for method in event_msgs {
+            let msg = JsonRpcMessage {
+                jsonrpc: "2.0".into(),
+                request_id: None,
+                method: Some(method.into()),
+                result: None,
+                error: None,
+            };
+            assert!(
+                matches!(parse_mopidy_event(&msg), Some(MopidyEvent::TracklistChanged)),
+                "method '{}' should parse to TracklistChanged", method
+            );
+        }
+    }
+
+    /// `parse_mopidy_event` falls back to Other for unrecognised method names.
+    #[test]
+    fn parse_mopidy_event_unknown_falls_to_other() {
+        let msg = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: None,
+            method: Some("mixer.volume.changed".into()),
+            result: None,
+            error: None,
+        };
+        match parse_mopidy_event(&msg).expect("should parse") {
+            MopidyEvent::Other { method } => assert_eq!(method, "mixer.volume.changed"),
+            other => panic!("expected Other, got {:?}", other),
+        }
+    }
+
+    /// `parse_mopidy_event` returns None for a message with no method field.
+    #[test]
+    fn parse_mopidy_event_no_method_returns_none() {
+        let reply = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: Some(1),
+            method: None,
+            result: Some(serde_json::json!("PLAYING")),
+            error: None,
+        };
+        assert!(parse_mopidy_event(&reply).is_none());
+    }
+
+    /// `MopidyEvent` variants can be cloned (needed for try_send_drop_oldest).
+    #[test]
+    fn mopidy_event_cloneable() {
+        let e1 = MopidyEvent::PlaybackStateChanged;
+        let _e1_copy = e1.clone();
+
+        let e2 = MopidyEvent::TracklistChanged;
+        let _e2_copy = e2.clone();
+
+        let e3 = MopidyEvent::Other { method: "test".into() };
+        let _e3_copy = e3.clone();
     }
 }

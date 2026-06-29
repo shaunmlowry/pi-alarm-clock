@@ -204,10 +204,10 @@ pub fn bootstrap() -> JoinHandle<()> {
     // ── Mopidy client with connection-state channel (task 4.3) ──────────────
     let (mopidy_state_tx, mopidy_state_rx) = tokio_mpsc::channel::<MopidyConnectionState>(16);
     
-    // Transport-level channels for raw JSON-RPC messages from the reconnect loop.
-    // In slice 0 these are consumed by command_dispatcher internally;
-    // later slices will wire them into real request handlers.
-    let (mopidy_event_tx, _mopidy_event_rx) = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
+    // Mopidy event channel: typed MopidyEvent from the WS read loop.
+    // In slice 0 these are logged; later slices consume them in the episode FSM.
+    // Mopidy reply channel for typed-call responses (task 4.5).
+    let (mopidy_event_tx, _mopidy_event_rx) = tokio_mpsc::channel::<mopidy_client::MopidyEvent>(16);
     let (mopidy_reply_tx, _mopidy_reply_rx) = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
     
     let _mopidy_client = mopidy_client::transport::MopidyWsClient::spawn(
