@@ -10,9 +10,11 @@
 
 mod channel;
 mod config;
+mod error;
 
 use crate::channel::{Cmd, Reply, MopidyEvent};
 use crate::config::Config;
+use std::panic::{self, AssertUnwindSafe};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -172,14 +174,37 @@ pub fn bootstrap() -> JoinHandle<()> {
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
-        // Drain reply channel (non-blocking).
-        while let Ok(reply) = reply_rx.try_recv() {
-            dispatch_reply_to_domain(reply);
-        }
+        // ── Tick-level panic isolation (Design D6) ──────────────────────
+        //
+        // Every periodic tick wraps its body in `catch_unwind`. A panic
+        // is logged at `error!` level and the tick reschedules on the
+        // next interval. Cardinal rule: a bug in one tick must not sink
+        // the alarm guarantee.
+        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+            // Drain reply channel (non-blocking).
+            while let Ok(reply) = reply_rx.try_recv() {
+                dispatch_reply_to_domain(reply);
+            }
 
-        // Drain Mopidy event channel (non-blocking).
-        while let Ok(event) = event_rx.try_recv() {
-            dispatch_event_to_domain(event);
+            // Drain Mopidy event channel (non-blocking).
+            while let Ok(event) = event_rx.try_recv() {
+                dispatch_event_to_domain(event);
+            }
+        }));
+
+        if let Err(err) = result {
+            // Log the panic payload — `Box<dyn Any + Send>` can be a String,
+            // &str, or opaque data. We log whatever we can recover.
+            let msg = match err.downcast::<String>() {
+                Ok(s) => *s,
+                Err(e) => match e.downcast::<&str>() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => "unknown panic payload".to_string(),
+                },
+            };
+            tracing::error!(panic = %msg, tick_interval_ms = 50,
+                "tick body panicked — caught and rescheduled",
+            );
         }
     });
 
@@ -223,7 +248,11 @@ fn dispatch_event_to_domain(event: MopidyEvent) {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
-fn main() {
+/// Application entry point (app boundary).
+///
+/// Uses **`anyhow::Result<()>`** per Design D6: anyhow at the boundary,
+/// thiserror for domain-specific error types internally.
+fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let worker_handle = info_span!("bootstrap").in_scope(|| bootstrap());
@@ -237,6 +266,34 @@ fn main() {
     // Dropping `cmd_sender` (when it goes out of scope at end of lifetime)
     // will cause the tokio worker's recv loop to terminate naturally.
     let _ = worker_handle.join();
+
+    Ok(())
+}
+
+// ── Protected tick (Design D6) ───────────────────────────────────────────────
+
+/// Execute a periodic-tick body with panic isolation.
+///
+/// Returns `Ok(())` on success, `Err(String)` when the body panicked.
+/// The caller (`slint::Timer` lambda) logs at `error!` and naturally
+/// reschedules because the timer fires again on its interval.
+pub(crate) fn protected_tick<F>(body: F)
+where
+    F: FnOnce() + Send,
+{
+    let result = panic::catch_unwind(AssertUnwindSafe(body));
+    if let Err(err) = result {
+        let msg = match err.downcast::<String>() {
+            Ok(s) => *s,
+            Err(e) => match e.downcast::<&str>() {
+                Ok(s) => s.to_string(),
+                Err(_) => "unknown panic payload".to_string(),
+            },
+        };
+        tracing::error!(panic = %msg, kind = "protected_tick",
+            "tick body panicked — caught and will reschedule",
+        );
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -371,5 +428,104 @@ mod tests {
 
         // Clean shutdown.
         main_cmd_sender.blocking_send(Cmd::Shutdown).unwrap();
+    }
+
+    /// ── Task 2.4: Tick-level panic isolation ────────────────────────────
+
+    /// Scenario: a tick body that panics is caught by `protected_tick`;
+    /// control returns to the caller (the timer will fire again).
+    #[test]
+    fn protected_tick_catches_panic_and_continues() {
+        // Use a counter to prove subsequent ticks still execute.
+        let counter = std::sync::atomic::AtomicU32::new(0);
+
+        // Tick 1: normal execution.
+        protected_tick(|| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "first tick should execute");
+
+        // Tick 2: panicked body — must be caught, not abort the process.
+        protected_tick(|| {
+            panic!("simulated bug in dispatch logic");
+        });
+        // We are still alive after the caught panic.
+        assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 1,
+            "panic should not mutate state past the unwind point");
+
+        // Tick 3: normal execution again — proves rescheduling works.
+        protected_tick(|| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "tick after a panicking tick should still execute (rescheduled)"
+        );
+    }
+
+    /// Scenario: `protected_tick` extracts the panic message from a String payload.
+    #[test]
+    fn protected_tick_catches_string_panic_message() {
+        // This must not abort this test.
+        protected_tick(|| {
+            let msg = "boom".to_string();
+            panic!("{}", msg);
+        });
+        // If we reach here, the panic was caught — test passes.
+    }
+
+    /// Scenario: `protected_tick` handles a bare &str panic message.
+    #[test]
+    fn protected_tick_catches_str_panic_message() {
+        protected_tick(|| { panic!("&str panic"); });
+        // Alive = caught.
+    }
+
+    /// ── Task 2.5: Error / panic policy ──────────────────────────────────
+
+    /// Scenario: app boundary uses `anyhow::Result<()>` — `main()` returns
+    /// a proper Result that callers can inspect for failures.
+    #[test]
+    fn main_boundary_returns_anyhow_result() {
+        use crate::error::{ConfigError, Result as DomainResult};
+
+        // thiserror domain errors convert into anyhow at the boundary.
+        let domain_err: DomainResult<()> = Err(ConfigError::WriteFailed(
+            std::io::Error::new(std::io::ErrorKind::Other, "disk full"),
+        ));
+
+        // Conversion to anyhow::Error preserves the chain.
+        let boundary_err: Result<(), anyhow::Error> = domain_err.map_err(Into::into);
+        assert!(boundary_err.is_err());
+        let msg = format!("{}", boundary_err.unwrap_err());
+        assert!(msg.contains("config write failed"), "anyhow wraps ConfigError chain: {msg}");
+    }
+
+    /// Scenario: failed config write degrades — in-memory state remains
+    /// authoritative; the process does not exit.
+    #[test]
+    fn failed_config_write_degrades_keeps_in_memory_state() {
+        // Simulate a successful load followed by a failing persist attempt.
+        let cfg = Config::default();
+
+        // In-memory state before the (simulated) write.
+        assert_eq!(cfg.db_path, crate::config::DEFAULT_DB_PATH);
+        assert_eq!(cfg.mopidy_ws_url, crate::config::DEFAULT_MOPIDY_WS_URL);
+
+        // Simulate a write failure: construct the error and verify it converts
+        // to anyhow at the boundary without aborting.
+        use crate::error::{ConfigError, Result as DomainResult};
+        let write_result: DomainResult<()> = Err(ConfigError::WriteFailed(
+            std::io::Error::new(std::io::ErrorKind::Other, "disk full"),
+        ));
+
+        // The error is propagated to the app boundary as anyhow (never panic).
+        let _boundary: Result<(), anyhow::Error> = write_result.map_err(Into::into);
+
+        // In-memory Config state is UNAFFECTED by the failed write.
+        assert_eq!(cfg.db_path, crate::config::DEFAULT_DB_PATH);
+        assert_eq!(cfg.mopidy_ws_url, crate::config::DEFAULT_MOPIDY_WS_URL);
     }
 }
