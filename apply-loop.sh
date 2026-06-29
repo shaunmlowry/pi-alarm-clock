@@ -74,11 +74,14 @@ done
 mkdir -p "$PROMPTDIR" "$LOGDIR"
 
 # ─── Model escalation config (env-overridable) ──────────────────────────────
-PRIMARY_MODEL="${PRIMARY_MODEL:-erbanku/Qwen3-Coder-Next-GGUF-UD-IQ4_XS:latest}"
+# Model strings use pi's "provider/id" prefix form so each model targets its
+# own provider (Qwen is local via ollama; GLM-5.2 via openrouter). No --provider
+# flag is passed unless PI_PROVIDER is explicitly set.
+PRIMARY_MODEL="${PRIMARY_MODEL:-ollama/erbanku/Qwen3-Coder-Next-GGUF-UD-IQ4_XS:latest}"
 PRIMARY_ATTEMPTS="${PRIMARY_ATTEMPTS:-3}"
-ESCALATION_MODEL="${ESCALATION_MODEL:-z-ai/glm-5.2}"
+ESCALATION_MODEL="${ESCALATION_MODEL:-openrouter/z-ai/glm-5.2}"
 ESCALATION_ATTEMPTS="${ESCALATION_ATTEMPTS:-2}"
-PI_PROVIDER="${PI_PROVIDER:-}"   # optional; if set, passed as --provider
+PI_PROVIDER="${PI_PROVIDER:-}"   # optional override; if set, passed as --provider
 TOTAL_ATTEMPTS=$((PRIMARY_ATTEMPTS + ESCALATION_ATTEMPTS))
 
 # Return the model id for a given 1-based attempt number.
