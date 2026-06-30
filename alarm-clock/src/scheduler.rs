@@ -46,8 +46,9 @@ use tracing_subscriber::layer::{Context, Layer};
 /// negligible.
 pub const DEFAULT_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Identifier of an alarm (matches the `alarms.id` SQLite `INTEGER PRIMARY KEY`).
-pub type AlarmId = i64;
+/// Identifier of an alarm (matches the `alarms.id` SQLite `TEXT PRIMARY KEY` —
+/// a UUID string, per migration `v2` / [`crate::alarm_store::Alarm`]).
+pub type AlarmId = String;
 
 /// A due alarm surfaced to the scheduler by the alarm source.
 ///
@@ -205,12 +206,12 @@ where
                     now = %now,
                     "missed alarm on boot — skipping, advancing next_fire",
                 );
-                self.source.recompute_next_fire(alarm.id, now);
+                self.source.recompute_next_fire(alarm.id.clone(), now);
                 skipped_missed += 1;
             } else if alarm.next_fire <= now {
                 // Task 1.1: fire the episode FSM and recompute next_fire.
-                self.fsm.fire(alarm.id);
-                self.source.recompute_next_fire(alarm.id, now);
+                self.fsm.fire(alarm.id.clone());
+                self.source.recompute_next_fire(alarm.id.clone(), now);
                 fired += 1;
             }
             // Else: the source returned a not-yet-due alarm (next_fire > now).
@@ -280,7 +281,7 @@ mod tests {
             self.alarms.iter().filter(|a| a.next_fire <= now).cloned().collect()
         }
         fn recompute_next_fire(&mut self, id: AlarmId, now: DateTime<Local>) {
-            self.recomputed.push((id, now));
+            self.recomputed.push((id.clone(), now));
             if let Some(a) = self.alarms.iter_mut().find(|a| a.id == id) {
                 a.next_fire = now + Duration::days(1);
             }
@@ -312,7 +313,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(fire);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: 1, next_fire: fire });
+        source.alarms.push(DueAlarm { id: "1".to_string(), next_fire: fire });
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -325,9 +326,9 @@ mod tests {
         assert_eq!(report.skipped_missed, 0);
 
         let Scheduler { source, fsm, clock: _, booted } = sched;
-        assert_eq!(fsm.fired, vec![1], "FSM should have fired alarm 1");
+        assert_eq!(fsm.fired, vec!["1".to_string()], "FSM should have fired alarm 1");
         assert_eq!(
-            source.recomputed, vec![(1, fire)],
+            source.recomputed, vec![("1".to_string(), fire)],
             "next_fire should have been recomputed for alarm 1",
         );
         assert!(booted, "scheduler should be marked booted after first tick");
@@ -350,7 +351,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(now);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: 2, next_fire: future });
+        source.alarms.push(DueAlarm { id: "2".to_string(), next_fire: future });
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -383,7 +384,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(before);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: 3, next_fire: fire });
+        source.alarms.push(DueAlarm { id: "3".to_string(), next_fire: fire });
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -406,7 +407,7 @@ mod tests {
             source.nows, vec![before, fire],
             "clock should be re-read on each tick",
         );
-        assert_eq!(fsm.fired, vec![3]);
+        assert_eq!(fsm.fired, vec!["3".to_string()]);
     }
 
     // ── Task 1.2: missed-alarm-on-boot is skipped ────────────────────────
@@ -421,7 +422,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(now);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: 7, next_fire: past });
+        source.alarms.push(DueAlarm { id: "7".to_string(), next_fire: past });
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -435,7 +436,7 @@ mod tests {
         let Scheduler { source, fsm, mut clock, booted } = sched;
         assert!(fsm.fired.is_empty(), "FSM must not fire a missed-on-boot alarm");
         assert_eq!(
-            source.recomputed, vec![(7, now)],
+            source.recomputed, vec![("7".to_string(), now)],
             "next_fire should be recomputed (advanced) for the skipped alarm",
         );
         assert_eq!(
@@ -467,7 +468,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(fire);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: 9, next_fire: fire });
+        source.alarms.push(DueAlarm { id: "9".to_string(), next_fire: fire });
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -476,7 +477,7 @@ mod tests {
         assert_eq!(r.skipped_missed, 0);
 
         let Scheduler { source: _, fsm, clock: _, booted: _ } = sched;
-        assert_eq!(fsm.fired, vec![9]);
+        assert_eq!(fsm.fired, vec!["9".to_string()]);
     }
 
     // ── Task 1.3: scheduler_tick span emits with structured fields ──────
@@ -582,7 +583,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(fire);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: 11, next_fire: fire });
+        source.alarms.push(DueAlarm { id: "11".to_string(), next_fire: fire });
         let fsm = MockFsm::default();
         let mut sched = Scheduler::new(source, fsm, clock);
 

@@ -524,12 +524,12 @@ mod tests {
         let (ctrl, calls) = mock(vec![snap.clone()]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(7, "file:///alarm/source.mp3", 80);
+        fsm.fire("7".to_string(), "file:///alarm/source.mp3", 80);
 
         assert!(fsm.is_firing());
         match fsm.state() {
             EpisodeState::Firing { alarm_id, snapshot, .. } => {
-                assert_eq!(*alarm_id, 7);
+                assert_eq!(*alarm_id, "7".to_string());
                 assert_eq!(*snapshot, snap, "snapshot should be captured into Firing");
             }
             other => panic!("expected Firing, got {:?}", other),
@@ -567,7 +567,7 @@ mod tests {
         let (ctrl, calls) = mock(vec![snap.clone()]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///alarm/source.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm/source.mp3", 90);
         { calls.lock().unwrap().clear(); } // isolate restore calls
 
         fsm.dismiss();
@@ -606,7 +606,7 @@ mod tests {
         let (ctrl, calls) = mock(vec![snap]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(2, "file:///alarm/source.mp3", 90);
+        fsm.fire("2".to_string(), "file:///alarm/source.mp3", 90);
         { calls.lock().unwrap().clear(); }
 
         fsm.dismiss();
@@ -635,7 +635,7 @@ mod tests {
         let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(3, "file:///alarm/source.mp3", 100);
+        fsm.fire("3".to_string(), "file:///alarm/source.mp3", 100);
 
         assert!(fsm.is_firing());
         let snap = fsm.snapshot().unwrap().clone();
@@ -707,14 +707,14 @@ mod tests {
         let mut fsm = EpisodeController::new(ctrl);
 
         // First episode.
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         assert_eq!(fsm.snapshot().unwrap().clone(), first);
         fsm.dismiss();
 
         { calls.lock().unwrap().clear(); }
 
         // Second episode — snapshot reflects the advanced session.
-        fsm.fire(2, "file:///alarm.mp3", 90);
+        fsm.fire("2".to_string(), "file:///alarm.mp3", 90);
         assert_eq!(
             fsm.snapshot().unwrap().clone(),
             second,
@@ -779,17 +779,17 @@ mod tests {
         let mut fsm = EpisodeController::new(ctrl);
 
         // First episode.
-        fsm.fire(1, "file:///alarm1.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm1.mp3", 90);
         assert_eq!(fsm.snapshot().unwrap().clone(), first);
         { calls.lock().unwrap().clear(); }
 
         // Second fire mid-episode: dismiss-and-restore first, then fire queued.
-        fsm.fire(2, "file:///alarm2.mp3", 80);
+        fsm.fire("2".to_string(), "file:///alarm2.mp3", 80);
 
         // Still firing — but the queued alarm now.
         match fsm.state() {
             EpisodeState::Firing { alarm_id, snapshot, .. } => {
-                assert_eq!(*alarm_id, 2, "queued alarm should now be firing");
+                assert_eq!(*alarm_id, "2".to_string(), "queued alarm should now be firing");
                 assert_eq!(snapshot.clone(), second, "fresh snapshot for queued fire");
             }
             other => panic!("expected Firing(queued), got {:?}", other),
@@ -837,7 +837,7 @@ mod tests {
         let (ctrl, calls) = mock(vec![snap.clone()]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         assert!(fsm.is_firing());
         { calls.lock().unwrap().clear(); }
 
@@ -885,7 +885,7 @@ mod tests {
         let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         assert!(fsm.is_firing());
         // Snapshot should be None/defaults (Mopidy-down capture).
         let snap = fsm.snapshot().unwrap().clone();
@@ -908,7 +908,7 @@ mod tests {
         let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         { calls.lock().unwrap().clear(); }
 
         // NotConnected failure stays Firing.
@@ -950,7 +950,7 @@ mod tests {
         let (ctrl, calls) = mock(vec![snap.clone()]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///bad-source.mp3", 90);
+        fsm.fire("1".to_string(), "file:///bad-source.mp3", 90);
         assert!(fsm.is_firing());
         { calls.lock().unwrap().clear(); }
 
@@ -984,7 +984,7 @@ mod tests {
         let (ctrl, _calls) = mock(vec![snap]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         assert!(fsm.is_firing());
 
         // Advance past the grace window by sleeping.
@@ -1004,7 +1004,7 @@ mod tests {
         let (ctrl, _calls) = mock(vec![snap]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         assert!(fsm.is_firing());
 
         fsm.on_playback_state_changed(PlaybackState::Playing);
@@ -1022,7 +1022,7 @@ mod tests {
         let (ctrl, _calls) = mock(vec![snap]);
         let mut fsm = EpisodeController::new(ctrl);
 
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         assert!(fsm.is_firing());
 
         // Mopidy disconnects mid-episode.
@@ -1111,7 +1111,7 @@ mod tests {
         let before_enter = *entered.lock().unwrap();
         let before_exit = *exited.lock().unwrap();
 
-        fsm.fire(42, "file:///alarm.mp3", 90);
+        fsm.fire("42".to_string(), "file:///alarm.mp3", 90);
 
         assert_eq!(
             *entered.lock().unwrap(),
@@ -1152,7 +1152,7 @@ mod tests {
         let mut fsm = EpisodeController::new(ctrl);
 
         // Fire the alarm.
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         assert!(fsm.is_firing());
         { calls.lock().unwrap().clear(); } // isolate restore commands
 
@@ -1203,7 +1203,7 @@ mod tests {
         let mut fsm = EpisodeController::new(ctrl);
 
         // Fire then dismiss normally.
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
         fsm.dismiss();
         assert!(matches!(fsm.state(), EpisodeState::Dismissed));
         { calls.lock().unwrap().clear(); }
@@ -1226,7 +1226,7 @@ mod tests {
         let mut fsm = EpisodeController::new(ctrl);
 
         // Fire the alarm.
-        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.fire("1".to_string(), "file:///alarm.mp3", 90);
 
         // Measure wall-clock time of shutdown_restore.
         let start = Instant::now();

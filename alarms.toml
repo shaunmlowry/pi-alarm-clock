@@ -1,0 +1,61 @@
+# alarm-clock — dev alarm seed (task 8.1, design D9).
+#
+# This file is consumed at boot **if present** at `./alarms.toml` (the dev path)
+# in development builds. Each `[[alarms]]` entry is parsed into an `Alarm`
+# record and upserted into the database by `id` (idempotent — re-running boot
+# does not duplicate alarms). An `info!` log entry records the dev seeding with
+# a "dev seed" marker.
+#
+# In production this file is absent and the database is the sole source of
+# alarms (seeding happens via the future web slice). It exists so slice 1 can be
+# validated end-to-end without a web UI.
+#
+# Fields mirror the `Alarm` model but use a friendlier dev surface:
+#   preset = "Once" | "Daily" | "Weekdays" | "Weekends" | "Specific-days"
+#   days  = ["Mo","Fr"]          # only for Specific-days (two-letter BYDAY codes)
+#   time  = "HH:MM:SS"           # wall-clock local fire time
+#   once_at = "YYYY-MM-DDTHH:MM:SS"  # only for Once
+
+[[alarms]]
+id = "test-morning"
+enabled = true
+name = "Morning test"
+preset = "Daily"
+time = "07:30:00"
+timezone = "America/Edmonton"
+source_uri = "spotify:track:4uLU6hMCjMI75M1A2tKUQC"
+max_volume = 40
+
+[[alarms]]
+id = "test-weekdays"
+enabled = true
+name = "Weekday test"
+preset = "Weekdays"
+time = "08:15:00"
+timezone = "America/Edmonton"
+source_uri = "spotify:track:0VjIjW4GlUZAMYd2vXMi3b"
+max_volume = 35
+
+# Example of a Specific-days alarm (commented out — uncomment to test).
+# [[alarms]]
+# id = "test-mo-fr"
+# enabled = true
+# name = "Mo/Fr test"
+# preset = "Specific-days"
+# days = ["Mo", "Fr"]
+# time = "06:45:00"
+# timezone = "America/Edmonton"
+# source_uri = "spotify:track:..."
+# max_volume = 50
+
+# Example of a Once alarm (commented out — uncomment to test).
+# [[alarms]]
+# id = "test-once"
+# enabled = true
+# name = "One-shot test"
+# preset = "Once"
+# time = "07:30:00"
+# timezone = "America/Edmonton"
+# source_uri = "spotify:track:..."
+# max_volume = 40
+# once_at = "2026-07-01T07:30:00"

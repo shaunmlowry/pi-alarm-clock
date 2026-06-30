@@ -17,8 +17,15 @@ mod episode;
 mod schedule;
 mod scheduler;
 
-use crate::channel::{Cmd, Reply, MopidyEvent};
+use crate::alarm_store::{Alarm, AlarmStore};
+use crate::channel::{Cmd, CmdSender, Reply, MopidyEvent};
+use crate::episode::{EpisodeController, MopidyControl, MopidySnapshot};
+use crate::scheduler::{
+    AlarmSource, DueAlarm, EpisodeFsm, LocalClock, Scheduler, DEFAULT_TICK_INTERVAL,
+};
+use chrono::{DateTime, Local, Utc};
 use mopidy_client::state::MopidyConnectionState;
+use rusqlite::Connection;
 use tokio::sync::mpsc as tokio_mpsc;
 use crate::config::Config;
 use std::panic::{self, AssertUnwindSafe};
@@ -27,7 +34,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal as unix_signal};
 use tokio::sync::mpsc;
-use tracing::{info, info_span, warn};
+use tracing::{error, info, info_span, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -35,6 +42,226 @@ use tracing_subscriber::util::SubscriberInitExt;
 // with the `episode-firing` property and `dismiss-requested` callback
 // (tasks 7.1–7.3).
 slint::include_modules!();
+
+// ── Episode-FSM Mopidy control (channel-backed, task 9.1) ────────────────────
+
+/// [`MopidyControl`] backed by the cross-thread `Cmd` channel.
+///
+/// Replaces the slice-0 [`crate::episode::NoopMopidyControl`] no-op. Playback
+/// commands are issued fire-and-forget on the main thread as [`Cmd::CallMopidy`]
+/// envelopes (the tokio worker owns the live Mopidy WS client). The FSM never
+/// blocks awaiting a reply (design D4: optimistic transition with correction).
+///
+/// `capture_snapshot` returns `None`/defaults in slice 1: the snapshot reply
+/// correlation is not yet wired through the dispatcher, so the episode follows
+/// the Mopidy-down graceful-degradation path (task 6.1 — episode stays
+/// `Firing` and dismissable; restore is a no-op apart from volume/repeat/
+/// shuffle). This matches the slice-1 end-to-end Mopidy-down scenario.
+#[derive(Clone)]
+pub struct ChannelMopidyControl {
+    cmd_tx: CmdSender,
+}
+
+impl ChannelMopidyControl {
+    /// Construct from the main-side command sender.
+    pub fn new(cmd_tx: CmdSender) -> Self {
+        Self { cmd_tx }
+    }
+
+    /// Fire-and-forget a Mopidy JSON-RPC call across the `Cmd` channel.
+    ///
+    /// Uses `try_send` (non-blocking): on a full/closed channel the call is
+    /// dropped with a `warn!` (best-effort, never blocks the Slint event loop).
+    fn send_call(&self, method: &str, params: serde_json::Value) {
+        if let Err(e) = self.cmd_tx.try_send(Cmd::CallMopidy {
+            method: method.to_string(),
+            params,
+        }) {
+            warn!(method, error = %e, "dropped Mopidy command (channel full/closed)");
+        }
+    }
+}
+
+impl MopidyControl for ChannelMopidyControl {
+    fn capture_snapshot(&self) -> MopidySnapshot {
+        // Slice 1: snapshot reply correlation is not yet wired through the
+        // dispatcher. Proceed with defaults (Mopidy-down path, task 6.1).
+        info!(
+            "capture_snapshot: returning defaults (snapshot reply correlation not yet wired)"
+        );
+        MopidySnapshot::default()
+    }
+    fn tracklist_add(&self, uri: &str) {
+        self.send_call("tracklist.add", serde_json::json!({ "uris": [uri] }));
+    }
+    fn playback_play(&self) {
+        self.send_call("playback.play", serde_json::json!({}));
+    }
+    fn playback_stop(&self) {
+        self.send_call("playback.stop", serde_json::json!({}));
+    }
+    fn playback_seek(&self, position_ms: u32) {
+        self.send_call(
+            "playback.seek",
+            serde_json::json!({ "time_position": position_ms }),
+        );
+    }
+    fn tracklist_set_repeat(&self, on: bool) {
+        self.send_call("tracklist.set_repeat", serde_json::json!({ "repeat": on }));
+    }
+    fn tracklist_set_shuffle(&self, on: bool) {
+        self.send_call("tracklist.set_shuffle", serde_json::json!({ "shuffle": on }));
+    }
+    fn playback_set_volume(&self, volume: u8) {
+        self.send_call("playback.set_volume", serde_json::json!({ "volume": volume }));
+    }
+}
+
+// ── Scheduler seams backed by the real AlarmStore / EpisodeController ────────
+
+/// Shared, sendable handle to the single `rusqlite::Connection`.
+///
+/// The connection lives on the main thread; wrapping it in `Arc<Mutex<..>>`
+/// appeases the `Send` bound the `slint::Timer` closure requires (the mutex is
+/// never contended — only the main-thread tick ever locks it), mirroring the
+/// existing `Arc<Mutex<EpisodeController>>` pattern.
+pub type SharedConnection = Arc<Mutex<Connection>>;
+
+/// [`AlarmSource`] backed by the real [`AlarmStore`].
+///
+/// `due_alarms` lists enabled alarms whose stored `next_fire <= now` (parsed
+/// from the ISO-8601 UTC cache); `recompute_next_fire` recomputes all alarm
+/// caches from their rules in a single transaction (a superset of the
+/// single-alarm recompute the scheduler requests).
+pub struct StoreAlarmSource {
+    conn: SharedConnection,
+}
+
+impl StoreAlarmSource {
+    pub fn new(conn: SharedConnection) -> Self {
+        Self { conn }
+    }
+}
+
+impl AlarmSource for StoreAlarmSource {
+    fn due_alarms(&mut self, now: DateTime<Local>) -> Vec<DueAlarm> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                error!(error = %e, "alarm DB mutex poisoned — skipping due_alarms");
+                return Vec::new();
+            }
+        };
+        let store = AlarmStore::new(&*conn);
+        let alarms = match store.list() {
+            Ok(a) => a,
+            Err(e) => {
+                error!(error = %e, "failed to list alarms for scheduler tick");
+                return Vec::new();
+            }
+        };
+        drop(conn);
+
+        let mut due = Vec::new();
+        for alarm in alarms {
+            if !alarm.enabled {
+                continue;
+            }
+            let nf = match alarm.next_fire.as_ref() {
+                Some(s) => s,
+                None => continue, // not yet computed → not due
+            };
+            let nf_dt = match DateTime::parse_from_rfc3339(nf) {
+                Ok(dt) => dt.with_timezone(&Local),
+                Err(e) => {
+                    warn!(
+                        alarm_id = %alarm.id,
+                        error = %e,
+                        next_fire = %nf,
+                        "unparseable next_fire cache; skipping alarm",
+                    );
+                    continue;
+                }
+            };
+            if nf_dt <= now {
+                due.push(DueAlarm { id: alarm.id, next_fire: nf_dt });
+            }
+        }
+        due
+    }
+
+    fn recompute_next_fire(&mut self, _id: crate::scheduler::AlarmId, now: DateTime<Local>) {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                error!(error = %e, "alarm DB mutex poisoned — skipping recompute");
+                return;
+            }
+        };
+        let store = AlarmStore::new(&*conn);
+        let now_utc = now.with_timezone(&Utc);
+        if let Err(e) = store.recompute_next_fires(now_utc) {
+            error!(error = %e, "failed to recompute next_fire caches");
+        }
+    }
+}
+
+/// [`EpisodeFsm`] backed by the real [`EpisodeController`].
+///
+/// The scheduler only hands us an alarm id; the controller's `fire()` also
+/// needs the alarm's `source_uri` and `max_volume`, so this adapter looks the
+/// alarm up by id (a main-thread `&Connection` read) before invoking the FSM.
+/// Lock ordering is unidirectional (alarm-store read → release → episode
+/// mutex) so the drain/dismiss paths (which lock only the episode mutex) never
+/// deadlock.
+pub struct EpisodeFsmAdapter {
+    conn: SharedConnection,
+    episode: Arc<Mutex<EpisodeController<ChannelMopidyControl>>>,
+}
+
+impl EpisodeFsmAdapter {
+    pub fn new(
+        conn: SharedConnection,
+        episode: Arc<Mutex<EpisodeController<ChannelMopidyControl>>>,
+    ) -> Self {
+        Self { conn, episode }
+    }
+
+    /// Look up the alarm's `source_uri` / `max_volume` by id.
+    fn lookup_alarm(&self, alarm_id: &crate::scheduler::AlarmId) -> Option<Alarm> {
+        let conn = self.conn.lock().ok()?;
+        let store = AlarmStore::new(&*conn);
+        store.get(alarm_id).ok().flatten()
+    }
+}
+
+impl EpisodeFsm for EpisodeFsmAdapter {
+    fn fire(&mut self, alarm_id: crate::scheduler::AlarmId) {
+        let alarm = match self.lookup_alarm(&alarm_id) {
+            Some(a) => a,
+            None => {
+                warn!(
+                    alarm_id = %alarm_id,
+                    "fire requested for an unknown/disabled alarm; ignoring",
+                );
+                return;
+            }
+        };
+        let max_volume = alarm.max_volume.clamp(0, 100) as u8;
+        if let Ok(mut ctl) = self.episode.lock() {
+            ctl.fire(alarm_id, &alarm.source_uri, max_volume);
+        } else {
+            error!(alarm_id = %alarm_id, "episode mutex poisoned — fire dropped");
+        }
+    }
+}
+
+/// Handle that keeps the bootstrap-installed `slint::Timer`s alive across the
+/// Slint event loop. Dropping it stops both the drain and scheduler ticks.
+pub struct AppTimers {
+    _drain: slint::Timer,
+    _scheduler: slint::Timer,
+}
 
 // ── Observability (tracing → journald / fmt fallback) ────────────────────────
 
@@ -54,12 +281,6 @@ fn init_tracing() {
                 .init();
         }
     }
-}
-
-/// Placeholder: `episode` span (defined for later slices, currently unused).
-#[allow(dead_code)]
-fn _create_episode_span() -> tracing::Span {
-    tracing::info_span!("episode")
 }
 
 // ── Tokio worker (async command dispatcher) ───────────────────────────────────
@@ -232,7 +453,7 @@ fn spawn_tokio_worker(
 /// The returned [`JoinHandle`] can be `.join()`d to wait for the tokio worker
 /// to finish; in normal operation the handle is parked (the application lives
 /// as long as the Slint event loop runs).
-pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
+pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimers) {
     let cfg = Config::load();
 
     info!(
@@ -246,7 +467,7 @@ pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
 
     // Create cross-thread channels (task 2.1).
     let handles = channel::create_channels();
-    let _cmd_sender = handles.main.cmd_sender;
+    let cmd_sender = handles.main.cmd_sender;
     let mut reply_rx = handles.main.reply_receiver;
     let mut event_rx = handles.main.event_receiver;
     let tokio_handles = handles.tokio;
@@ -273,21 +494,22 @@ pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
 
     info!("tokio worker thread spawned successfully");
 
-    // ── Shutdown wiring (task 6.5) ──────────────────────────────────────
+    // ── Episode FSM (task 9.1) ──────────────────────────────────────
     //
-    // Create an episode controller so the shutdown handler can call
-    // `shutdown_restore()` before draining the Cmd channel and exiting.
-    // Uses NoopMopidyControl as a placeholder; group 9.1 will wire the
-    // real Mopidy-backed impl.
+    // Create the episode controller so the shutdown handler can call
+    // `shutdown_restore()` (task 6.5) before draining the Cmd channel and
+    // exiting. Its [`MopidyControl`] seam is the channel-backed
+    // [`ChannelMopidyControl`] (the slice-0 `NoopMopidyControl` no-op is
+    // replaced by group 9.1).
     //
     // Wrapped in `Arc<Mutex<..>>` (task 7.3) so the dismiss tap handler —
-    // registered on the `AppWindow` below — and the drain timer can both
-    // reach the FSM on the main thread. `Arc` (not `Rc`) because the slint
-    // drain `Timer` closure must be `Send`.
-    let episode_ctl: Arc<Mutex<episode::EpisodeController<episode::NoopMopidyControl>>> =
-        Arc::new(Mutex::new(
-            episode::EpisodeController::new(episode::NoopMopidyControl),
-        ));
+    // registered on the `AppWindow` below — the drain timer, and the
+    // scheduler's [`EpisodeFsmAdapter`] can all reach the FSM on the main
+    // thread. (`slint::Timer` closures do not require `Send` in this version,
+    // but `Arc` is kept for the shared-ownership pattern.)
+    let episode_ctl: Arc<Mutex<EpisodeController<ChannelMopidyControl>>> = Arc::new(
+        Mutex::new(EpisodeController::new(ChannelMopidyControl::new(cmd_sender))),
+    );
 
     // ── Slint AppWindow + episode UI wiring (tasks 7.2 / 7.3) ─────────────
     //
@@ -328,6 +550,10 @@ pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
     // event channel on every Slint tick. It uses `try_recv` so main never
     // blocks waiting for the tokio worker. Each received item is dispatched
     // directly into domain handlers on the main thread — no locks needed.
+
+    // The drain timer below moves `episode_ctl` into its closure; clone it now
+    // for the scheduler's `EpisodeFsmAdapter` (constructed after the drain timer).
+    let episode_ctl_for_scheduler = Arc::clone(&episode_ctl);
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
@@ -391,15 +617,33 @@ pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
     // Until the real `AlarmStore` (group 3) and `EpisodeController` (group 5)
     // are wired in by group 9.1, the scheduler runs over no-op seam impls —
     // the tick machinery and span are exercised, but no real alarms fire yet.
-    let scheduler_state = Mutex::new(scheduler::Scheduler::new(
-        scheduler::NoopAlarmSource,
-        scheduler::NoopEpisodeFsm,
-        scheduler::LocalClock,
+    // Boot recompute (task 3.4): populate/refresh the `next_fire` caches
+    // from each alarm's rule once before the first tick (design D1).
+    {
+        if let Ok(conn_guard) = conn.lock() {
+            let store = AlarmStore::new(&*conn_guard);
+            if let Err(e) = store.recompute_next_fires(Utc::now()) {
+                error!(error = %e, "boot recompute of next_fire caches failed");
+            } else {
+                info!("boot recompute: next_fire caches refreshed");
+            }
+        } else {
+            error!("alarm DB mutex poisoned at boot; skipping recompute");
+        }
+    }
+
+    // Group 9.1: wire the real [`StoreAlarmSource`] (over [`AlarmStore`]) and
+    // [`EpisodeFsmAdapter`] (over the [`EpisodeController`] above) in place of
+    // the slice-0 no-op seams, so real alarms now drive the episode FSM.
+    let scheduler_state = Mutex::new(Scheduler::new(
+        StoreAlarmSource::new(Arc::clone(&conn)),
+        EpisodeFsmAdapter::new(Arc::clone(&conn), episode_ctl_for_scheduler),
+        LocalClock,
     ));
     let scheduler_timer = slint::Timer::default();
     scheduler_timer.start(
         slint::TimerMode::Repeated,
-        scheduler::DEFAULT_TICK_INTERVAL,
+        DEFAULT_TICK_INTERVAL,
         move || {
             // Design D6: isolate the tick body so a bug never sinks the alarm
             // guarantee; the timer reschedules on its next interval.
@@ -411,23 +655,22 @@ pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
         },
     );
     info!(
-        interval_secs = scheduler::DEFAULT_TICK_INTERVAL.as_secs(),
+        interval_secs = DEFAULT_TICK_INTERVAL.as_secs(),
         "scheduler timer installed",
     );
 
-    // Keep the scheduler timer alive for the bootstrap scope (same lifetime
-    // model as the drain timer above; group 9.1 will host both across the
-    // Slint event loop).
-    let _scheduler_timer = scheduler_timer;
-
     // Hold the `AppWindow` alive across the bootstrap scope so the weak refs
-    // captured by the drain timer and the dismiss callback remain valid. Group
-    // 9.1 hosts `.run()` to drive the Slint event loop; until then the window
-    // is held here (and returned to `main`) so the episode-UI wiring is live
-    // when 9.1 runs it.
+    // captured by the drain timer and the dismiss callback remain valid. The
+    // timers are returned in [`AppTimers`] so `main` can keep them alive
+    // across `.run()` (a dropped `slint::Timer` stops firing).
     let _app_window = app_window;
 
-    (worker_handle, _app_window)
+    let timers = AppTimers {
+        _drain: timer,
+        _scheduler: scheduler_timer,
+    };
+
+    (worker_handle, _app_window, timers)
 }
 
 /// Dispatch a [`Reply`] from the tokio worker into the domain.
@@ -436,7 +679,7 @@ pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
 /// update Slint UI models. Runs on main via the drain timer callback.
 fn dispatch_reply_to_domain(
     reply: Reply,
-    episode_ctl: &std::sync::Mutex<episode::EpisodeController<episode::NoopMopidyControl>>,
+    episode_ctl: &std::sync::Mutex<EpisodeController<ChannelMopidyControl>>,
 ) {
     match reply {
         Reply::MopidyState(state) => {
@@ -530,7 +773,7 @@ fn sd_notify_ready() {
 /// 4. Commit any pending DB transaction — no-op in slice 0 (DB not yet wired).
 /// 5. Exit with status 0.
 fn execute_shutdown(
-    episode_ctl: &std::sync::Mutex<episode::EpisodeController<episode::NoopMopidyControl>>,
+    episode_ctl: &std::sync::Mutex<EpisodeController<ChannelMopidyControl>>,
 ) {
     info!("shutdown sequence starting");
 
@@ -580,7 +823,8 @@ fn main() -> anyhow::Result<()> {
 
     info!("database: migrations complete");
 
-    let (worker_handle, _app_window) = info_span!("bootstrap").in_scope(|| bootstrap());
+    let (worker_handle, app_window, timers) =
+        info_span!("bootstrap").in_scope(|| bootstrap(Arc::new(Mutex::new(conn))));
 
     // systemd readiness (Design D10): signal READY=1 after all bootstrap steps
     // complete even when Mopidy is not yet reachable.
@@ -588,16 +832,19 @@ fn main() -> anyhow::Result<()> {
 
     info!("alarm-clock: bootstrap complete — application running");
 
-    // In later slices, the Slint window will be created and `.run()` here,
-    // keeping main alive. For slice 0 verification we park for a short
-    // period to allow any pending timer ticks to fire.
-    //
-    // Slice 1 (tasks 7.1–7.3): the `AppWindow` is now created in `bootstrap`
-    // and held here as `_app_window`; group 9.1 will call `_app_window.run()`
-    // to drive the Slint event loop.
-    //
-    // Dropping `cmd_sender` (when it goes out of scope at end of lifetime)
-    // will cause the tokio worker's recv loop to terminate naturally.
+    // Task 9.1: drive the Slint event loop. The drain and scheduler timers
+    // (held in `timers`) fire on each tick while `.run()` blocks; the episode
+    // UI (`episode-firing` / `dismiss-requested`) is bound to this window. On
+    // SIGTERM/SIGINT the worker sends `Reply::ShutdownRequested`, the drain
+    // dispatches `execute_shutdown` (which restores any firing episode before
+    // `process::exit(0)`), interrupting `.run()`.
+    let _ = app_window.run();
+
+    // `.run()` returned (window closed / `slint::quit()`). Drop the timers and
+    // the window so the only `Cmd` sender (inside the episode FSM) is released,
+    // closing the channel and letting the tokio worker exit before join.
+    drop(timers);
+    drop(app_window);
     let _ = worker_handle.join();
 
     Ok(())
@@ -612,7 +859,7 @@ fn main() -> anyhow::Result<()> {
 /// reschedules because the timer fires again on its interval.
 pub(crate) fn protected_tick<F>(body: F)
 where
-    F: FnOnce() + Send,
+    F: FnOnce(),
 {
     let result = panic::catch_unwind(AssertUnwindSafe(body));
     if let Err(err) = result {
@@ -701,9 +948,27 @@ mod tests {
     /// the drain timer without panicking or deadlocking.
     #[test]
     fn bootstrap_creates_worker_and_timer() {
-        let _handle = bootstrap();
+        // bootstrap now owns the single `Connection` (wrapped in `Arc<Mutex>`
+        // so the `slint::Timer` closures are `Send`). Build a fresh migrated
+        // temp DB for this run.
+        let path = std::env::temp_dir().join(format!(
+            "alarm_bootstrap_test_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = crate::database::open_connection(path.to_str().unwrap())
+            .expect("open db");
+        crate::database::run_migrations(&conn).expect("migrations");
+
+        let _result = bootstrap(Arc::new(Mutex::new(conn)));
         // If we get here without deadlocking or panicking, the structure is
         // sound: channels created, thread spawned, timer installed.
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Scenario: sending a command through the full channel topology reaches

@@ -63,7 +63,7 @@
 
 ## 9. Integration & acceptance
 
-- [ ] 9.1 Wire the scheduler tick, episode FSM, and alarm episode UI into `main.rs` (replacing slice-0 no-ops); ensure `cargo check --workspace` and `cargo test --workspace` pass.
+- [x] 9.1 Wire the scheduler tick, episode FSM, and alarm episode UI into `main.rs` (replacing slice-0 no-ops); ensure `cargo check --workspace` and `cargo test --workspace` pass.
 - [ ] 9.2 End-to-end (dev Mopidy with a playable URI): seed a daily alarm due in ~1 minute; verify it fires, plays the source looping at `max_volume`, and on tap dismisses and restores the prior Mopidy session (track, position, volume, repeat, shuffle).
 - [ ] 9.3 End-to-end Mopidy-down: stop Mopidy before the fire time; verify the alarm still fires (audio silently fails, logged), the UI is dismissable, and the process does not hang or crash.
 - [ ] 9.4 End-to-end shutdown mid-episode: fire an alarm, `systemctl stop` (or SIGTERM); verify the snapshot is restored before exit (exit code 0, restore logged).

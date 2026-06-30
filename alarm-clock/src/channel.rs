@@ -47,7 +47,7 @@ pub enum Cmd {
     Shutdown,
 
     /// Fire an alarm by ID (for alarm scheduling in slice 1).
-    FireAlarm { alarm_id: i64 },
+    FireAlarm { alarm_id: String },
 
     /// Dismiss the current alarm episode (task 7.3).
     Dismiss,

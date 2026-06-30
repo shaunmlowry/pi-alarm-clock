@@ -22,6 +22,10 @@ pub enum ConfigError {
     /// Failed to apply a migration step.
     #[error("migration failed at step {step}: {detail}")]
     MigrationFailed { step: u32, detail: String },
+
+    /// Failed to parse or apply the dev `alarms.toml` seed file.
+    #[error("dev seed error: {0}")]
+    Seed(String),
 }
 /// Application-level result alias for the app boundary.
 pub type Result<T, E = ConfigError> = std::result::Result<T, E>;
