@@ -8,6 +8,7 @@
 //! A `slint::Timer` drains replies and events non-blockingly on each tick,
 //! dispatching them to the domain without ever sleeping main.
 
+mod alarm_store;
 mod channel;
 mod config;
 mod database;
