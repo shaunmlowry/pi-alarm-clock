@@ -24,9 +24,11 @@
 //! `None`/defaults (task 5.3 graceful-degradation path). The remaining
 //! commands (`tracklist.add`, `playback.play`, `set_repeat`, `set_volume`,
 //! `set_shuffle`, `stop`, `seek`) are fire-and-forget on the main thread — the
-//! FSM transitions optimistically and the reply drain (task 5.5, later group)
-//! corrects state on failure. Slice 1's FSM does not block the Slint event
-//! loop awaiting a reply.
+//! FSM transitions optimistically (task 5.5) and does not block awaiting a
+//! reply. Replies arrive on the reply channel and are dispatched to the FSM on
+//! the next tick; [`EpisodeController::on_command_failure`] is the correction
+//! hook the drain calls when a reply indicates failure (logged). Slice 1's FSM
+//! does not block the Slint event loop awaiting a reply.
 
 use tracing::{info, info_span};
 use tracing::span::EnteredSpan;
@@ -170,24 +172,26 @@ impl<C: MopidyControl> EpisodeController<C> {
     /// alarm's `source_uri` looping at `max_volume` (task 5.3).
     ///
     /// Begin a fresh episode from `Idle` or `Dismissed` (a restored state).
-    /// second-alarm-during-episode case (task 5.6, not this group); slice 1
-    /// policy is to serialize, but the dismiss-and-re-fire orchestration is
-    /// task 5.6's responsibility — here we guard against overlapping episodes
-    /// by ignoring the call (logged).
+    /// A fire while already `Firing` is the second-alarm-during-episode case
+    /// (task 5.6): slice 1 serializes by dismissing-and-restoring the current
+    /// episode, then firing the queued alarm (no overlap). The commands issued
+    /// here are fire-and-forget on main (task 5.5): the FSM transitions
+    /// optimistically to `Firing` without awaiting a reply; the reply drain
+    /// corrects state on failure via [`on_command_failure`](Self::on_command_failure).
     ///
     /// `source_uri` is the alarm's stored source URI; `max_volume` is the
     /// alarm's stored max volume (0..100).
     pub fn fire(&mut self, alarm_id: AlarmId, source_uri: &str, max_volume: u8) {
-        if let EpisodeState::Firing { .. } = self.state {
-            // A fire while already Firing is the second-alarm-during-episode
-            // case (task 5.6). Slice 1 serializes via dismiss-and-re-fire, but
-            // that orchestration is task 5.6's responsibility — here we guard
-            // against overlapping episodes by ignoring the call (logged).
+        if self.is_firing() {
+            // Task 5.6: second-alarm serialization. Dismiss-and-restore the
+            // current episode, then fall through to fire the queued alarm.
             info!(
                 alarm_id,
-                "fire() called while Firing — ignoring (second-alarm serialization is task 5.6)",
+                "second alarm while Firing — dismissing current episode then firing queued",
             );
-            return;
+            self.dismiss();
+            // State is now `Dismissed` (restored); fall through to begin the
+            // new episode below.
         }
         // From `Idle` or `Dismissed` (a restored state) a fresh episode begins.
 
@@ -275,6 +279,38 @@ impl<C: MopidyControl> EpisodeController<C> {
         match &self.state {
             EpisodeState::Firing { snapshot, .. } => Some(snapshot),
             _ => None,
+        }
+    }
+
+    /// Correction hook for the optimistic-transition-with-correction pattern
+    /// (task 5.5).
+    ///
+    /// The FSM issues Mopidy commands fire-and-forget and transitions
+    /// optimistically to `Firing` without awaiting a reply. Replies arrive on
+    /// the reply channel and are dispatched to the FSM on the next tick; the
+    /// drain calls this method when a reply indicates failure (e.g.
+    /// `NotConnected`, a JSON-RPC error, or a timeout).
+    ///
+    /// For slice 1 the correction is to dismiss-and-restore the current
+    /// episode (a failed fire cannot produce a working alarm; the
+    /// source-failure grace window is task 6.2). The failure is logged with
+    /// `command` and `error` structured fields. Calling this while not `Firing`
+    /// is a logged no-op.
+    pub fn on_command_failure(&mut self, command: &str, error: &str) {
+        info!(command, error, "mopidy command failure reply received");
+        if self.is_firing() {
+            info!(
+                command,
+                error,
+                "correcting FSM state: dismissing-and-restoring after command failure",
+            );
+            self.dismiss();
+        } else {
+            info!(
+                command,
+                error,
+                "command failure reported while not Firing — no correction needed",
+            );
         }
     }
 
@@ -600,26 +636,127 @@ mod tests {
         assert!({ calls.lock().unwrap().is_empty() });
     }
 
-    /// Scenario: a `fire()` while already `Firing` is ignored (no second
-    /// overlapping episode; serialization is task 5.6).
+    /// Scenario: a `fire()` while already `Firing` dismisses-and-restores the
+    /// current episode then fires the queued alarm (task 5.6: second-alarm
+    /// serialization; no overlap).
     #[test]
-    fn fire_while_firing_is_ignored() {
-        let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
+    fn fire_while_firing_serializes() {
+        let first = MopidySnapshot {
+            uri: Some("file:///music/a.mp3".into()),
+            position_ms: 1_000,
+            was_playing: true,
+            seekable: true,
+            volume: 20,
+            repeat: false,
+            shuffle: false,
+        };
+        // Second capture reflects the (now advanced) session at the second fire.
+        let second = MopidySnapshot {
+            uri: Some("file:///music/b.mp3".into()),
+            position_ms: 5_000,
+            was_playing: true,
+            seekable: true,
+            volume: 50,
+            repeat: true,
+            shuffle: false,
+        };
+        let (ctrl, calls) = mock(vec![first.clone(), second.clone()]);
         let mut fsm = EpisodeController::new(ctrl);
 
+        // First episode.
         fsm.fire(1, "file:///alarm1.mp3", 90);
-        let first_calls = { calls.lock().unwrap().len() };
+        assert_eq!(fsm.snapshot().unwrap().clone(), first);
+        { calls.lock().unwrap().clear(); }
 
-        // A second fire mid-episode must not overlap (task 5.6 handles it).
-        fsm.fire(2, "file:///alarm2.mp3", 90);
-        let no_new = { calls.lock().unwrap().len() } == first_calls;
-        assert!(no_new, "second fire while Firing must not issue new commands");
+        // Second fire mid-episode: dismiss-and-restore first, then fire queued.
+        fsm.fire(2, "file:///alarm2.mp3", 80);
 
-        // Still firing the first alarm.
+        // Still firing — but the queued alarm now.
         match fsm.state() {
-            EpisodeState::Firing { alarm_id, .. } => assert_eq!(*alarm_id, 1),
-            other => panic!("expected Firing(first), got {:?}", other),
+            EpisodeState::Firing { alarm_id, snapshot, .. } => {
+                assert_eq!(*alarm_id, 2, "queued alarm should now be firing");
+                assert_eq!(snapshot.clone(), second, "fresh snapshot for queued fire");
+            }
+            other => panic!("expected Firing(queued), got {:?}", other),
         }
+
+        // The recorded calls should be: restore of the first episode, then
+        // the fire sequence of the second alarm.
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                // restore of the first episode (was_playing, seekable)
+                "set_repeat(false)".to_string(),
+                "set_shuffle(false)".to_string(),
+                "set_volume(20)".to_string(),
+                "add(file:///music/a.mp3)".to_string(),
+                "play".to_string(),
+                "seek(1000)".to_string(),
+                // fire of the queued second alarm
+                "add(file:///alarm2.mp3)".to_string(),
+                "play".to_string(),
+                "set_repeat(true)".to_string(),
+                "set_volume(80)".to_string(),
+            ],
+            "second fire should dismiss-and-restore then fire the queued alarm",
+        );
+    }
+
+    // ── Task 5.5 / scenario: optimistic transition with correction ───────
+
+    /// Scenario: the reply drain reports a command failure while `Firing`; the
+    /// FSM corrects by dismissing-and-restoring (logged), ending the episode
+    /// without blocking the event loop.
+    #[test]
+    fn command_failure_corrects_firing_to_dismissed() {
+        let snap = MopidySnapshot {
+            uri: Some("file:///music/a.mp3".into()),
+            position_ms: 1_000,
+            was_playing: true,
+            seekable: true,
+            volume: 20,
+            repeat: false,
+            shuffle: false,
+        };
+        let (ctrl, calls) = mock(vec![snap.clone()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        assert!(fsm.is_firing());
+        { calls.lock().unwrap().clear(); }
+
+        // The reply drain dispatches a failure (no blocking — called on tick).
+        fsm.on_command_failure("playback.play", "NotConnected");
+
+        // Corrected: episode dismissed and restored.
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+        assert_eq!(fsm.snapshot(), None);
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                "set_repeat(false)".to_string(),
+                "set_shuffle(false)".to_string(),
+                "set_volume(20)".to_string(),
+                "add(file:///music/a.mp3)".to_string(),
+                "play".to_string(),
+                "seek(1000)".to_string(),
+            ],
+            "command failure while Firing should dismiss-and-restore",
+        );
+    }
+
+    /// Scenario: a command failure reported while not `Firing` is a logged
+    /// no-op (no spurious restore).
+    #[test]
+    fn command_failure_while_idle_is_noop() {
+        let (ctrl, calls) = mock(vec![]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.on_command_failure("playback.play", "timeout");
+        assert!(matches!(fsm.state(), EpisodeState::Idle));
+        assert!({ calls.lock().unwrap().is_empty() });
     }
 
     // ── Task 5.1: episode span entered on fire, exited on restore ────────

@@ -35,9 +35,9 @@
 - [x] 5.2 Define `MopidySnapshot { uri, position_ms, was_playing, seekable, volume, repeat, shuffle }`.
 - [x] 5.3 Implement `fire()`: capture the snapshot (batch the `get_state`/`get_time_position`/`get_volume`/`tracklist.get_repeat`/`get_shuffle`/tracklist reads; bound by a 1s wait, proceed with `None`/defaults on timeout or `NotConnected`)); then `tracklist.add(source_uri)` + `playback.play` + `tracklist.set_repeat(true)` + `playback.set_volume(max_volume)`.
 - [x] 5.4 Implement `dismiss()`: transition to `Dismissed`, restore the snapshot (`set_repeat`, `set_shuffle`, `set_volume`; if `uri` Some and `was_playing`: `tracklist.add` + `play` + seek `position_ms`; if not playing: `stop`; if `uri` None: restore volume/repeat/shuffle only).
-- [ ] 5.5 Implement the optimistic-transition-with-correction pattern: the FSM does not block awaiting replies; the reply drain corrects FSM state on failure (logged).
-- [ ] 5.6 Implement second-alarm serialization: a fire while `Firing` dismisses-and-restores the current episode then fires the queued alarm.
-- [ ] 5.7 Unit-test the FSM: fire → Firing; dismiss → Dismissed → restore issued; snapshot fresh per fire.
+- [x] 5.5 Implement the optimistic-transition-with-correction pattern: the FSM does not block awaiting replies; the reply drain corrects FSM state on failure (logged).
+- [x] 5.6 Implement second-alarm serialization: a fire while `Firing` dismisses-and-restores the current episode then fires the queued alarm.
+- [x] 5.7 Unit-test the FSM: fire → Firing; dismiss → Dismissed → restore issued; snapshot fresh per fire.
 
 ## 6. Graceful degradation & shutdown restore
 
