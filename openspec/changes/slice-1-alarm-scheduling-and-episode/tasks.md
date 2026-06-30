@@ -67,5 +67,5 @@
 - [ ] 9.2 End-to-end (dev Mopidy with a playable URI): seed a daily alarm due in ~1 minute; verify it fires, plays the source looping at `max_volume`, and on tap dismisses and restores the prior Mopidy session (track, position, volume, repeat, shuffle).
 - [ ] 9.3 End-to-end Mopidy-down: stop Mopidy before the fire time; verify the alarm still fires (audio silently fails, logged), the UI is dismissable, and the process does not hang or crash.
 - [ ] 9.4 End-to-end shutdown mid-episode: fire an alarm, `systemctl stop` (or SIGTERM); verify the snapshot is restored before exit (exit code 0, restore logged).
-- [ ] 9.5 End-to-end DST: seed a daily alarm across a DST boundary (mock or real); verify it fires at the same wall-clock local time on both sides.
+- [x] 9.5 End-to-end DST: seed a daily alarm across a DST boundary (mock or real); verify it fires at the same wall-clock local time on both sides.
 - [ ] 9.6 Verify on the Pi: `journalctl` shows `scheduler_tick` and `episode` spans with structured fields; `user_version=2` after migration; `alarms` table round-trips.

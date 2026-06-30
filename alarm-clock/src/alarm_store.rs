@@ -353,6 +353,7 @@ fn iso_now() -> String {
 mod tests {
     use super::*;
     use crate::database::{open_connection, run_migrations};
+    use chrono::Offset;
 
     /// Build a fresh, migrated in-memory-backed temp DB and return its
     /// `AlarmStore`.
@@ -599,6 +600,101 @@ mod tests {
             .unwrap();
         let got = store.get("alarm-rb").unwrap().expect("original row intact");
         assert_eq!(got.id, "alarm-rb");
+
+        cleanup(path);
+    }
+
+    /// Task 9.5 — End-to-end DST: seed a daily alarm across a DST boundary;
+    /// verify it fires at the same wall-clock local time on both sides.
+    ///
+    /// Scenario: seed a daily alarm for 07:30 in `America/Edmonton`;
+    /// recompute next-fire before the spring-forward (MST, UTC-7) and after
+    /// it (MDT, UTC-6); assert both yield wall-clock "07:30:00" despite the
+    /// underlying UTC offset shifting by 1 hour.
+    #[test]
+    fn e2e_daily_alarm_fires_same_wall_clock_across_dst_boundary() {
+        let (path, store) = fresh_store();
+
+        // Seed a daily alarm for 07:30 America/Edmonton (simulates dev alarm
+        // seeding through the persistence layer).
+        let alarm = Alarm {
+            id: "dst-e2e-daily".to_string(),
+            enabled: true,
+            name: "DST end-to-end daily".to_string(),
+            time_local: "07:30:00".to_string(),
+            timezone: "America/Edmonton".to_string(),
+            rrule: Some("FREQ=DAILY".to_string()),
+            once_at: None,
+            source_uri: "coreaudio://alarm.mp3".to_string(),
+            max_volume: 40,
+            next_fire: None,
+            created_at: "2026-01-01T00:00:00+00:00".to_string(),
+            updated_at: "2026-01-01T00:00:00+00:00".to_string(),
+        };
+        store.upsert(&alarm).expect("seed upsert should succeed");
+
+        let tz: Tz = "America/Edmonton".parse().unwrap();
+
+        // --- Before DST spring-forward (2026-03-08 02:00 MST→MDT) ---
+        // now = Mar 7 midnight MST → next fire should be Mar 7 07:30 MST.
+        let before_dst = tz.with_ymd_and_hms(2026, 3, 7, 0, 0, 0).unwrap();
+        let now_before = before_dst.with_timezone(&Utc);
+        store.recompute_next_fires(now_before).expect("recompute before DST");
+
+        let got_before = store.get("dst-e2e-daily").unwrap().unwrap();
+        let nf_before = got_before.next_fire.expect("next_fire populated before DST");
+        let dt_before = DateTime::parse_from_rfc3339(&nf_before)
+            .unwrap()
+            .with_timezone(&tz);
+        assert_eq!(
+            dt_before.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-07 07:30:00",
+            "wall-clock before DST should be 07:30:00 MST"
+        );
+        assert_eq!(
+            dt_before.offset().fix().local_minus_utc(),
+            -7 * 3600,
+            "before DST offset should be negative for UTC-7 (MST)"
+        );
+
+        // --- After DST spring-forward ---
+        // now = Mar 8 at 04:00 MDT (after the boundary at 03:00, before alarm)
+        let after_dst = tz.with_ymd_and_hms(2026, 3, 8, 4, 0, 0).unwrap();
+        let now_after = after_dst.with_timezone(&Utc);
+        store.recompute_next_fires(now_after).expect("recompute after DST");
+
+        let got_after = store.get("dst-e2e-daily").unwrap().unwrap();
+        let nf_after = got_after.next_fire.expect("next_fire populated after DST");
+        let dt_after = DateTime::parse_from_rfc3339(&nf_after)
+            .unwrap()
+            .with_timezone(&tz);
+        // Same wall-clock time!
+        assert_eq!(
+            dt_after.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-08 07:30:00",
+            "wall-clock after DST should still be 07:30:00 MDT"
+        );
+        assert_eq!(
+            dt_after.offset().fix().local_minus_utc(),
+            -6 * 3600,
+            "after DST offset should be negative for UTC-6 (MDT)"
+        );
+
+        // --- Cross-boundary consistency ---
+        // Both fires report the same wall-clock HH:MM:SS.
+        assert_eq!(
+            dt_before.format("%H:%M:%S").to_string(),
+            dt_after.format("%H:%M:%S").to_string(),
+            "wall-clock HH:MM:SS must be identical on both sides of DST",
+        );
+        // But the UTC instants differ by only 1 hour (not 0, not 2).
+        let utc_before = dt_before.with_timezone(&Utc);
+        let utc_after = dt_after.with_timezone(&Utc) - chrono::Duration::days(1);
+        assert_eq!(
+            utc_after - utc_before,
+            chrono::Duration::hours(-1),
+            "UTC shifted by 1 hour across DST (wall-clock preserved)"
+        );
 
         cleanup(path);
     }
