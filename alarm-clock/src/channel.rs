@@ -34,6 +34,12 @@ pub enum Cmd {
     /// Request the current Mopidy playback state.
     GetMopidyState,
 
+    /// Capture a fresh Mopidy snapshot (slice 1, episode FSM). Batches the
+    /// `get_state` / `get_time_position` / `get_volume` / `tracklist.get_repeat`
+    /// / `get_shuffle` / tracklist reads, bounded by a 1 s wait; on timeout or
+    /// `NotConnected`, returns `None`/defaults. The reply is `Reply::Snapshot`.
+    CaptureSnapshot,
+
     /// Call a Mopidy JSON-RPC method with named parameters.
     CallMopidy { method: String, params: Value },
 

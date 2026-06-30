@@ -1,0 +1,688 @@
+//! Episode FSM (slice 1, tasks 5.1–5.4).
+//!
+//! Design D4: a single-threaded state machine owned by main with states
+//! `Idle → Firing → Dismissed`. The FSM is driven by the scheduler tick (fires),
+//! the Mopidy reply/event drain (state changes), the UI (dismiss tap), and
+//! shutdown (`shutdown_restore()`, task 6.4 — not in this group).
+//!
+//! - **`Idle`**: no episode active.
+//! - **`Firing`**: a snapshot was captured at fire time and the alarm's
+//!   `source_uri` is playing looping at `max_volume`. Holds the `alarm_id`
+//!   and the captured [`MopidySnapshot`]. Only one episode is active at a
+//!   time; the `episode` [`tracing`] span is entered on `fire()` and held
+//!   entered for the whole episode lifetime.
+//! - **`Dismissed`**: the snapshot has been restored (playback resumed/stopped,
+//!   volume/repeat/shuffle restored). The `episode` span exits when restore
+//!   completes.
+//!
+//! ## Non-blocking model
+//!
+//! Mopidy commands are issued through the [`MopidyControl`] seam. The seam's
+//! `capture_snapshot` batches the `get_state` / `get_time_position` /
+//! `get_volume` / `tracklist.get_repeat` / `get_shuffle` / tracklist reads and
+//! is bounded by a 1 s wait; on timeout or `NotConnected` it returns
+//! `None`/defaults (task 5.3 graceful-degradation path). The remaining
+//! commands (`tracklist.add`, `playback.play`, `set_repeat`, `set_volume`,
+//! `set_shuffle`, `stop`, `seek`) are fire-and-forget on the main thread — the
+//! FSM transitions optimistically and the reply drain (task 5.5, later group)
+//! corrects state on failure. Slice 1's FSM does not block the Slint event
+//! loop awaiting a reply.
+
+use tracing::{info, info_span};
+use tracing::span::EnteredSpan;
+
+use crate::scheduler::AlarmId;
+
+/// Upper bound for snapshot capture (task 5.3): a 1 s wait; on timeout or
+/// `NotConnected`, proceed with `None`/defaults.
+#[allow(dead_code)] // slice-1 seam; consumed by the Mopidy-backed impl (group 9.1).
+pub const SNAPSHOT_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+// ── Snapshot (task 5.2) ──────────────────────────────────────────────────────
+
+/// Snapshot of Mopidy playback state captured at fire time (task 5.2 / D5).
+///
+/// Captured fresh per fire. On Mopidy-down at fire time every field is
+/// `None`/default (`uri = None`, `position_ms = 0`, `was_playing = false`,
+/// `seekable = false`, `volume = 0`, `repeat = false`, `shuffle = false`) and
+/// restore becomes a no-op apart from re-applying volume/repeat/shuffle.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MopidySnapshot {
+    /// Current tracklist URI (first track) if any.
+    pub uri: Option<String>,
+    /// Playback time position in milliseconds.
+    pub position_ms: u32,
+    /// Whether playback state was "playing" at capture.
+    pub was_playing: bool,
+    /// Whether the current track is seekable.
+    pub seekable: bool,
+    /// Volume 0..100.
+    pub volume: u8,
+    /// Tracklist repeat flag.
+    pub repeat: bool,
+    /// Tracklist shuffle flag.
+    pub shuffle: bool,
+}
+
+// ── Mopidy control seam ──────────────────────────────────────────────────────
+
+/// Mopidy command seam used by the episode FSM.
+///
+/// All methods are non-blocking fire-and-forget on main except
+/// [`capture_snapshot`](MopidyControl::capture_snapshot), which batches the
+/// `get_state` / `get_time_position` / `get_volume` / `tracklist.get_repeat` /
+/// `get_shuffle` / tracklist reads and is bounded by
+/// [`SNAPSHOT_CAPTURE_TIMEOUT`]; on timeout or `NotConnected` it returns
+/// `None`/defaults.
+///
+/// The concrete implementation (group 9.1) talks to the Mopidy WS client over
+/// the cross-thread command channel; the FSM itself never blocks the Slint
+/// event loop awaiting a reply (optimistic transition, task 5.5).
+pub trait MopidyControl {
+    /// Capture a fresh [`MopidySnapshot`] (1 s bound; `None`/defaults on
+    /// timeout / `NotConnected`).
+    fn capture_snapshot(&self) -> MopidySnapshot;
+
+    /// `tracklist.add([uri])`.
+    fn tracklist_add(&self, uri: &str);
+    /// `playback.play`.
+    fn playback_play(&self);
+    /// `playback.stop`.
+    fn playback_stop(&self);
+    /// `playback.seek(time_position)`.
+    fn playback_seek(&self, position_ms: u32);
+    /// `tracklist.set_repeat`.
+    fn tracklist_set_repeat(&self, on: bool);
+    /// `tracklist.set_shuffle` (alias `set_random`).
+    fn tracklist_set_shuffle(&self, on: bool);
+    /// `playback.set_volume` (clamped 0..100 by the impl).
+    fn playback_set_volume(&self, volume: u8);
+}
+
+// ── FSM states (task 5.1) ────────────────────────────────────────────────────
+
+/// Episode FSM states (task 5.1).
+///
+/// `Firing` holds the `alarm_id`, the captured [`MopidySnapshot`], and the
+/// entered `episode` [`tracing::Span`] guard. The span is entered on `fire()`
+/// and exits (guard dropped) on restore completion in `dismiss()`.
+#[derive(Debug)]
+pub enum EpisodeState {
+    /// No episode active.
+    Idle,
+    /// An alarm is firing: snapshot captured, `source_uri` playing looping at
+    /// `max_volume`.
+    Firing {
+        alarm_id: AlarmId,
+        snapshot: MopidySnapshot,
+        /// Entered `episode` span guard; dropped on restore → span exits.
+        _span: EnteredSpan,
+    },
+    /// The episode was dismissed and the snapshot restored.
+    Dismissed,
+}
+
+impl EpisodeState {
+    /// `true` when the FSM is in the `Firing` state.
+    pub fn is_firing(&self) -> bool {
+        matches!(self, EpisodeState::Firing { .. })
+    }
+}
+
+impl Default for EpisodeState {
+    fn default() -> Self {
+        EpisodeState::Idle
+    }
+}
+
+// ── EpisodeController (task 5.1) ──────────────────────────────────────────────
+
+/// Single-threaded episode state machine owned by main (task 5.1 / design D4).
+///
+/// Generic over a [`MopidyControl`] seam so the FSM is fully unit-testable
+/// with a mock backend; group 9.1 wires the concrete Mopidy-backed
+/// implementation.
+pub struct EpisodeController<C: MopidyControl> {
+    control: C,
+    state: EpisodeState,
+}
+
+impl<C: MopidyControl> EpisodeController<C> {
+    /// Construct a controller in the `Idle` state with the given Mopidy seam.
+    pub fn new(control: C) -> Self {
+        Self {
+            control,
+            state: EpisodeState::Idle,
+        }
+    }
+
+    /// Current state reference (for observability / UI wiring).
+    pub fn state(&self) -> &EpisodeState {
+        &self.state
+    }
+
+    /// `true` when an episode is currently firing.
+    pub fn is_firing(&self) -> bool {
+        self.state.is_firing()
+    }
+
+    /// Enter the `episode` span, capture a fresh Mopidy snapshot, and play the
+    /// alarm's `source_uri` looping at `max_volume` (task 5.3).
+    ///
+    /// Begin a fresh episode from `Idle` or `Dismissed` (a restored state).
+    /// second-alarm-during-episode case (task 5.6, not this group); slice 1
+    /// policy is to serialize, but the dismiss-and-re-fire orchestration is
+    /// task 5.6's responsibility — here we guard against overlapping episodes
+    /// by ignoring the call (logged).
+    ///
+    /// `source_uri` is the alarm's stored source URI; `max_volume` is the
+    /// alarm's stored max volume (0..100).
+    pub fn fire(&mut self, alarm_id: AlarmId, source_uri: &str, max_volume: u8) {
+        if let EpisodeState::Firing { .. } = self.state {
+            // A fire while already Firing is the second-alarm-during-episode
+            // case (task 5.6). Slice 1 serializes via dismiss-and-re-fire, but
+            // that orchestration is task 5.6's responsibility — here we guard
+            // against overlapping episodes by ignoring the call (logged).
+            info!(
+                alarm_id,
+                "fire() called while Firing — ignoring (second-alarm serialization is task 5.6)",
+            );
+            return;
+        }
+        // From `Idle` or `Dismissed` (a restored state) a fresh episode begins.
+
+        // Task 5.1: enter the `episode` span (held until restore).
+        let span = info_span!(parent: None, "episode", alarm_id = alarm_id).entered();
+
+        // Task 5.3: capture a fresh snapshot (1 s bound / NotConnected →
+        // None/defaults handled inside the control seam).
+        let snapshot = self.control.capture_snapshot();
+        info!(?snapshot, "episode snapshot captured");
+
+        // Task 5.3: play the alarm source looping at max_volume.
+        //   tracklist.add(source_uri) + playback.play + tracklist.set_repeat(true)
+        //   + playback.set_volume(max_volume)
+        self.control.tracklist_add(source_uri);
+        self.control.playback_play();
+        self.control.tracklist_set_repeat(true);
+        self.control.playback_set_volume(max_volume);
+
+        self.state = EpisodeState::Firing {
+            alarm_id,
+            snapshot,
+            _span: span,
+        };
+    }
+
+    /// Transition `Firing → Dismissed` and restore the snapshot (task 5.4).
+    ///
+    /// Restore contract (D5):
+    /// - `tracklist.set_repeat(snapshot.repeat)`
+    /// - `tracklist.set_shuffle(snapshot.shuffle)`
+    /// - `playback.set_volume(snapshot.volume)`
+    /// - if `uri` is `Some` and `was_playing`: `tracklist.add(uri)` +
+    ///   `playback.play` + seek `position_ms`
+    /// - if `uri` is `Some` and not `was_playing`: `playback.stop`
+    /// - if `uri` is `None` (Mopidy was down at capture): restore
+    ///   volume/repeat/shuffle only.
+    ///
+    /// The `episode` span exits when restore completes (the entered-span guard
+    /// is dropped at the end of this function).
+    pub fn dismiss(&mut self) {
+        // Extract the Firing payload, transitioning to Dismissed. The span guard
+        // is moved out here but kept alive until the end of the function so the
+        // span exits *after* restore completes (task 5.1: "exit on restore").
+        let (snapshot, _span) = match std::mem::replace(&mut self.state, EpisodeState::Dismissed) {
+            EpisodeState::Firing { snapshot, _span, .. } => (snapshot, _span),
+            other => {
+                // Not firing — nothing to restore. Restore the prior state.
+                self.state = other;
+                info!("dismiss() called while not Firing — no-op");
+                return;
+            }
+        };
+
+        // Task 5.4: restore the snapshot.
+        info!(?snapshot, "restoring episode snapshot");
+
+        self.control.tracklist_set_repeat(snapshot.repeat);
+        self.control.tracklist_set_shuffle(snapshot.shuffle);
+        self.control.playback_set_volume(snapshot.volume);
+
+        match snapshot.uri.as_ref() {
+            Some(uri) if snapshot.was_playing => {
+                self.control.tracklist_add(uri);
+                self.control.playback_play();
+                if snapshot.seekable {
+                    self.control.playback_seek(snapshot.position_ms);
+                }
+            }
+            Some(_) => {
+                // Was not playing → stop (leave it stopped).
+                self.control.playback_stop();
+            }
+            None => {
+                // Mopidy was down at capture: restore volume/repeat/shuffle only.
+                info!("snapshot uri was None — restore limited to volume/repeat/shuffle");
+            }
+        }
+
+        // `_span` drops here → the `episode` span exits on restore completion.
+    }
+
+    /// Borrow the captured snapshot, if currently `Firing`.
+    pub fn snapshot(&self) -> Option<&MopidySnapshot> {
+        match &self.state {
+            EpisodeState::Firing { snapshot, .. } => Some(snapshot),
+            _ => None,
+        }
+    }
+
+    /// Consume into the underlying control (for group 9.1 / shutdown wiring).
+    #[allow(dead_code)] // consumed by group 9.1 wiring.
+    pub fn into_control(self) -> C {
+        self.control
+    }
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::Subscriber;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    /// Recording mock for [`MopidyControl`]. `capture_snapshot` returns the
+    /// next snapshot in `snapshots` (advancing each call) so "fresh per fire"
+    /// is testable.
+    struct MockControl {
+        calls: Arc<Mutex<Vec<String>>>,
+        snapshots: Arc<Mutex<std::collections::VecDeque<MopidySnapshot>>>,
+    }
+
+    impl MockControl {
+        fn new(snapshots: Vec<MopidySnapshot>) -> Self {
+            let deque: std::collections::VecDeque<_> = snapshots.into();
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                snapshots: Arc::new(Mutex::new(deque)),
+            }
+        }
+
+        fn record(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+    }
+
+    impl MopidyControl for MockControl {
+        fn capture_snapshot(&self) -> MopidySnapshot {
+            let mut q = self.snapshots.lock().unwrap();
+            q.pop_front().unwrap_or_default()
+        }
+        fn tracklist_add(&self, uri: &str) {
+            self.record(format!("add({})", uri));
+        }
+        fn playback_play(&self) {
+            self.record("play".into());
+        }
+        fn playback_stop(&self) {
+            self.record("stop".into());
+        }
+        fn playback_seek(&self, position_ms: u32) {
+            self.record(format!("seek({})", position_ms));
+        }
+        fn tracklist_set_repeat(&self, on: bool) {
+            self.record(format!("set_repeat({})", on));
+        }
+        fn tracklist_set_shuffle(&self, on: bool) {
+            self.record(format!("set_shuffle({})", on));
+        }
+        fn playback_set_volume(&self, volume: u8) {
+            self.record(format!("set_volume({})", volume));
+        }
+    }
+
+    /// Convenience: thread the call log out via an Arc clone.
+    fn mock(snapshots: Vec<MopidySnapshot>) -> (MockControl, Arc<Mutex<Vec<String>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let ctrl = MockControl {
+            calls: Arc::clone(&calls),
+            snapshots: Arc::new(Mutex::new(snapshots.into_iter().collect())),
+        };
+        (ctrl, calls)
+    }
+
+    // ── Task 5.1 / scenario: Fire transitions Idle → Firing ───────────────
+
+    /// Scenario: a fire while Idle transitions to `Firing`, captures a snapshot,
+    /// plays `source_uri` with `repeat=true` at `max_volume`.
+    #[test]
+    fn fire_transitions_idle_to_firing() {
+        let snap = MopidySnapshot {
+            uri: Some("file:///music/track.mp3".into()),
+            position_ms: 120_000,
+            was_playing: true,
+            seekable: true,
+            volume: 25,
+            repeat: false,
+            shuffle: true,
+        };
+        let (ctrl, calls) = mock(vec![snap.clone()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(7, "file:///alarm/source.mp3", 80);
+
+        assert!(fsm.is_firing());
+        match fsm.state() {
+            EpisodeState::Firing { alarm_id, snapshot, .. } => {
+                assert_eq!(*alarm_id, 7);
+                assert_eq!(*snapshot, snap, "snapshot should be captured into Firing");
+            }
+            other => panic!("expected Firing, got {:?}", other),
+        }
+
+        // Fire command sequence (task 5.3).
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                "add(file:///alarm/source.mp3)".to_string(),
+                "play".into(),
+                "set_repeat(true)".into(),
+                "set_volume(80)".into(),
+            ],
+            "fire() should add source, play, set_repeat(true), set_volume(max)",
+        );
+    }
+
+    // ── Task 5.4 / scenario: Dismiss transitions Firing → Dismissed ──────
+
+    /// Scenario: dismiss while Firing transitions to Dismissed and restores the
+    /// snapshot (position 120000, volume 25, shuffle on, repeat restored).
+    #[test]
+    fn dismiss_transitions_firing_to_dismissed_and_restores() {
+        let snap = MopidySnapshot {
+            uri: Some("file:///music/track.mp3".into()),
+            position_ms: 120_000,
+            was_playing: true,
+            seekable: true,
+            volume: 25,
+            repeat: false,
+            shuffle: true,
+        };
+        let (ctrl, calls) = mock(vec![snap.clone()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm/source.mp3", 90);
+        { calls.lock().unwrap().clear(); } // isolate restore calls
+
+        fsm.dismiss();
+
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+        assert_eq!(fsm.snapshot(), None);
+
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                "set_repeat(false)".to_string(), // pre-alarm repeat restored
+                "set_shuffle(true)".to_string(),      // shuffle on
+                "set_volume(25)".to_string(),          // volume 25
+                "add(file:///music/track.mp3)".to_string(),
+                "play".to_string(),
+                "seek(120000)".to_string(),            // position 120000ms
+            ],
+            "dismiss() should restore repeat/shuffle/volume then resume+seek",
+        );
+    }
+
+    /// Scenario: when `was_playing` is false but `uri` is Some, dismiss stops
+    /// playback (and restores flags/volume).
+    #[test]
+    fn dismiss_stops_when_was_not_playing() {
+        let snap = MopidySnapshot {
+            uri: Some("file:///music/track.mp3".into()),
+            position_ms: 5_000,
+            was_playing: false,
+            seekable: true,
+            volume: 40,
+            repeat: true,
+            shuffle: false,
+        };
+        let (ctrl, calls) = mock(vec![snap]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(2, "file:///alarm/source.mp3", 90);
+        { calls.lock().unwrap().clear(); }
+
+        fsm.dismiss();
+
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                "set_repeat(true)".to_string(),
+                "set_shuffle(false)".to_string(),
+                "set_volume(40)".to_string(),
+                "stop".to_string(),
+            ],
+            "not-playing → stop after restoring flags/volume",
+        );
+    }
+
+    // ── Task 5.3 / scenario: Snapshot with Mopidy down at fire time ──────
+
+    /// Scenario: Mopidy disconnected at fire time → snapshot fields are
+    /// None/defaults, the alarm still fires (playback commands issued), and
+    /// restore is a no-op (volume/repeat/shuffle only, all defaults).
+    #[test]
+    fn fire_with_mopidy_down_uses_defaults_and_restore_is_noop() {
+        // capture_snapshot returns the default (Mopidy-down) snapshot.
+        let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(3, "file:///alarm/source.mp3", 100);
+
+        assert!(fsm.is_firing());
+        let snap = fsm.snapshot().unwrap().clone();
+        assert_eq!(snap.uri, None);
+        assert_eq!(snap.position_ms, 0);
+        assert!(!snap.was_playing);
+        assert!(!snap.seekable);
+        assert_eq!(snap.volume, 0);
+        assert!(!snap.repeat);
+        assert!(!snap.shuffle);
+
+        // Alarm still fires the source at max_volume.
+        let fire_log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            fire_log,
+            vec![
+                "add(file:///alarm/source.mp3)".to_string(),
+                "play".to_string(),
+                "set_repeat(true)".to_string(),
+                "set_volume(100)".to_string(),
+            ],
+        );
+
+        { calls.lock().unwrap().clear(); }
+        fsm.dismiss();
+
+        // Restore: volume/repeat/shuffle only (all defaults); no add/play/seek/stop.
+        let restore_log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            restore_log,
+            vec![
+                "set_repeat(false)".to_string(),
+                "set_shuffle(false)".to_string(),
+                "set_volume(0)".to_string(),
+            ],
+            "Mopidy-down restore is volume/repeat/shuffle only",
+        );
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+    }
+
+    // ── Task 5.2 / scenario: Fresh snapshot per fire ──────────────────────
+
+    /// Scenario: an episode fires after a prior episode restored the user's
+    /// (now advanced) session → the new snapshot reflects the current (advanced)
+    /// Mopidy state, not the prior snapshot.
+    #[test]
+    fn snapshot_is_fresh_per_fire() {
+        let first = MopidySnapshot {
+            uri: Some("file:///a.mp3".into()),
+            position_ms: 10_000,
+            was_playing: true,
+            seekable: true,
+            volume: 10,
+            repeat: false,
+            shuffle: false,
+        };
+        // The user's session advanced between episodes: new track, position
+        // 50_000, volume 30.
+        let second = MopidySnapshot {
+            uri: Some("file:///b.mp3".into()),
+            position_ms: 50_000,
+            was_playing: true,
+            seekable: true,
+            volume: 30,
+            repeat: true,
+            shuffle: true,
+        };
+        let (ctrl, calls) = mock(vec![first.clone(), second.clone()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        // First episode.
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        assert_eq!(fsm.snapshot().unwrap().clone(), first);
+        fsm.dismiss();
+
+        { calls.lock().unwrap().clear(); }
+
+        // Second episode — snapshot reflects the advanced session.
+        fsm.fire(2, "file:///alarm.mp3", 90);
+        assert_eq!(
+            fsm.snapshot().unwrap().clone(),
+            second,
+            "second fire captures a fresh (advanced) snapshot",
+        );
+
+        // Restore of the second episode uses the second snapshot's values.
+        { calls.lock().unwrap().clear(); }
+        fsm.dismiss();
+        let restore_log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            restore_log,
+            vec![
+                "set_repeat(true)".to_string(),
+                "set_shuffle(true)".to_string(),
+                "set_volume(30)".to_string(),
+                "add(file:///b.mp3)".to_string(),
+                "play".to_string(),
+                "seek(50000)".to_string(),
+            ],
+            "restore uses the fresh second snapshot",
+        );
+    }
+
+    /// Scenario: dismiss while Idle is a safe no-op (does not transition to
+    /// Dismissed spuriously or issue restore commands).
+    #[test]
+    fn dismiss_while_idle_is_noop() {
+        let (ctrl, calls) = mock(vec![]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.dismiss();
+        assert!(matches!(fsm.state(), EpisodeState::Idle));
+        assert!({ calls.lock().unwrap().is_empty() });
+    }
+
+    /// Scenario: a `fire()` while already `Firing` is ignored (no second
+    /// overlapping episode; serialization is task 5.6).
+    #[test]
+    fn fire_while_firing_is_ignored() {
+        let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm1.mp3", 90);
+        let first_calls = { calls.lock().unwrap().len() };
+
+        // A second fire mid-episode must not overlap (task 5.6 handles it).
+        fsm.fire(2, "file:///alarm2.mp3", 90);
+        let no_new = { calls.lock().unwrap().len() } == first_calls;
+        assert!(no_new, "second fire while Firing must not issue new commands");
+
+        // Still firing the first alarm.
+        match fsm.state() {
+            EpisodeState::Firing { alarm_id, .. } => assert_eq!(*alarm_id, 1),
+            other => panic!("expected Firing(first), got {:?}", other),
+        }
+    }
+
+    // ── Task 5.1: episode span entered on fire, exited on restore ────────
+
+    /// Capturing layer that records enter/exit of the `episode` span.
+    #[derive(Default)]
+    struct SpanLifecycle {
+        entered: Arc<Mutex<usize>>,
+        exited: Arc<Mutex<usize>>,
+    }
+
+    impl<S: Subscriber> Layer<S> for SpanLifecycle {
+        fn on_enter(&self, _id: &tracing::span::Id, _ctx: Context<'_, S>) {
+            *self.entered.lock().unwrap() += 1;
+        }
+        fn on_exit(&self, _id: &tracing::span::Id, _ctx: Context<'_, S>) {
+            *self.exited.lock().unwrap() += 1;
+        }
+    }
+
+    /// Raise the global `MAX_LEVEL` gate (defaults to OFF). `set_default` alone
+    /// does not raise it; a global default subscriber does. `try_init` succeeds
+    /// once per process; we ignore the `Err` on subsequent calls.
+    fn ensure_global_max_level() {
+        let _ = tracing_subscriber::registry().try_init();
+    }
+
+    /// Scenario: `fire()` enters the `episode` span; `dismiss()` exits it on
+    /// restore completion.
+    #[test]
+    fn episode_span_entered_on_fire_exited_on_restore() {
+        let layer = SpanLifecycle::default();
+        let entered = Arc::clone(&layer.entered);
+        let exited = Arc::clone(&layer.exited);
+
+        ensure_global_max_level();
+        let _guard = tracing_subscriber::registry().with(layer).set_default();
+
+        let (ctrl, _calls) = mock(vec![MopidySnapshot::default()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        let before_enter = *entered.lock().unwrap();
+        let before_exit = *exited.lock().unwrap();
+
+        fsm.fire(42, "file:///alarm.mp3", 90);
+
+        assert_eq!(
+            *entered.lock().unwrap(),
+            before_enter + 1,
+            "fire() should enter the episode span",
+        );
+        assert_eq!(
+            *exited.lock().unwrap(),
+            before_exit,
+            "episode span must NOT exit before restore",
+        );
+
+        fsm.dismiss();
+
+        assert_eq!(
+            *exited.lock().unwrap(),
+            before_exit + 1,
+            "dismiss() should exit the episode span on restore completion",
+        );
+    }
+}

@@ -13,6 +13,7 @@ mod channel;
 mod config;
 mod database;
 mod error;
+mod episode;
 mod schedule;
 mod scheduler;
 
@@ -108,6 +109,15 @@ pub async fn command_dispatcher(
                         let _ = reply_tx
                             .send(Reply::MopidyState("STOPPED".into()))
                             .await;
+                    }
+                    Cmd::CaptureSnapshot => {
+                        // Slice-1 placeholder: the tokio worker does not yet hold
+                        // a live MopidyWsClient handle in this dispatcher context.
+                        // The full CaptureSnapshot implementation (batch get_state,
+                        // get_time_position, get_volume, repeat, shuffle reads)
+                        // will be wired when the Mopidy client is available on tokio.
+                        // For now, a default-reply is sent back if needed.
+                        info!(action = "CaptureSnapshot", "command received (slice 1 placeholder — no live Mopidy handle in dispatcher yet)");
                     }
                     Cmd::CallMopidy { method, .. } => {
                         let _guard = info_span!("mopidy_request", method = %method).entered();
