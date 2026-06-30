@@ -44,9 +44,9 @@
 - [x] 6.1 Implement the Mopidy-down-at-fire path: snapshot is `None`/defaults; playback commands return `NotConnected` (logged); episode stays `Firing` and dismissable; restore is a no-op.
 - [x] 6.2 Implement source-failure end-of-episode: if playback goes to `stopped`/tracklist-ended within the grace window (default 8s), log `error!`, dismiss-and-restore, end the episode (no fallback chain in slice 1).
 - [x] 6.3 Implement mid-episode Mopidy restart handling: log connection-state transitions; do not crash; episode stays dismissable (no mid-episode re-issue in slice 1).
-- [ ] 6.4 Implement `shutdown_restore()` on `EpisodeController`: if `Firing`, restore the snapshot before exit; if `Idle`, no-op. Bound the restore by a 2s timeout.
-- [ ] 6.5 Wire the shutdown handler (slice 0) to call `EpisodeController::shutdown_restore()` before draining the Cmd channel and exiting.
-- [ ] 6.6 Unit-test `shutdown_restore()`: `Firing` → restore issued; `Idle` → no-op; timeout exits promptly.
+- [x] 6.4 Implement `shutdown_restore()` on `EpisodeController`: if `Firing`, restore the snapshot before exit; if `Idle`, no-op. Bound the restore by a 2s timeout.
+- [x] 6.5 Wire the shutdown handler (slice 0) to call `EpisodeController::shutdown_restore()` before draining the Cmd channel and exiting.
+- [x] 6.6 Unit-test `shutdown_restore()`: `Firing` → restore issued; `Idle` → no-op; timeout exits promptly.
 
 ## 7. Alarm episode UI
 

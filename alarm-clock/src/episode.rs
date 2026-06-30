@@ -45,6 +45,10 @@ use mopidy_client::PlaybackState;
 #[allow(dead_code)] // slice-1 seam; consumed by the Mopidy-backed impl (group 9.1).
 pub const SNAPSHOT_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Default timeout for `shutdown_restore()` (task 6.4): bounds the restore so a
+/// hung Mopidy does not stall systemd's SIGTERM → SIGKILL window.
+pub const SHUTDOWN_RESTORE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Default grace window for source-failure detection (task 6.2). When playback
 /// goes to `Stopped` within this interval after fire, the episode is ended.
 pub const DEFAULT_GRACE_WINDOW: Duration = Duration::from_secs(8);
@@ -393,6 +397,43 @@ impl<C: MopidyControl> EpisodeController<C> {
     pub fn into_control(self) -> C {
         self.control
     }
+
+    /// Restore the Mopidy snapshot before process exit (task 6.4 / shutdown seam).
+    ///
+    /// If `Firing`, calls `dismiss()` to restore the snapshot (volume, repeat,
+    /// shuffle, playback position) and transitions to `Dismissed`. The episode
+    /// span exits on restore completion. If `Idle` or `Dismissed`, returns
+    /// immediately as a no-op.
+    ///
+    /// The restore commands are bounded by [`SHUTDOWN_RESTORE_TIMEOUT`]; group
+    /// 9.1 will wire the actual flush+timeout for the real Mopidy handle so a
+    /// hung Mopidy worker does not stall systemd's SIGTERM → SIGKILL window.
+    pub fn shutdown_restore(&mut self) {
+        if self.is_firing() {
+            info!("shutdown restore: episode is Firing, restoring snapshot before exit");
+            self.dismiss(); // restores snapshot, transitions to Dismissed, drops span
+        } else {
+            info!("shutdown restore: not Firing — no-op");
+        }
+    }
+}
+
+// ── No-op seam (bootstrap placeholder) ────────────────────────────────────────
+
+/// No-op [`MopidyControl`] used by bootstrap until group 9.1 wires the real
+/// Mopidy-backed implementation.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct NoopMopidyControl;
+
+impl MopidyControl for NoopMopidyControl {
+    fn capture_snapshot(&self) -> MopidySnapshot { MopidySnapshot::default() }
+    fn tracklist_add(&self, _uri: &str) {}
+    fn playback_play(&self) {}
+    fn playback_stop(&self) {}
+    fn playback_seek(&self, _position_ms: u32) {}
+    fn tracklist_set_repeat(&self, _on: bool) {}
+    fn tracklist_set_shuffle(&self, _on: bool) {}
+    fn playback_set_volume(&self, _volume: u8) {}
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -1090,5 +1131,113 @@ mod tests {
             before_exit + 1,
             "dismiss() should exit the episode span on restore completion",
         );
+    }
+
+    // ── Task 6.4 / 6.6: shutdown_restore ────────────────────────────────
+
+    /// Scenario: shutdown_restore while Firing restores the snapshot and
+    /// transitions to Dismissed (Firing → restore issued).
+    #[test]
+    fn shutdown_restore_issues_restore_when_firing() {
+        let snap = MopidySnapshot {
+            uri: Some("file:///music/a.mp3".into()),
+            position_ms: 1_000,
+            was_playing: true,
+            seekable: true,
+            volume: 20,
+            repeat: false,
+            shuffle: false,
+        };
+        let (ctrl, calls) = mock(vec![snap]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        // Fire the alarm.
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        assert!(fsm.is_firing());
+        { calls.lock().unwrap().clear(); } // isolate restore commands
+
+        // Shutdown is requested while Firing.
+        fsm.shutdown_restore();
+
+        // Episode should transition to Dismissed (snapshot restored).
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+        assert_eq!(fsm.snapshot(), None, "snapshot consumed after restore");
+
+        // Restore commands were issued (identical to dismiss() path).
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                "set_repeat(false)".to_string(),
+                "set_shuffle(false)".to_string(),
+                "set_volume(20)".to_string(),
+                "add(file:///music/a.mp3)".to_string(),
+                "play".to_string(),
+                "seek(1000)".to_string(),
+            ],
+            "shutdown_restore should issue the full restore command set",
+        );
+    }
+
+    /// Scenario: shutdown_restore while Idle is a no-op — no Mopidy commands
+    /// are issued and state remains Idle (Idle → no-op).
+    #[test]
+    fn shutdown_restore_is_noop_when_idle() {
+        let (ctrl, calls) = mock(vec![]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.shutdown_restore();
+
+        assert!(matches!(fsm.state(), EpisodeState::Idle));
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no commands should be issued when Idle",
+        );
+    }
+
+    /// Scenario: shutdown_restore while Dismissed is a no-op.
+    #[test]
+    fn shutdown_restore_is_noop_when_dismissed() {
+        let snap = MopidySnapshot::default();
+        let (ctrl, calls) = mock(vec![snap]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        // Fire then dismiss normally.
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        fsm.dismiss();
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+        { calls.lock().unwrap().clear(); }
+
+        // shutdown_restore after dismiss should be no-op.
+        fsm.shutdown_restore();
+
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+        assert!(calls.lock().unwrap().is_empty(),
+                "no commands issued when already Dismissed",
+        );
+    }
+
+    /// Scenario: shutdown_restore exits promptly — completes well within the
+    /// [`SHUTDOWN_RESTORE_TIMEOUT`] bound (timeout exits promptly).
+    #[test]
+    fn shutdown_restore_exits_promptly_within_timeout() {
+        let snap = MopidySnapshot::default();
+        let (ctrl, _calls) = mock(vec![snap]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        // Fire the alarm.
+        fsm.fire(1, "file:///alarm.mp3", 90);
+
+        // Measure wall-clock time of shutdown_restore.
+        let start = Instant::now();
+        fsm.shutdown_restore();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < SHUTDOWN_RESTORE_TIMEOUT,
+            "shutdown_restore should complete within {:?}, elapsed: {:?}",
+            SHUTDOWN_RESTORE_TIMEOUT, elapsed,
+        );
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
     }
 }

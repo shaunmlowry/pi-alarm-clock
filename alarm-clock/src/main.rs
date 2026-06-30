@@ -260,6 +260,16 @@ pub fn bootstrap() -> JoinHandle<()> {
 
     info!("tokio worker thread spawned successfully");
 
+    // ── Shutdown wiring (task 6.5) ──────────────────────────────────────
+    //
+    // Create an episode controller so the shutdown handler can call
+    // `shutdown_restore()` before draining the Cmd channel and exiting.
+    // Uses NoopMopidyControl as a placeholder; group 9.1 will wire the
+    // real Mopidy-backed impl.
+    let episode_ctl = std::sync::Mutex::new(
+        episode::EpisodeController::new(episode::NoopMopidyControl),
+    );
+
     // ── Slint drain timer (non-blocking try_recv on each tick) ────────────
     //
     // This single repeating timer polls both the reply channel and the Mopidy
@@ -278,7 +288,10 @@ pub fn bootstrap() -> JoinHandle<()> {
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             // Drain reply channel (non-blocking).
             while let Ok(reply) = reply_rx.try_recv() {
-                dispatch_reply_to_domain(reply);
+                dispatch_reply_to_domain(
+                    reply,
+                    &episode_ctl,
+                );
             }
 
             // Drain Mopidy event channel (non-blocking).
@@ -352,7 +365,10 @@ pub fn bootstrap() -> JoinHandle<()> {
 ///
 /// In slice 0 these are logged. Later slices will route them to the FSM or
 /// update Slint UI models. Runs on main via the drain timer callback.
-fn dispatch_reply_to_domain(reply: Reply) {
+fn dispatch_reply_to_domain(
+    reply: Reply,
+    episode_ctl: &std::sync::Mutex<episode::EpisodeController<episode::NoopMopidyControl>>,
+) {
     match reply {
         Reply::MopidyState(state) => {
             info!(reply = "MopidyState", state = %state, "dispatched reply to domain");
@@ -362,7 +378,7 @@ fn dispatch_reply_to_domain(reply: Reply) {
         }
         Reply::ShutdownRequested => {
             info!("Shutdown requested (signal) — entering shutdown sequence");
-            execute_shutdown();
+            execute_shutdown(episode_ctl);
         }
         // Task 4.3: log Mopidy connection-state transitions (not consumed beyond logging in slice 0).
         Reply::MopidyConnectionState(state) => {
@@ -437,30 +453,35 @@ fn sd_notify_ready() {
 
 /// Perform the full graceful shutdown on the main thread.
 ///
-/// 1. Drain remaining commands by allowing the channel sender to be dropped
+/// 1. **Restore snapshot** (task 6.5): if an episode is firing, restore the
+///    Mopidy snapshot before draining the Cmd channel and exiting.
+/// 2. Drain remaining commands by allowing the channel sender to be dropped
 ///    (happens naturally when the process exits).
-/// 2. Stop Mopidy client and axum — no-op in slice 0 (no live resources).
-/// 3. Commit any pending DB transaction — no-op in slice 0 (DB not yet wired).
-/// 4. Call the domain's `shutdown_restore()` hook.
+/// 3. Stop Mopidy client and axum — no-op in slice 0 (no live resources).
+/// 4. Commit any pending DB transaction — no-op in slice 0 (DB not yet wired).
 /// 5. Exit with status 0.
-fn execute_shutdown() {
+fn execute_shutdown(
+    episode_ctl: &std::sync::Mutex<episode::EpisodeController<episode::NoopMopidyControl>>,
+) {
     info!("shutdown sequence starting");
 
-    // Step 1: cmd channel drain — sender drops when function scope ends and
+    // Step 1 (task 6.5): restore snapshot if an episode is firing, before
+    // draining the Cmd channel and exiting.
+    if let Ok(mut ctl) = episode_ctl.lock() {
+        ctl.shutdown_restore();
+    }
+
+    // Step 2: cmd channel drain — sender drops when function scope ends and
     // the process exits, naturally closing the recv side on tokio.
     info!("cmd channel drained (sender dropped on exit)");
 
-    // Step 2: stop Mopidy client and axum — no-op in slice 0 (no live resources).
+    // Step 3: stop Mopidy client and axum — no-op in slice 0 (no live resources).
     // Later slices will hold real handles here.
     info!("Mopidy client stop requested — slice 0 no-op");
     info!("axum server stop requested — slice 0 no-op");
 
-    // Step 3: commit pending DB work — no-op in slice 0 (DB not yet wired).
+    // Step 4: commit pending DB work — no-op in slice 0 (DB not yet wired).
     info!("pending DB transaction commit — slice 0 no-op");
-
-    // Step 4: call the domain's shutdown_restore() hook.
-    let domain = Domain;
-    domain.shutdown_restore();
 
     info!("shutdown sequence complete — exiting with code 0");
     std::process::exit(0);
