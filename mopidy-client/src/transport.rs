@@ -261,6 +261,10 @@ pub(crate) enum ClientCmd {
 /// the matched reply by request ID.
 type PendingReplies = Arc<Mutex<HashMap<RequestId, oneshot::Sender<Result<JsonRpcMessage, TransportError>>>>>;
 
+/// Shared, mutable connection state that all typed-call wrappers can check
+/// before dispatching (task 4.4).
+type SharedState = Arc<Mutex<MopidyConnectionState>>;
+
 /// A reconnecting WebSocket JSON-RPC client for Mopidy.
 ///
 /// On construction the client spawns an async task on the current tokio runtime
@@ -271,6 +275,9 @@ pub struct MopidyWsClient {
     cmd_tx: mpsc::Sender<ClientCmd>,
     id_counter: Arc<AtomicU64>,
     pending_replies: PendingReplies,
+    /// Shared connection state — updated by the reconnect loop on every
+    /// transition (Disconnected / BackingOff / Connecting / Connected).
+    conn_state: SharedState,
 }
 
 impl MopidyWsClient {
@@ -295,6 +302,7 @@ impl MopidyWsClient {
     ) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(64);
         let pending_replies: PendingReplies = Arc::new(Mutex::new(HashMap::new()));
+        let conn_state: SharedState = Arc::new(Mutex::new(MopidyConnectionState::Disconnected));
 
         tokio::spawn(Self::reconnect_loop(
             url,
@@ -304,12 +312,27 @@ impl MopidyWsClient {
             state_tx,
             cmd_rx,
             pending_replies.clone(),
+            conn_state.clone(),
         ));
 
         Self {
             cmd_tx,
             id_counter: Arc::new(AtomicU64::new(0)),
             pending_replies,
+            conn_state,
+        }
+    }
+
+    /// Returns `true` when the client is in the Connected state.
+    ///
+    /// Typed-call wrappers call this before dispatching requests; if it
+    /// returns `false` they return [`MopidyClientError::NotConnected`] instead
+    /// of hanging (task 4.4).
+    pub fn is_connected(&self) -> bool {
+        if let Ok(state) = self.conn_state.lock() {
+            matches!(*state, MopidyConnectionState::Connected)
+        } else {
+            false // poisoned lock → treat as disconnected
         }
     }
 
@@ -374,6 +397,7 @@ impl MopidyWsClient {
         state_tx: mpsc::Sender<MopidyConnectionState>,
         cmd_rx: mpsc::Receiver<ClientCmd>,
         pending_replies: PendingReplies,
+        shared_state: SharedState,
     ) {
         let policy = policy.unwrap_or_default();
         let mut attempt: u32 = 0;
@@ -385,12 +409,18 @@ impl MopidyWsClient {
         // Initial state: Disconnected (task 4.3)
         let state_change = MopidyConnectionState::Disconnected;
         let _ = state_tx.send(state_change.clone()).await;
+        if let Ok(mut shared) = shared_state.lock() {
+            *shared = state_change.clone();
+        }
         info!(state = ?state_change, "connection state transition" );
 
         loop {
             // ── State: Connecting (task 4.3) ──────────────
             let state_change = MopidyConnectionState::Connecting;
             let _ = state_tx.send(state_change.clone()).await;
+            if let Ok(mut shared) = shared_state.lock() {
+                *shared = state_change.clone();
+            }
             info!(url = %url, attempt, state = ?state_change, "connecting to Mopidy WebSocket");
 
             match connect_ws(&url).await {
@@ -398,6 +428,9 @@ impl MopidyWsClient {
                     // ── State: Connected (task 4.3) ───────
                     let state_change = MopidyConnectionState::Connected;
                     let _ = state_tx.send(state_change.clone()).await;
+                    if let Ok(mut shared) = shared_state.lock() {
+                        *shared = state_change.clone();
+                    }
                     info!(url = %url, state = ?state_change, "connected to Mopidy WebSocket");
                     attempt = 0; // reset on successful connection
 
@@ -424,6 +457,9 @@ impl MopidyWsClient {
                     // ── State: BackingOff (task 4.3) ᐸ─────
                     let state_change = MopidyConnectionState::BackingOff { retry_in: delay };
                     let _ = state_tx.send(state_change.clone()).await;
+                    if let Ok(mut shared) = shared_state.lock() {
+                        *shared = state_change.clone();
+                    }
                     info!(delay_ms = delay.as_millis(), state = ?state_change, "backing off before reconnect");
                     tokio::time::sleep(delay).await;
 

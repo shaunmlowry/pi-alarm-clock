@@ -10,6 +10,26 @@
 use crate::transport::{JsonRpcMessage, MopidyWsClient, TransportError};
 use serde_json::Value;
 
+// ── Typed-call error type (task 4.4) ──────────────────────────────────────────
+
+/// Errors returned by the typed Mopidy RPC wrappers.
+///
+/// [`MopidyClientError::NotConnected`] is returned immediately (no hang) by
+/// every typed call when the client is not in the `Connected` state
+/// (`Disconnected` / `BackingOff`). The episode FSM treats this as
+/// "playback silently failed" (logged) and continues the episode.
+#[derive(Debug, thiserror::Error)]
+#[allow(dead_code)]
+pub enum MopidyClientError {
+    /// The client is not in the `Connected` state (Disconnected / BackingOff).
+    #[error("not connected to Mopidy")]
+    NotConnected,
+
+    /// A transport-level failure occurred while dispatching the call.
+    #[error(transparent)]
+    Transport(#[from] TransportError),
+}
+
 // ── core.get_version ─────────────────────────────────────────────────────────
 
 /// Request struct for `core.get_version`. No arguments are needed.
@@ -200,10 +220,10 @@ impl GetTimePositionRequest {
 /// operation instead of scattering free functions.
 pub trait CoreApi {
     /// Return the server version by calling `core.get_version`.
-    fn get_version(&self) -> impl std::future::Future<Output = Result<VersionInfo, TransportError>> + Send;
+    fn get_version(&self) -> impl std::future::Future<Output = Result<VersionInfo, MopidyClientError>> + Send;
 
     /// Return the current playback state by calling `core.get_state`.
-    fn get_state(&self) -> impl std::future::Future<Output = Result<PlaybackState, TransportError>> + Send;
+    fn get_state(&self) -> impl std::future::Future<Output = Result<PlaybackState, MopidyClientError>> + Send;
 }
 
 /// Convenience trait providing playback-related RPC calls.
@@ -212,49 +232,58 @@ pub trait PlaybackApi {
     fn playback_play(
         &self,
         uri: Option<String>,
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), MopidyClientError>> + Send;
 
     /// Pause playback by calling `playback.pause`.
-    fn playback_pause(&self) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+    fn playback_pause(&self) -> impl std::future::Future<Output = Result<(), MopidyClientError>> + Send;
 
     /// Resume playback by calling `playback.resume`.
-    fn playback_resume(&self) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+    fn playback_resume(&self) -> impl std::future::Future<Output = Result<(), MopidyClientError>> + Send;
 
     /// Stop playback by calling `playback.stop`.
-    fn playback_stop(&self) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+    fn playback_stop(&self) -> impl std::future::Future<Output = Result<(), MopidyClientError>> + Send;
 
     /// Set the mixer volume (clamped 0..=100) by calling `playback.set_volume`.
     fn playback_set_volume(
         &self,
         volume: u8,
-    ) -> impl std::future::Future<Output = Result<(), TransportError>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), MopidyClientError>> + Send;
 
     /// Query the current playback state by calling `playback.get_state`.
-    fn playback_get_state(&self) -> impl std::future::Future<Output = Result<PlaybackState, TransportError>> + Send;
+    fn playback_get_state(&self) -> impl std::future::Future<Output = Result<PlaybackState, MopidyClientError>> + Send;
 
     /// Query the current playback time position (milliseconds) by calling
     /// `playback.get_time_position`.
     fn playback_get_time_position(
         &self,
-    ) -> impl std::future::Future<Output = Result<u32, TransportError>> + Send;
+    ) -> impl std::future::Future<Output = Result<u32, MopidyClientError>> + Send;
 }
 
 impl CoreApi for MopidyWsClient {
-    async fn get_version(&self) -> Result<VersionInfo, TransportError> {
+    async fn get_version(&self) -> Result<VersionInfo, MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let _req = GetVersionRequest::default();
         let reply_msg = self.send_and_await("core.get_version", None).await?;
-        parse_or_error::<VersionInfo>(reply_msg)
+        Ok(parse_or_error::<VersionInfo>(reply_msg)?)
     }
 
-    async fn get_state(&self) -> Result<PlaybackState, TransportError> {
+    async fn get_state(&self) -> Result<PlaybackState, MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let _req = GetStateRequest::default();
         let reply_msg = self.send_and_await("core.get_state", None).await?;
-        parse_or_error::<PlaybackState>(reply_msg)
+        Ok(parse_or_error::<PlaybackState>(reply_msg)?)
     }
 }
 
 impl PlaybackApi for MopidyWsClient {
-    async fn playback_play(&self, uri: Option<String>) -> Result<(), TransportError> {
+    async fn playback_play(&self, uri: Option<String>) -> Result<(), MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let req = PlayRequest { uri };
         let params = req.to_jsonrpc_params();
         let reply_msg = self.send_and_await("playback.play", params).await?;
@@ -263,28 +292,40 @@ impl PlaybackApi for MopidyWsClient {
         Ok(())
     }
 
-    async fn playback_pause(&self) -> Result<(), TransportError> {
+    async fn playback_pause(&self) -> Result<(), MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let _req = PauseRequest::default();
         let reply_msg = self.send_and_await("playback.pause", None).await?;
         parse_or_error::<bool>(reply_msg)?;
         Ok(())
     }
 
-    async fn playback_resume(&self) -> Result<(), TransportError> {
+    async fn playback_resume(&self) -> Result<(), MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let _req = ResumeRequest::default();
         let reply_msg = self.send_and_await("playback.resume", None).await?;
         parse_or_error::<bool>(reply_msg)?;
         Ok(())
     }
 
-    async fn playback_stop(&self) -> Result<(), TransportError> {
+    async fn playback_stop(&self) -> Result<(), MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let _req = StopRequest::default();
         let reply_msg = self.send_and_await("playback.stop", None).await?;
         parse_or_error::<bool>(reply_msg)?;
         Ok(())
     }
 
-    async fn playback_set_volume(&self, volume: u8) -> Result<(), TransportError> {
+    async fn playback_set_volume(&self, volume: u8) -> Result<(), MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let req = SetVolumeRequest::new(volume as i32);
         let params = Some(req.to_jsonrpc_params());
         let reply_msg = self.send_and_await("playback.set_volume", params).await?;
@@ -292,16 +333,172 @@ impl PlaybackApi for MopidyWsClient {
         Ok(())
     }
 
-    async fn playback_get_state(&self) -> Result<PlaybackState, TransportError> {
+    async fn playback_get_state(&self) -> Result<PlaybackState, MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let _req = GetStateRequest::default();
         let reply_msg = self.send_and_await("playback.get_state", None).await?;
-        parse_or_error::<PlaybackState>(reply_msg)
+        Ok(parse_or_error::<PlaybackState>(reply_msg)?)
     }
 
-    async fn playback_get_time_position(&self) -> Result<u32, TransportError> {
+    async fn playback_get_time_position(&self) -> Result<u32, MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
         let _req = GetTimePositionRequest::default();
         let reply_msg = self.send_and_await("playback.get_time_position", None).await?;
-        parse_or_error::<u32>(reply_msg)
+        Ok(parse_or_error::<u32>(reply_msg)?)
+    }
+}
+
+// ── tracklist.add (task 4.3) ──────────────────────────────────────────────
+
+/// Request struct for `tracklist.add(uris)`.
+///
+/// Mopidy expects params `{ uris: ["...", ...] }`.
+#[derive(Debug, Clone, Default)]
+pub struct TracklistAddRequest {
+    /// The track URIs to add to the tracklist (e.g. `"file:///path/to/track.mp3"`).
+    pub uris: Vec<String>,
+}
+
+impl TracklistAddRequest {
+    /// Create a request to add the given URIs.
+    pub fn new(uris: Vec<String>) -> Self {
+        Self { uris }
+    }
+
+    /// Serialize into the JSON-RPC params object `{ "uris": [...] }`.
+    pub fn to_jsonrpc_params(self) -> Option<Value> {
+        Some(serde_json::json!({ "uris": self.uris }))
+    }
+}
+
+/// Typed reply from `tracklist.add`.
+///
+/// Mopidy returns the list of added `TlTrack` objects. Slice 1 only needs
+/// acknowledgement, so the payload is accepted and discarded; later slices
+/// may model the TlTrack array.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TracklistAddReply;
+
+impl<'de> serde::Deserialize<'de> for TracklistAddReply {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Accept and discard any result (array of TlTracks, `null`, etc.).
+        let _ = Value::deserialize(deserializer)?;
+        Ok(TracklistAddReply)
+    }
+}
+
+// ── tracklist.set_repeat (task 4.3) ───────────────────────────────────────────
+
+/// Request struct for `tracklist.set_repeat(bool)`.
+#[derive(Debug, Clone)]
+pub struct SetRepeatRequest {
+    /// Whether Mopidy's repeat should be enabled.
+    pub repeat: bool,
+}
+
+impl SetRepeatRequest {
+    /// Create a request with the desired repeat state.
+    pub fn new(repeat: bool) -> Self {
+        Self { repeat }
+    }
+
+    /// Serialize into the JSON-RPC params object `{ "repeat": bool }`.
+    pub fn to_jsonrpc_params(self) -> Value {
+        serde_json::json!({ "repeat": self.repeat })
+    }
+}
+
+// ── tracklist.set_shuffle (task 4.3) ──────────────────────────────────────────
+// Mopidy exposes `tracklist.set_random`; `random` and `shuffle` are aliased.
+// Slice 1 uses the `shuffle` naming per PRD and sends `tracklist.set_shuffle`
+// on the wire. If a Mopidy version exposes only `set_random`, the call site
+// may be aliased to `tracklist.set_random` there; the typed wrapper keeps the
+// `shuffle` naming.
+
+/// Request struct for `tracklist.set_shuffle(bool)`.
+#[derive(Debug, Clone)]
+pub struct SetShuffleRequest {
+    /// Whether Mopidy's shuffle should be enabled.
+    pub shuffle: bool,
+}
+
+impl SetShuffleRequest {
+    /// Create a request with the desired shuffle state.
+    pub fn new(shuffle: bool) -> Self {
+        Self { shuffle }
+    }
+
+    /// Serialize into the JSON-RPC params object `{ "shuffle": bool }`.
+    pub fn to_jsonrpc_params(self) -> Value {
+        serde_json::json!({ "shuffle": self.shuffle })
+    }
+}
+
+// ── Extension methods on MopidyWsClient (tracklist) ──────────────────────────
+
+/// Convenience trait providing tracklist-related RPC calls.
+pub trait TracklistApi {
+    /// Add tracks to the tracklist by calling `tracklist.add`.
+    fn tracklist_add(
+        &self,
+        uris: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<TracklistAddReply, MopidyClientError>> + Send;
+
+    /// Toggle Mopidy's repeat by calling `tracklist.set_repeat`.
+    fn tracklist_set_repeat(
+        &self,
+        repeat: bool,
+    ) -> impl std::future::Future<Output = Result<(), MopidyClientError>> + Send;
+
+    /// Toggle Mopidy's shuffle by calling `tracklist.set_shuffle`.
+    fn tracklist_set_shuffle(
+        &self,
+        shuffle: bool,
+    ) -> impl std::future::Future<Output = Result<(), MopidyClientError>> + Send;
+}
+
+impl TracklistApi for MopidyWsClient {
+    async fn tracklist_add(&self, uris: Vec<String>) -> Result<TracklistAddReply, MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
+        let req = TracklistAddRequest::new(uris);
+        let params = req.to_jsonrpc_params();
+        let reply_msg = self.send_and_await("tracklist.add", params).await?;
+        Ok(parse_or_error::<TracklistAddReply>(reply_msg)?)
+    }
+
+    async fn tracklist_set_repeat(&self, repeat: bool) -> Result<(), MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
+        let req = SetRepeatRequest::new(repeat);
+        let params = Some(req.to_jsonrpc_params());
+        let reply_msg = self.send_and_await("tracklist.set_repeat", params).await?;
+        // Mopidy returns `null`/`true` for this void method; acknowledge any
+        // result and only fail on an RPC-level error.
+        let _: Value = parse_or_error::<Value>(reply_msg)?;
+        Ok(())
+    }
+
+    async fn tracklist_set_shuffle(&self, shuffle: bool) -> Result<(), MopidyClientError> {
+        if !self.is_connected() {
+            return Err(MopidyClientError::NotConnected);
+        }
+        let req = SetShuffleRequest::new(shuffle);
+        let params = Some(req.to_jsonrpc_params());
+        let reply_msg = self.send_and_await("tracklist.set_shuffle", params).await?;
+        // Mopidy returns `null`/`true` for this void method; acknowledge any
+        // result and only fail on an RPC-level error.
+        let _: Value = parse_or_error::<Value>(reply_msg)?;
+        Ok(())
     }
 }
 
@@ -526,5 +723,207 @@ mod tests {
     fn get_time_position_request_has_no_params() {
         let req = GetTimePositionRequest::default();
         assert!(req.to_jsonrpc_params().is_none());
+    }
+
+    // ── tracklist.add request serialization (task 4.5) ─────────────
+
+    #[test]
+    fn tracklist_add_request_serializes_uris_object() {
+        let req = TracklistAddRequest::new(vec![
+            "file:///path/to/track.mp3".to_string(),
+            "file:///path/to/other.mp3".to_string(),
+        ]);
+        let params = req.to_jsonrpc_params().expect("params present");
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "uris": ["file:///path/to/track.mp3", "file:///path/to/other.mp3"]
+            })
+        );
+    }
+
+    #[test]
+    fn tracklist_add_request_single_uri_shape() {
+        // Scenario: tracklist.add with URIs sends `{method: "tracklist.add",
+        // params: {uris: [uri]}}`.
+        let req = TracklistAddRequest::new(vec!["file:///alarm.mp3".to_string()]);
+        let params = req.to_jsonrpc_params().expect("params present");
+        let uris = params.get("uris").expect("uris field present");
+        let arr = uris.as_array().expect("uris is an array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0], "file:///alarm.mp3");
+    }
+
+    #[test]
+    fn tracklist_add_request_empty_uris() {
+        let req = TracklistAddRequest::default();
+        let params = req.to_jsonrpc_params().expect("params present");
+        assert_eq!(params, serde_json::json!({ "uris": [] }));
+    }
+
+    // ── tracklist.add reply deserialization (task 4.5) ─────────────
+
+    #[test]
+    fn tracklist_add_reply_deserializes_from_tltrack_array() {
+        // Mopidy returns an array of added TlTrack objects.
+        let fixture = serde_json::json!([
+            { "tlid": 1, "track": { "uri": "file:///alarm.mp3", "name": "Alarm" } }
+        ]);
+        let reply: TracklistAddReply =
+            serde_json::from_value(fixture).expect("deserialize TracklistAddReply");
+        assert_eq!(reply, TracklistAddReply);
+    }
+
+    #[test]
+    fn tracklist_add_reply_deserializes_from_empty_array() {
+        let fixture = serde_json::json!([]);
+        let reply: TracklistAddReply =
+            serde_json::from_value(fixture).expect("deserialize TracklistAddReply");
+        assert_eq!(reply, TracklistAddReply);
+    }
+
+    #[test]
+    fn tracklist_add_reply_acknowledged_via_parse_or_error() {
+        let msg = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: Some(7),
+            method: None,
+            result: Some(serde_json::json!([
+                { "tlid": 1, "track": { "uri": "file:///alarm.mp3" } }
+            ])),
+            error: None,
+        };
+        let reply: TracklistAddReply =
+            parse_or_error(msg).expect("acknowledged reply");
+        assert_eq!(reply, TracklistAddReply);
+    }
+
+    // ── tracklist.set_repeat request serialization (task 4.5) ──────
+
+    #[test]
+    fn set_repeat_request_serializes_true() {
+        let req = SetRepeatRequest::new(true);
+        assert_eq!(req.repeat, true);
+        assert_eq!(req.to_jsonrpc_params(), serde_json::json!({ "repeat": true }));
+    }
+
+    #[test]
+    fn set_repeat_request_serializes_false() {
+        let req = SetRepeatRequest::new(false);
+        assert_eq!(req.repeat, false);
+        assert_eq!(req.to_jsonrpc_params(), serde_json::json!({ "repeat": false }));
+    }
+
+    // ── tracklist.set_shuffle request serialization (task 4.5) ──────
+
+    #[test]
+    fn set_shuffle_request_serializes_true() {
+        let req = SetShuffleRequest::new(true);
+        assert_eq!(req.shuffle, true);
+        assert_eq!(req.to_jsonrpc_params(), serde_json::json!({ "shuffle": true }));
+    }
+
+    #[test]
+    fn set_shuffle_request_serializes_false() {
+        let req = SetShuffleRequest::new(false);
+        assert_eq!(req.shuffle, false);
+        assert_eq!(req.to_jsonrpc_params(), serde_json::json!({ "shuffle": false }));
+    }
+
+    // ── tracklist.set_repeat / set_shuffle reply deserialization (task 4.5)
+
+    #[test]
+    fn set_repeat_reply_acknowledges_null() {
+        // Mopidy returns `null` for void methods.
+        let msg = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: Some(11),
+            method: None,
+            result: Some(serde_json::Value::Null),
+            error: None,
+        };
+        let _: Value = parse_or_error::<Value>(msg).expect("acknowledged null");
+    }
+
+    #[test]
+    fn set_shuffle_reply_acknowledges_true() {
+        let msg = JsonRpcMessage {
+            jsonrpc: "2.0".into(),
+            request_id: Some(12),
+            method: None,
+            result: Some(serde_json::json!(true)),
+            error: None,
+        };
+        let _: Value = parse_or_error::<Value>(msg).expect("acknowledged true");
+    }
+
+    // ── MopidyClientError (task 4.5) ───────────────────────────────
+
+    #[test]
+    fn mopidy_client_error_not_connected_displays() {
+        let err = MopidyClientError::NotConnected;
+        assert!(format!("{err}").contains("not connected to Mopidy"));
+    }
+
+    #[test]
+    fn mopidy_client_error_transports_from_transport_error() {
+        let transport_err = TransportError::Parse("boom".to_string());
+        let client_err: MopidyClientError = transport_err.into();
+        assert!(matches!(client_err, MopidyClientError::Transport(_)));
+    }
+
+    // ── NotConnected path (task 4.5) ───────────────────────────────
+
+    #[tokio::test]
+    async fn typed_calls_return_not_connected_when_disconnected() {
+        use crate::transport::MopidyWsClient;
+        use tokio::sync::mpsc;
+
+        // Spawn a client against an unreachable URL; it never reaches
+        // Connected (cycles Disconnected → Connecting → BackingOff …).
+        let (e_tx, _e_rx) = mpsc::channel::<crate::transport::MopidyEvent>(16);
+        let (r_tx, _r_rx) = mpsc::channel::<JsonRpcMessage>(16);
+        let (s_tx, _s_rx) = mpsc::channel::<crate::state::MopidyConnectionState>(16);
+
+        let client = MopidyWsClient::spawn(
+            "ws://127.0.0.1:1/unreachable-mopidy".into(),
+            None,
+            e_tx,
+            r_tx,
+            s_tx,
+        );
+
+        // The client is never Connected with an unreachable URL, so every
+        // typed call must short-circuit to NotConnected immediately.
+        assert!(!client.is_connected());
+
+        let err = client
+            .tracklist_set_repeat(true)
+            .await
+            .expect_err("expected NotConnected");
+        assert!(
+            matches!(err, MopidyClientError::NotConnected),
+            "expected NotConnected, got {:?}",
+            err
+        );
+
+        let err = client
+            .tracklist_set_shuffle(true)
+            .await
+            .expect_err("expected NotConnected");
+        assert!(matches!(err, MopidyClientError::NotConnected));
+
+        let err = client
+            .tracklist_add(vec!["file:///alarm.mp3".to_string()])
+            .await
+            .expect_err("expected NotConnected");
+        assert!(matches!(err, MopidyClientError::NotConnected));
+
+        // Playback calls must also return NotConnected immediately (no hang).
+        let err = client
+            .playback_play(Some("file:///alarm.mp3".to_string()))
+            .await
+            .expect_err("expected NotConnected");
+        assert!(matches!(err, MopidyClientError::NotConnected));
     }
 }
