@@ -22,7 +22,7 @@ use mopidy_client::state::MopidyConnectionState;
 use tokio::sync::mpsc as tokio_mpsc;
 use crate::config::Config;
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use tokio::signal::unix::{SignalKind, signal as unix_signal};
@@ -30,6 +30,11 @@ use tokio::sync::mpsc;
 use tracing::{info, info_span, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+// Generated Slint UI module (ui.slint + AlarmPanel.slint). Exposes `AppWindow`
+// with the `episode-firing` property and `dismiss-requested` callback
+// (tasks 7.1–7.3).
+slint::include_modules!();
 
 // ── Observability (tracing → journald / fmt fallback) ────────────────────────
 
@@ -138,6 +143,14 @@ pub async fn command_dispatcher(
                         // exhaustive.
                         info!(alarm_id, "FireAlarm command received (slice 1 placeholder)");
                     }
+                    // Task 7.3: the dismiss tap handler calls
+                    // `EpisodeController::dismiss()` directly on main (the FSM
+                    // lives on main per design D4/D8). `Cmd::Dismiss` is routed
+                    // to the tokio worker only if a cross-thread dismiss is
+                    // issued; the worker has no FSM, so it is a logged no-op.
+                    Cmd::Dismiss => {
+                        info!("Dismiss command received on tokio worker — no-op (episode FSM is on main)");
+                    }
                 }
             }
 
@@ -219,7 +232,7 @@ fn spawn_tokio_worker(
 /// The returned [`JoinHandle`] can be `.join()`d to wait for the tokio worker
 /// to finish; in normal operation the handle is parked (the application lives
 /// as long as the Slint event loop runs).
-pub fn bootstrap() -> JoinHandle<()> {
+pub fn bootstrap() -> (JoinHandle<()>, AppWindow) {
     let cfg = Config::load();
 
     info!(
@@ -266,9 +279,48 @@ pub fn bootstrap() -> JoinHandle<()> {
     // `shutdown_restore()` before draining the Cmd channel and exiting.
     // Uses NoopMopidyControl as a placeholder; group 9.1 will wire the
     // real Mopidy-backed impl.
-    let episode_ctl = std::sync::Mutex::new(
-        episode::EpisodeController::new(episode::NoopMopidyControl),
-    );
+    //
+    // Wrapped in `Arc<Mutex<..>>` (task 7.3) so the dismiss tap handler —
+    // registered on the `AppWindow` below — and the drain timer can both
+    // reach the FSM on the main thread. `Arc` (not `Rc`) because the slint
+    // drain `Timer` closure must be `Send`.
+    let episode_ctl: Arc<Mutex<episode::EpisodeController<episode::NoopMopidyControl>>> =
+        Arc::new(Mutex::new(
+            episode::EpisodeController::new(episode::NoopMopidyControl),
+        ));
+
+    // ── Slint AppWindow + episode UI wiring (tasks 7.2 / 7.3) ─────────────
+    //
+    // The `AppWindow` exposes the `episode-firing` property and the
+    // `dismiss-requested` callback. Group 9.1 hosts `.run()` to drive the
+    // Slint event loop; the window is held alive across the bootstrap scope
+    // (and returned to `main`) so the weak refs captured by the drain timer
+    // and the dismiss callback remain valid.
+    let app_window = AppWindow::new().expect("failed to create AppWindow");
+
+    // Task 7.3: a tap on the alarm overlay (`AlarmPanel`) invokes the
+    // `dismiss-requested` callback, which calls `EpisodeController::dismiss()`
+    // directly on main (the FSM lives on main per design D4/D8) and restores
+    // the UI to Idle. This does not route through the `Cmd` channel — the
+    // episode FSM is owned by main.
+    {
+        let ctl = Arc::clone(&episode_ctl);
+        let weak = app_window.as_weak();
+        app_window.on_dismiss_requested(move || {
+            if let Ok(mut ctl) = ctl.lock() {
+                ctl.dismiss();
+            }
+            // Optimistically restore the UI to Idle (the FSM is now `Dismissed`).
+            if let Some(w) = weak.upgrade() {
+                w.set_episode_firing(false);
+            }
+        });
+    }
+
+    // Weak handle captured by the drain timer (task 7.2): each tick reflects
+    // `EpisodeController::is_firing()` into the `episode-firing` property so
+    // the overlay shows/hides and the nav container / swipe are gated.
+    let ui_weak = app_window.as_weak();
 
     // ── Slint drain timer (non-blocking try_recv on each tick) ────────────
     //
@@ -290,13 +342,23 @@ pub fn bootstrap() -> JoinHandle<()> {
             while let Ok(reply) = reply_rx.try_recv() {
                 dispatch_reply_to_domain(
                     reply,
-                    &episode_ctl,
+                    &*episode_ctl,
                 );
             }
 
             // Drain Mopidy event channel (non-blocking).
             while let Ok(event) = event_rx.try_recv() {
                 dispatch_event_to_domain(event);
+            }
+
+            // Task 7.2: reflect the episode FSM state into the UI. When the
+            // FSM is `Firing`, the alarm overlay is shown exclusively and the
+            // navigation container is hidden + swipe disabled (bound in
+            // `ui.slint`); on `Idle`/`Dismissed` it is restored.
+            if let Ok(ctl) = episode_ctl.lock() {
+                if let Some(w) = ui_weak.upgrade() {
+                    w.set_episode_firing(ctl.is_firing());
+                }
             }
         }));
 
@@ -358,7 +420,14 @@ pub fn bootstrap() -> JoinHandle<()> {
     // Slint event loop).
     let _scheduler_timer = scheduler_timer;
 
-    worker_handle
+    // Hold the `AppWindow` alive across the bootstrap scope so the weak refs
+    // captured by the drain timer and the dismiss callback remain valid. Group
+    // 9.1 hosts `.run()` to drive the Slint event loop; until then the window
+    // is held here (and returned to `main`) so the episode-UI wiring is live
+    // when 9.1 runs it.
+    let _app_window = app_window;
+
+    (worker_handle, _app_window)
 }
 
 /// Dispatch a [`Reply`] from the tokio worker into the domain.
@@ -511,7 +580,7 @@ fn main() -> anyhow::Result<()> {
 
     info!("database: migrations complete");
 
-    let worker_handle = info_span!("bootstrap").in_scope(|| bootstrap());
+    let (worker_handle, _app_window) = info_span!("bootstrap").in_scope(|| bootstrap());
 
     // systemd readiness (Design D10): signal READY=1 after all bootstrap steps
     // complete even when Mopidy is not yet reachable.
@@ -522,6 +591,10 @@ fn main() -> anyhow::Result<()> {
     // In later slices, the Slint window will be created and `.run()` here,
     // keeping main alive. For slice 0 verification we park for a short
     // period to allow any pending timer ticks to fire.
+    //
+    // Slice 1 (tasks 7.1–7.3): the `AppWindow` is now created in `bootstrap`
+    // and held here as `_app_window`; group 9.1 will call `_app_window.run()`
+    // to drive the Slint event loop.
     //
     // Dropping `cmd_sender` (when it goes out of scope at end of lifetime)
     // will cause the tokio worker's recv loop to terminate naturally.

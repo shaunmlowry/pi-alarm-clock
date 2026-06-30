@@ -48,6 +48,9 @@ pub enum Cmd {
 
     /// Fire an alarm by ID (for alarm scheduling in slice 1).
     FireAlarm { alarm_id: i64 },
+
+    /// Dismiss the current alarm episode (task 7.3).
+    Dismiss,
 }
 
 /// Replies sent from the tokio worker back to main.

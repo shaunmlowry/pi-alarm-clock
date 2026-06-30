@@ -5,6 +5,8 @@
 // Slice 0 ships exactly one Clock panel; the scaffold is structured so that
 // later slices add panels without touching the navigation code.
 
+import { AlarmPanel } from "AlarmPanel.slint";
+
 // ── ClockFace (task 5.2 + 5.4): placeholder with theme seam ────────────────
 // Exposes `clock-color` and `font-family` as in-properties so that a future
 // theming slice swaps the hardcoded feeder for a token system without
@@ -43,10 +45,15 @@ component PanelContainer {
     // Number of panels in the container. Set by whoever instantiates this
     // component so the hard-stop guards self-adjust when panels are added.
     property <int> max-panels: 1;
+    // When `false`, the swipe TouchArea is disabled (task 7.2): the alarm
+    // episode overlay sets this to `false` while an episode is `Firing` so
+    // panel-swipe is disabled even though the container is also hidden.
+    in property <bool> swipe-enabled: true;
 
     _ta := TouchArea {
         width: parent.width;
         height: parent.height;
+        enabled: swipe-enabled;
 
         moved => {
             // TouchArea's mouse_x / pressed_x are <length> types.
@@ -93,5 +100,32 @@ export component AppWindow inherits Window {
     preferred-height: 854px;
     title: "Alarm Clock";
 
-    PanelContainer {}
+    // Episode FSM state exposed to Slint (task 7.2). `true` while an episode
+    // is `Firing`: the alarm overlay is shown exclusively and the navigation
+    // container is hidden + swipe disabled. `false` (Idle) restores the
+    // normal Clock panel. Main updates this from `EpisodeController::is_firing()`
+    // on each drain-timer tick.
+    in-out property <bool> episode-firing: false;
+
+    // Emitted when the user taps the alarm overlay (task 7.3). Main wires this
+    // to `EpisodeController::dismiss()` on the main thread.
+    callback dismiss-requested();
+
+    // Navigation container (slice 0): hidden and swipe-disabled while an episode
+    // is `Firing` (task 7.2).
+    panel := PanelContainer {
+        visible: !root.episode-firing;
+        swipe-enabled: !root.episode-firing;
+    }
+
+    // Alarm episode UI (task 7.1): rendered above the navigation container
+    // when `Firing`. Tap-anywhere-to-dismiss; no snooze affordance.
+    AlarmPanel {
+        visible: root.episode-firing;
+        clock-color: #334155;
+        font-family: "sans-serif";
+        dismiss-requested => {
+            root.dismiss-requested();
+        }
+    }
 }

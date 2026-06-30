@@ -50,10 +50,10 @@
 
 ## 7. Alarm episode UI
 
-- [ ] 7.1 Create `AlarmPanel.slint` rendered above the navigation container when the episode is `Firing`: shows the clock face (reusing the Clock panel's theme-seam properties, hardcoded values) and is tap-anywhere-to-dismiss; no snooze button.
-- [ ] 7.2 Expose the episode state (`Firing`/`Idle`) to Slint; on `Firing`, hide the navigation container and disable panel-swipe; on `Idle`, restore.
-- [ ] 7.3 Wire the dismiss tap handler to send a `Dismiss` command to the `EpisodeController` on main.
-- [ ] 7.4 Verify (cargo check / manual): during `Firing`, normal panels are hidden, swipe is disabled, and a tap dismisses; no snooze affordance is present.
+- [x] 7.1 Create `AlarmPanel.slint` rendered above the navigation container when the episode is `Firing`: shows the clock face (reusing the Clock panel's theme-seam properties, hardcoded values) and is tap-anywhere-to-dismiss; no snooze button.
+- [x] 7.2 Expose the episode state (`Firing`/`Idle`) to Slint; on `Firing`, hide the navigation container and disable panel-swipe; on `Idle`, restore.
+- [x] 7.3 Wire the dismiss tap handler to send a `Dismiss` command to the `EpisodeController` on main.
+- [x] 7.4 Verify (cargo check / manual): during `Firing`, normal panels are hidden, swipe is disabled, and a tap dismisses; no snooze affordance is present.
 
 ## 8. Dev alarm seeding
 
