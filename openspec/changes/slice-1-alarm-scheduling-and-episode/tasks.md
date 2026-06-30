@@ -23,8 +23,8 @@
 
 ## 4. Mopidy playback method surface
 
-- [ ] 4.1 Add typed wrappers (request struct + `call` + typed reply, slice-0 shape) for `playback.play(uri)`, `playback.pause`, `playback.resume`, `playback.stop`.
-- [ ] 4.2 Add typed wrappers for `playback.set_volume` (clamp 0..100), `playback.get_state` (`PlaybackState` enum: Playing/Paused/Stopped), `playback.get_time_position` (`u32` ms).
+- [x] 4.1 Add typed wrappers (request struct + `call` + typed reply, slice-0 shape) for `playback.play(uri)`, `playback.pause`, `playback.resume`, `playback.stop`.
+- [x] 4.2 Add typed wrappers for `playback.set_volume` (clamp 0..100), `playback.get_state` (`PlaybackState` enum: Playing/Paused/Stopped), `playback.get_time_position` (`u32` ms).
 - [ ] 4.3 Add typed wrappers for `tracklist.add(uris)`, `tracklist.set_repeat(bool)`, `tracklist.set_shuffle(bool)` (alias `set_random` if the Mopidy version exposes only that).
 - [ ] 4.4 Implement `MopidyClientError::NotConnected` (`thiserror` variant): typed calls return this error immediately (no hang) when the client is `Disconnected`/`BackingOff`.
 - [ ] 4.5 Unit-test the typed wrappers (serialization shape + reply deserialization) against fixture JSON-RPC payloads; unit-test the `NotConnected` path.
