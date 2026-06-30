@@ -30,15 +30,24 @@
 //! hook the drain calls when a reply indicates failure (logged). Slice 1's FSM
 //! does not block the Slint event loop awaiting a reply.
 
-use tracing::{info, info_span};
+use std::time::{Duration, Instant};
+
+use tracing::{error, info, info_span};
 use tracing::span::EnteredSpan;
 
 use crate::scheduler::AlarmId;
+
+use mopidy_client::MopidyConnectionState;
+use mopidy_client::PlaybackState;
 
 /// Upper bound for snapshot capture (task 5.3): a 1 s wait; on timeout or
 /// `NotConnected`, proceed with `None`/defaults.
 #[allow(dead_code)] // slice-1 seam; consumed by the Mopidy-backed impl (group 9.1).
 pub const SNAPSHOT_CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Default grace window for source-failure detection (task 6.2). When playback
+/// goes to `Stopped` within this interval after fire, the episode is ended.
+pub const DEFAULT_GRACE_WINDOW: Duration = Duration::from_secs(8);
 
 // ── Snapshot (task 5.2) ──────────────────────────────────────────────────────
 
@@ -117,6 +126,8 @@ pub enum EpisodeState {
     Firing {
         alarm_id: AlarmId,
         snapshot: MopidySnapshot,
+        /// Monotonic time at which fire began (for grace-window checks).
+        fire_time: Instant,
         /// Entered `episode` span guard; dropped on restore → span exits.
         _span: EnteredSpan,
     },
@@ -214,6 +225,7 @@ impl<C: MopidyControl> EpisodeController<C> {
         self.state = EpisodeState::Firing {
             alarm_id,
             snapshot,
+            fire_time: Instant::now(),
             _span: span,
         };
     }
@@ -291,14 +303,25 @@ impl<C: MopidyControl> EpisodeController<C> {
     /// drain calls this method when a reply indicates failure (e.g.
     /// `NotConnected`, a JSON-RPC error, or a timeout).
     ///
-    /// For slice 1 the correction is to dismiss-and-restore the current
-    /// episode (a failed fire cannot produce a working alarm; the
-    /// source-failure grace window is task 6.2). The failure is logged with
-    /// `command` and `error` structured fields. Calling this while not `Firing`
-    /// is a logged no-op.
+    /// **Task 6.1** (Mopidy-down-at-fire): when Mopidy is disconnected at fire
+    /// time the commands fail with `NotConnected`. This is logged but the
+    /// episode *stays* `Firing` — best-effort, no dismiss. Only non-
+    /// `NotConnected` failures trigger correction (dismiss-and-restore).
+    /// Calling this while not `Firing` is a logged no-op.
     pub fn on_command_failure(&mut self, command: &str, error: &str) {
         info!(command, error, "mopidy command failure reply received");
         if self.is_firing() {
+            // Task 6.1: Mopidy-down-at-fire — playback commands return
+            // NotConnected; episode stays Firing (best-effort).
+            if error == "NotConnected" {
+                info!(
+                    command,
+                    error,
+                    "mopidy not connected — playback best-effort, episode remains Firing",
+                );
+                return;
+            }
+            // Non-NotConnected failures: correct by dismissing-and-restoring.
             info!(
                 command,
                 error,
@@ -310,6 +333,57 @@ impl<C: MopidyControl> EpisodeController<C> {
                 command,
                 error,
                 "command failure reported while not Firing — no correction needed",
+            );
+        }
+    }
+
+    /// Grace-window source-failure detection (task 6.2 / design D10).
+    ///
+    /// When the Mopidy playback state transitions to `Stopped` within the
+    /// grace window after fire, log at `error!` and dismiss-and-restore the
+    /// episode. Slice 1 has no fallback chain; the user must re-arm.
+    /// Calling this while not `Firing` is a logged no-op.
+    pub fn on_playback_state_changed(&mut self, state: PlaybackState) {
+        let now = Instant::now();
+        match &self.state {
+            EpisodeState::Firing { fire_time, .. } => {
+                if now.duration_since(*fire_time) < DEFAULT_GRACE_WINDOW
+                    && matches!(state, PlaybackState::Stopped)
+                {
+                    error!(
+                        elapsed_ms = now.duration_since(*fire_time).as_millis(),
+                        "source failed (stopped within grace window) — ending episode",
+                    );
+                    self.dismiss();
+                }
+            }
+            _ => {
+                info!(?state, "playback state change while not Firing — no-op");
+            }
+        }
+    }
+
+    /// Mid-episode Mopidy restart handling (task 6.3 / design D10).
+    ///
+    /// Connection-state transitions are logged at `info!`. The episode remains
+    /// dismissable; no mid-episode re-issue in slice 1 (deferred to the
+    /// fallback-chain slice). Calling this while not `Firing` is also logged.
+    pub fn on_connection_state_change(
+        &mut self,
+        old_state: MopidyConnectionState,
+        new_state: MopidyConnectionState,
+    ) {
+        if self.is_firing() {
+            info!(
+                from = ?old_state,
+                to = ?new_state,
+                "mopidy connection state transition during Firing episode — logging only (mid-episode re-issue is deferred)",
+            );
+        } else {
+            info!(
+                from = ?old_state,
+                to = ?new_state,
+                "mopidy connection state transition while not Firing",
             );
         }
     }
@@ -727,7 +801,7 @@ mod tests {
         { calls.lock().unwrap().clear(); }
 
         // The reply drain dispatches a failure (no blocking — called on tick).
-        fsm.on_command_failure("playback.play", "NotConnected");
+        fsm.on_command_failure("playback.play", "RPCError: source unavailable");
 
         // Corrected: episode dismissed and restored.
         assert!(matches!(fsm.state(), EpisodeState::Dismissed));
@@ -757,6 +831,201 @@ mod tests {
         fsm.on_command_failure("playback.play", "timeout");
         assert!(matches!(fsm.state(), EpisodeState::Idle));
         assert!({ calls.lock().unwrap().is_empty() });
+    }
+
+    // ── Task 6.1: Mopidy-down-at-fire — NotConnected stays Firing ────────
+
+    /// Scenario: the reply drain reports a `NotConnected` failure while
+    /// `Firing`; per task 6.1 the episode *remains* Firing (best-effort,
+    /// no dismiss).
+    #[test]
+    fn not_connected_failure_stays_firing() {
+        // Mopidy is down at fire time → snapshot is defaults.
+        let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        assert!(fsm.is_firing());
+        // Snapshot should be None/defaults (Mopidy-down capture).
+        let snap = fsm.snapshot().unwrap().clone();
+        assert_eq!(snap.uri, None);
+        { calls.lock().unwrap().clear(); }
+
+        // Playback commands failed with NotConnected — episode stays Firing.
+        fsm.on_command_failure("playback.play", "NotConnected");
+        fsm.on_command_failure("tracklist.add", "NotConnected");
+
+        assert!(fsm.is_firing(), "episode should stay Firing on NotConnected error");
+        // No restore calls issued (no dismiss).
+        assert!(calls.lock().unwrap().is_empty(), "should not have restored");
+    }
+
+    /// Scenario: dismiss works normally when episode is Firing with a default
+    /// snapshot (Mopidy-down path; task 6.1 + existing restore logic).
+    #[test]
+    fn mopidy_down_restore_is_noop_volume_repeat_shuffle_only() {
+        let (ctrl, calls) = mock(vec![MopidySnapshot::default()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        { calls.lock().unwrap().clear(); }
+
+        // NotConnected failure stays Firing.
+        fsm.on_command_failure("playback.play", "NotConnected");
+        assert!(fsm.is_firing());
+
+        { calls.lock().unwrap().clear(); }
+        fsm.dismiss();
+
+        // Restore: only volume/repeat/shuffle (all defaults → no-op content).
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                "set_repeat(false)".to_string(),
+                "set_shuffle(false)".to_string(),
+                "set_volume(0)".to_string(),
+            ],
+            "Mopidy-down restore is volume/repeat/shuffle only (no add/play/seek/stop)",
+        );
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+    }
+
+    // ── Task 6.2: source-failure end-of-episode (grace window) ───────────
+
+    /// Scenario: playback goes to Stopped within the grace window after fire;
+    /// the episode is ended (dismiss-and-restore, error logged).
+    #[test]
+    fn source_failure_stops_within_grace_window_ends_episode() {
+        let snap = MopidySnapshot {
+            uri: Some("file:///music/a.mp3".into()),
+            position_ms: 1_000,
+            was_playing: true,
+            seekable: true,
+            volume: 20,
+            repeat: false,
+            shuffle: false,
+        };
+        let (ctrl, calls) = mock(vec![snap.clone()]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///bad-source.mp3", 90);
+        assert!(fsm.is_firing());
+        { calls.lock().unwrap().clear(); }
+
+        // Playback reports Stopped within the grace window → episode ends.
+        fsm.on_playback_state_changed(PlaybackState::Stopped);
+
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed),
+            "episode should be Dismissed after source failure in grace window");
+
+        // Restore commands were issued (was_playing = true, seekable).
+        let log = { calls.lock().unwrap().clone() };
+        assert_eq!(
+            log,
+            vec![
+                "set_repeat(false)".to_string(),
+                "set_shuffle(false)".to_string(),
+                "set_volume(20)".to_string(),
+                "add(file:///music/a.mp3)".to_string(),
+                "play".to_string(),
+                "seek(1000)".to_string(),
+            ],
+            "source failure should dismiss-and-restore",
+        );
+    }
+
+    /// Scenario: playback goes to Stopped AFTER the grace window has elapsed;
+    /// no auto-dismiss occurs (user may manually dismiss later).
+    #[test]
+    fn stopped_after_grace_window_does_not_auto_dismiss() {
+        let snap = MopidySnapshot::default();
+        let (ctrl, _calls) = mock(vec![snap]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        assert!(fsm.is_firing());
+
+        // Advance past the grace window by sleeping.
+        std::thread::sleep(DEFAULT_GRACE_WINDOW + std::time::Duration::from_secs(1));
+
+        // Playback goes Stopped after grace window — should NOT auto-dismiss.
+        fsm.on_playback_state_changed(PlaybackState::Stopped);
+        assert!(fsm.is_firing(),
+            "episode should stay Firing when stopped outside grace window");
+    }
+
+    /// Scenario: PlaybackStateChanged to Playing within the grace window does
+    /// NOT auto-dismiss (only Stopped triggers end-of-episode).
+    #[test]
+    fn playing_within_grace_window_does_not_dismiss() {
+        let snap = MopidySnapshot::default();
+        let (ctrl, _calls) = mock(vec![snap]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        assert!(fsm.is_firing());
+
+        fsm.on_playback_state_changed(PlaybackState::Playing);
+        assert!(fsm.is_firing(), "Playing state should not trigger dismiss");
+    }
+
+    // ── Task 6.3: mid-episode Mopidy restart handling ────────────────────
+
+    /// Scenario: Mopidy restarts while an episode is Firing (Connected →
+    /// BackingOff → Connected). The process does not crash, the episode
+    /// remains dismissable, and no re-issue of playback occurs (logged only).
+    #[test]
+    fn mid_episode_mopidy_restart_stays_firing() {
+        let snap = MopidySnapshot::default();
+        let (ctrl, _calls) = mock(vec![snap]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        fsm.fire(1, "file:///alarm.mp3", 90);
+        assert!(fsm.is_firing());
+
+        // Mopidy disconnects mid-episode.
+        fsm.on_connection_state_change(
+            MopidyConnectionState::Connected,
+            MopidyConnectionState::BackingOff {
+                retry_in: std::time::Duration::from_secs(2),
+            },
+        );
+        assert!(fsm.is_firing(), "should stay Firing during BackingOff");
+
+        // Mopidy reconnects.
+        fsm.on_connection_state_change(
+            MopidyConnectionState::BackingOff {
+                retry_in: std::time::Duration::from_secs(2),
+            },
+            MopidyConnectionState::Connected,
+        );
+        assert!(fsm.is_firing(), "should still stay Firing after reconnect");
+
+        // Still dismissable via normal path.
+        fsm.dismiss();
+        assert!(matches!(fsm.state(), EpisodeState::Dismissed));
+    }
+
+    /// Scenario: connection-state transition while not Firing (logged, no crash).
+    #[test]
+    fn connection_change_while_idle_does_not_crash() {
+        let (ctrl, _calls) = mock(vec![]);
+        let mut fsm = EpisodeController::new(ctrl);
+
+        assert!(matches!(fsm.state(), EpisodeState::Idle));
+
+        // Transition while Idle — should just log and not crash.
+        fsm.on_connection_state_change(
+            MopidyConnectionState::Disconnected,
+            MopidyConnectionState::Connecting,
+        );
+        fsm.on_connection_state_change(
+            MopidyConnectionState::Connecting,
+            MopidyConnectionState::Connected,
+        );
+
+        assert!(matches!(fsm.state(), EpisodeState::Idle));
     }
 
     // ── Task 5.1: episode span entered on fire, exited on restore ────────
