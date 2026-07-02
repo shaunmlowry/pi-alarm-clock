@@ -304,13 +304,13 @@ component PanelContainer {
             let threshold: float = 10;
 
             if dx < (-threshold) {
-                if ThemeGlobal.current-panel > 0 {
-                    ThemeGlobal.current-panel -= 1;
+                if ThemeGlobal.current-panel < (max-panels - 1) {
+                    ThemeGlobal.current-panel += 1;
                     root.swipe-consumed = true;
                 }
             } else if dx > threshold {
-                if ThemeGlobal.current-panel < (max-panels - 1) {
-                    ThemeGlobal.current-panel += 1;
+                if ThemeGlobal.current-panel > 0 {
+                    ThemeGlobal.current-panel -= 1;
                     root.swipe-consumed = true;
                 }
             }

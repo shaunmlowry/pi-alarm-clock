@@ -28,5 +28,5 @@
 ## 5. Verification
 
 - [x] 5.1 `cargo build` + `cargo test` green; slice 0–2 tests unaffected.
-- [ ] 5.2 Visual check: live analog clock shows correct time; both themes match their wireframes; runtime switch re-renders all panels; theme/mode persists across restart.
+- [x] 5.2 Visual check: live analog clock shows correct time; both themes match their wireframes; runtime switch re-renders all panels; theme/mode persists across restart.
 - [x] 5.3 Full-screen kiosk: release build on the Pi covers the entire display with no title bar/border; debug build retains 480×854 for testing.
