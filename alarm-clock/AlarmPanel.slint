@@ -1,29 +1,21 @@
-// AlarmPanel.slint — alarm episode UI (slice 1, task 7.1).
+// AlarmPanel.slint — alarm episode UI (slice 3).
 //
-// Rendered **above** the navigation container when an episode is `Firing`
-// (see `AppWindow` in `ui.slint`). It hides the normal panels and disables
-// panel-swipe (handled by `AppWindow` binding `episode-firing`). The panel
-// shows the clock face reusing the Clock panel's theme-seam properties
-// (`clock-color` / `font-family`, hardcoded feeder values — same as slice 0;
-// the token system is built in a later slice) and is **tap-anywhere-to-dismiss**.
-// No snooze button is present in slice 1 (snooze is deferred).
+// Rendered above the navigation container when an episode is `Firing`. It
+// inherits the active theme via `ThemeGlobal`, so it re-renders instantly when
+// the user switches themes mid-episode.
+
+import { ThemeGlobal } from "ui/ThemeGlobal.slint";
+import { Button } from "ui/Button.slint";
 
 export component AlarmPanel inherits Rectangle {
-    // Theme-seam properties (same shape as `ClockFace` in `ui.slint`): a future
-    // theming slice swaps the hardcoded feeder for a token system without
-    // touching this component's internal structure.
-    in property <color> clock-color;
-    in property <string> font-family;
-
-    // Emitted when the user taps anywhere on the panel (task 7.3). Main wires
-    // this to `EpisodeController::dismiss()` on the main thread.
     callback dismiss-requested();
+    callback snooze-requested();
 
-    background: #0f172a;
+    background: ThemeGlobal.background;
 
-    // Clock face (hardcoded values, same feeder as the Clock panel in slice 0).
+    // Clock face placeholder, now theme-bound.
     Rectangle {
-        background: root.clock-color;
+        background: ThemeGlobal.clock-face-background;
         width: parent.width;
         height: parent.height;
 
@@ -32,19 +24,28 @@ export component AlarmPanel inherits Rectangle {
             vertical-alignment: center;
             text: "12:00";
             font-size: 140px;
-            color: #f8fafc;
-            font-family: root.font-family;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
         }
     }
 
-    // Tap-anywhere-to-dismiss: a full-screen TouchArea layered above the clock.
-    // Per PRD: a tap anywhere on the alarm UI dismisses the episode. There is
-    // deliberately no snooze affordance in slice 1.
-    TouchArea {
+    // Tap-anywhere-to-dismiss, layered beneath the Snooze button.
+    dismiss-ta := TouchArea {
         width: parent.width;
         height: parent.height;
         clicked => {
             root.dismiss-requested();
+        }
+    }
+
+    Button {
+        text: "Snooze";
+        x: (parent.width - self.width) / 2;
+        y: parent.height - self.height - 48px;
+
+        // Declared after dismiss-ta, so its TouchArea is hit-tested first.
+        clicked => {
+            root.snooze-requested();
         }
     }
 }

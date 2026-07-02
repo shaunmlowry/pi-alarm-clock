@@ -79,8 +79,17 @@ pub trait AlarmSource {
 ///
 /// `fire(alarm_id)` captures the Mopidy snapshot and starts playback. It does
 /// not block the tick — the reply drain corrects FSM state on failure (design).
+///
+/// `on_tick(now)` (slice 2) advances escalation and re-fires snoozed episodes;
+/// it has a default no-op so no-op/mock seams compile unchanged.
 pub trait EpisodeFsm {
     fn fire(&mut self, alarm_id: AlarmId);
+
+    /// Per-tick episode progress hook (slice 2 / D5): advance the volume
+    /// through `escalation_steps` and re-fire a snoozed episode whose
+    /// `snooze_until` has elapsed. The default is a no-op so existing no-op
+    /// and mock seam implementations compile unchanged.
+    fn on_tick(&mut self, _now: DateTime<Local>) {}
 }
 
 /// Clock seam so the tick re-reads `Local::now()` each tick and is mockable.
@@ -222,6 +231,11 @@ where
         // alarms fire normally.
         self.booted = true;
 
+        // Slice 2 / D5: advance escalation and re-fire snoozed episodes on
+        // every tick. This does not block — the FSM issues fire-and-forget
+        // Mopidy commands.
+        self.fsm.on_tick(now);
+
         // Record the final counts onto the span (task 1.3 structured fields).
         span.record("fired", fired);
         span.record("skipped_missed", skipped_missed);
@@ -296,6 +310,20 @@ mod tests {
     impl EpisodeFsm for MockFsm {
         fn fire(&mut self, alarm_id: AlarmId) {
             self.fired.push(alarm_id);
+        }
+    }
+
+    /// Mock episode FSM that records `on_tick` calls (slice 2 / D5).
+    #[derive(Default)]
+    struct MockFsmTick {
+        tick_count: u32,
+        last_now: Option<DateTime<Local>>,
+    }
+    impl EpisodeFsm for MockFsmTick {
+        fn fire(&mut self, _alarm_id: AlarmId) {}
+        fn on_tick(&mut self, now: DateTime<Local>) {
+            self.tick_count += 1;
+            self.last_now = Some(now);
         }
     }
 
@@ -665,5 +693,41 @@ mod tests {
         };
         assert_eq!(field("alarms_evaluated").as_deref(), Some("0"));
         assert_eq!(field("fired").as_deref(), Some("0"));
+    }
+
+    // ── Slice 2 / D5: scheduler tick calls on_tick ───────────────────────
+
+    /// Scenario: a scheduler tick invokes `on_tick(now)` on the episode FSM
+    /// exactly once per tick, passing the re-read clock value.
+    #[test]
+    fn tick_invokes_on_tick_on_fsm() {
+        let now = t(2026, 6, 29, 10, 0);
+        let mut clock = MockClock::default();
+        clock.set(now);
+        let fsm = MockFsmTick::default();
+
+        let mut sched = Scheduler::new(MockSource::default(), fsm, clock);
+        sched.tick();
+
+        let Scheduler { source: _, fsm, clock: _ , booted: _ } = sched;
+        assert_eq!(fsm.tick_count, 1, "on_tick called once per tick");
+        assert_eq!(fsm.last_now, Some(now), "on_tick received the re-read now");
+    }
+
+    /// Scenario: a scheduler tick against `NoopEpisodeFsm` (default no-op
+    /// `on_tick`) compiles and is a no-op — no panic, no commands.
+    #[test]
+    fn tick_with_noop_fsm_on_tick_is_noop() {
+        let now = t(2026, 6, 29, 10, 0);
+        let mut clock = MockClock::default();
+        clock.set(now);
+        let mut sched = Scheduler::new(
+            MockSource::default(),
+            NoopEpisodeFsm,
+            clock,
+        );
+        // No panic:
+        sched.tick();
+        assert!(true, "noop on_tick did not panic");
     }
 }

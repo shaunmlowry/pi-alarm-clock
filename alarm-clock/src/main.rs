@@ -16,6 +16,8 @@ mod error;
 mod episode;
 mod schedule;
 mod scheduler;
+mod seed;
+mod theme;
 
 use crate::alarm_store::{Alarm, AlarmStore};
 use crate::channel::{Cmd, CmdSender, Reply, MopidyEvent};
@@ -23,11 +25,13 @@ use crate::episode::{EpisodeController, MopidyControl, MopidySnapshot};
 use crate::scheduler::{
     AlarmSource, DueAlarm, EpisodeFsm, LocalClock, Scheduler, DEFAULT_TICK_INTERVAL,
 };
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local, Timelike, Utc};
 use mopidy_client::state::MopidyConnectionState;
 use rusqlite::Connection;
 use tokio::sync::mpsc as tokio_mpsc;
 use crate::config::Config;
+use crate::theme::ThemeController;
+use slint::ComponentHandle;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -248,10 +252,29 @@ impl EpisodeFsm for EpisodeFsmAdapter {
             }
         };
         let max_volume = alarm.max_volume.clamp(0, 100) as u8;
+        let plan = crate::episode::EpisodePlan::new(
+            alarm.source_uri.clone(),
+            max_volume,
+            alarm.escalation_steps.clone(),
+            alarm.fallback_chain.clone(),
+        );
         if let Ok(mut ctl) = self.episode.lock() {
-            ctl.fire(alarm_id, &alarm.source_uri, max_volume);
+            ctl.fire(alarm_id, &plan);
         } else {
             error!(alarm_id = %alarm_id, "episode mutex poisoned — fire dropped");
+        }
+    }
+
+    /// Slice 2 / D5: per-tick escalation advance + snooze-refire check. Driven
+    /// by `Scheduler::tick` via the `EpisodeFsm::on_tick` hook. Non-blocking:
+    /// the FSM issues fire-and-forget Mopidy commands.
+    fn on_tick(&mut self, _now: DateTime<Local>) {
+        let now = std::time::Instant::now();
+        if let Ok(mut ctl) = self.episode.lock() {
+            ctl.check_snooze_refire(now);
+            ctl.advance_escalation(now);
+        } else {
+            error!("episode mutex poisoned — on_tick dropped");
         }
     }
 }
@@ -261,6 +284,7 @@ impl EpisodeFsm for EpisodeFsmAdapter {
 pub struct AppTimers {
     _drain: slint::Timer,
     _scheduler: slint::Timer,
+    _clock: slint::Timer,
 }
 
 // ── Observability (tracing → journald / fmt fallback) ────────────────────────
@@ -304,9 +328,12 @@ pub enum CmdLoopResult {
 /// # Ownership
 /// The receiver is moved into this function and owned for the lifetime of the
 /// tokio runtime. Replies are pushed through [`reply_tx`] back to main.
+type MopidyClient = Arc<mopidy_client::transport::MopidyWsClient>;
+
 pub async fn command_dispatcher(
     mut cmd_rx: mpsc::Receiver<Cmd>,
     reply_tx: mpsc::Sender<Reply>,
+    client: MopidyClient,
 ) -> CmdLoopResult {
     // Set up signal listeners for SIGTERM (systemd stop) and SIGINT (Ctrl+C).
     let mut sigterm = unix_signal(SignalKind::terminate())
@@ -330,11 +357,31 @@ pub async fn command_dispatcher(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     Cmd::GetMopidyState => {
-                        info!(action = "GetMopidyState", "command received (slice 0 placeholder)");
-                        // Placeholder: domain not yet connected to Mopidy.
-                        let _ = reply_tx
-                            .send(Reply::MopidyState("STOPPED".into()))
-                            .await;
+                        info!(action = "GetMopidyState", "command received");
+                        if client.is_connected() {
+                            match client.send_and_await("core.get_state", None).await {
+                                Ok(res) => {
+                                    let state = res
+                                        .result
+                                        .as_ref()
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("STOPPED");
+                                    let _ = reply_tx
+                                        .send(Reply::MopidyState(state.to_string()))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "failed to get mopidy state");
+                                    let _ = reply_tx
+                                        .send(Reply::MopidyState("STOPPED".into()))
+                                        .await;
+                                }
+                            }
+                        } else {
+                            let _ = reply_tx
+                                .send(Reply::MopidyState("STOPPED".into()))
+                                .await;
+                        }
                     }
                     Cmd::CaptureSnapshot => {
                         // Slice-1 placeholder: the tokio worker does not yet hold
@@ -345,12 +392,36 @@ pub async fn command_dispatcher(
                         // For now, a default-reply is sent back if needed.
                         info!(action = "CaptureSnapshot", "command received (slice 1 placeholder — no live Mopidy handle in dispatcher yet)");
                     }
-                    Cmd::CallMopidy { method, .. } => {
+                    Cmd::CallMopidy { method, params } => {
                         let _guard = info_span!("mopidy_request", method = %method).entered();
-                        info!("CallMopidy command received (slice 0 placeholder)");
-                        let _ = reply_tx
-                            .send(Reply::CallResult(serde_json::json!({"error": "not yet implemented"})))
-                            .await;
+                        info!("CallMopidy command received");
+                        if client.is_connected() {
+                            match client.send_and_await(&method, Some(params)).await {
+                                Ok(msg) => {
+                                    let result = msg.result.unwrap_or_else(|| {
+                                        msg.error
+                                            .unwrap_or(serde_json::json!({"error": "empty response"}))
+                                    });
+                                    let _ = reply_tx
+                                        .send(Reply::CallResult(result))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    error!(method, error = %e, "mopidy call failed");
+                                    let _ = reply_tx
+                                        .send(Reply::CallResult(
+                                            serde_json::json!({"error": e.to_string()})
+                                        ))
+                                        .await;
+                                }
+                            }
+                        } else {
+                            let _ = reply_tx
+                                .send(Reply::CallResult(
+                                    serde_json::json!({"error": "mopidy not connected"})
+                                ))
+                                .await;
+                        }
                     }
                     Cmd::Shutdown => {
                         info!("Shutdown command received — terminating tokio worker loop");
@@ -414,13 +485,13 @@ fn spawn_tokio_worker(
                 // `block_on`, rather than on main.
                 let (mopidy_state_tx, mut mopidy_state_rx) =
                     tokio_mpsc::channel::<MopidyConnectionState>(16);
-                let _mopidy_client = mopidy_client::transport::MopidyWsClient::spawn(
+                let client: MopidyClient = Arc::new(mopidy_client::transport::MopidyWsClient::spawn(
                     mopidy_ws_url,
                     None, // use default backoff policy
                     mopidy_event_tx,
                     mopidy_reply_tx,
                     mopidy_state_tx,
-                );
+                ));
 
                 // Task 4.3: Mopidy client state forwarding — spawn a background
                 // task that reads MopidyConnectionState transitions and forwards
@@ -434,8 +505,8 @@ fn spawn_tokio_worker(
                     }}
                 }});
 
-                // Run the command dispatcher to completion.
-                let result = command_dispatcher(cmd_rx, reply_tx).await;
+// Run the command dispatcher with the live MopidyClient handle.
+                let result = command_dispatcher(cmd_rx, reply_tx, client).await;
                 info!(result = ?result, "tokio command dispatcher exited");
             }});
 
@@ -539,10 +610,114 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         });
     }
 
+    // Slice 2 / D8: the snooze button on the alarm overlay invokes
+    // `EpisodeController::snooze(DEFAULT_SNOOZE_DURATION)`. The drain timer
+    // reflects `is_firing()` (false during `Snoozing`) into `episode-firing`
+    // on the next tick, so the overlay hides without further wiring here.
+    {
+        let ctl = Arc::clone(&episode_ctl);
+        app_window.on_snooze_requested(move || {
+            if let Ok(mut ctl) = ctl.lock() {
+                ctl.snooze(crate::episode::DEFAULT_SNOOZE_DURATION);
+            }
+        });
+    }
+
     // Weak handle captured by the drain timer (task 7.2): each tick reflects
     // `EpisodeController::is_firing()` into the `episode-firing` property so
     // the overlay shows/hides and the nav container / swipe are gated.
     let ui_weak = app_window.as_weak();
+
+    // ── Runtime theme controller + live clock timer (slice 3) ────────────────
+    //
+    // Theme selection and mode are loaded from `kv_config`, pushed into the
+    // Slint `ThemeGlobal` singleton, and updated every second so the clock
+    // and theme tokens stay in sync.
+    let theme_controller = Arc::new(Mutex::new(ThemeController::new(
+        Arc::clone(&conn),
+    )));
+
+    // Push the initially loaded theme into Slint.
+    {
+        let ctl = theme_controller.lock().expect("theme mutex poisoned");
+        ctl.push(&app_window);
+    }
+
+    // Settings panel: tap to cycle theme.
+    {
+        let ctl = Arc::clone(&theme_controller);
+        let weak = app_window.as_weak();
+        app_window.on_theme_tapped(move || {
+            protected_tick(|| {
+                if let Ok(mut ctl) = ctl.lock() {
+                    ctl.cycle_theme();
+                    if let Some(w) = weak.upgrade() {
+                        ctl.push(&w);
+                    }
+                }
+            });
+        });
+    }
+
+    // Settings panel: tap to cycle mode.
+    {
+        let ctl = Arc::clone(&theme_controller);
+        let weak = app_window.as_weak();
+        app_window.on_mode_tapped(move || {
+            protected_tick(|| {
+                if let Ok(mut ctl) = ctl.lock() {
+                    ctl.cycle_mode();
+                    if let Some(w) = weak.upgrade() {
+                        ctl.push(&w);
+                    }
+                }
+            });
+        });
+    }
+
+    // Debug tap logging — remove once calibration is finalised.
+    //
+    // (removed — calibration is now handled via udev LIBINPUT_CALIBRATION_MATRIX)
+
+    // 1-second clock timer: compute hand angles and refresh the theme tokens.
+    let clock_timer = slint::Timer::default();
+    {
+        let ctl = Arc::clone(&theme_controller);
+        let weak = app_window.as_weak();
+        clock_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_secs(1),
+            move || {
+                protected_tick(|| {
+                    let now = Local::now();
+                    let h = (now.hour() % 12) as f32;
+                    let m = now.minute() as f32;
+                    let s = now.second() as f32;
+
+                    let second_angle = s * 6.0;
+                    let minute_angle = (m * 60.0 + s) * 0.1;
+                    let hour_angle = (h * 3600.0 + m * 60.0 + s) * 0.008333333;
+
+                    if let Some(w) = weak.upgrade() {
+                        let global = w.global::<ThemeGlobal>();
+                        global.set_hour_angle(hour_angle);
+                        global.set_minute_angle(minute_angle);
+                        global.set_second_angle(second_angle);
+                        global.set_clock_weekday(slint::SharedString::from(
+                            now.format("%A").to_string(),
+                        ));
+                        global.set_clock_date(slint::SharedString::from(
+                            now.format("%B %-d, %Y").to_string(),
+                        ));
+
+                        if let Ok(ctl) = ctl.lock() {
+                            ctl.push(&w);
+                        }
+                    }
+                });
+            },
+        );
+    }
 
     // ── Slint drain timer (non-blocking try_recv on each tick) ────────────
     //
@@ -617,6 +792,22 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // Until the real `AlarmStore` (group 3) and `EpisodeController` (group 5)
     // are wired in by group 9.1, the scheduler runs over no-op seam impls —
     // the tick machinery and span are exercised, but no real alarms fire yet.
+    // Dev alarm seeding (task 8.3 / design D9): consume `./alarms.toml`
+    // (if present) and upsert each entry by `id` into the DB. Idempotent,
+    // dev-only (no-op in release builds). This must run *before* the
+    // `recompute_next_fires` boot step so freshly-seeded alarms get a
+    // `next_fire` cache entry on this boot.
+    {
+        if let Ok(conn_guard) = conn.lock() {
+            let store = AlarmStore::new(&*conn_guard);
+            if let Err(e) = seed::seed_alarms(&store) {
+                error!(error = %e, "dev alarm seeding failed; continuing with DB as sole source");
+            }
+        } else {
+            error!("alarm DB mutex poisoned at boot; skipping dev seed");
+        }
+    }
+
     // Boot recompute (task 3.4): populate/refresh the `next_fire` caches
     // from each alarm's rule once before the first tick (design D1).
     {
@@ -668,6 +859,7 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     let timers = AppTimers {
         _drain: timer,
         _scheduler: scheduler_timer,
+        _clock: clock_timer,
     };
 
     (worker_handle, _app_window, timers)
@@ -761,6 +953,58 @@ fn sd_notify_ready() {
     }
 }
 
+// ── Display orientation (slice 3 / D6) ──────────────────────────────────────
+
+/// Rotate the display to portrait. Under Wayland/cage this calls `wlr-randr`;
+/// under the Slint linuxkms backend (no compositor) the `SLINT_KMS_ROTATION`
+/// environment variable is set before Slint initializes.
+fn rotate_display_to_portrait() {
+    // The Slint linuxkms backend reads SLINT_KMS_ROTATION at init time to
+    // rotate the DRM framebuffer. Set it before the window is created.
+    if std::env::var("SLINT_KMS_ROTATION").is_err() {
+        std::env::set_var("SLINT_KMS_ROTATION", "270");
+        info!("set SLINT_KMS_ROTATION=270 for portrait orientation");
+    }
+
+    // Under a Wayland compositor (cage), also rotate the output via wlr-randr.
+    // `wlr-randr --json` prints a JSON array of output objects.
+    let json_output = match std::process::Command::new("wlr-randr")
+        .arg("--json")
+        .output()
+    {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => {
+            // wlr-randr not found or no compositor — not an error (linuxkms).
+            return;
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&json_output) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    // The output is an array: [{"name": "DSI-1", "transform": "normal", ...}]
+    let output_name = parsed
+        .as_array()
+        .and_then(|arr| arr.first())
+        .and_then(|first| first.get("name"))
+        .and_then(|n| n.as_str());
+
+    let output_name = match output_name {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+
+    info!(output = %output_name, "rotating Wayland output 270° for portrait");
+    let _ = std::process::Command::new("wlr-randr")
+        .arg("--output")
+        .arg(&output_name)
+        .arg("--transform")
+        .arg("270")
+        .status();
+}
+
 // ── Shutdown sequence executor (Design D7) ──────────────────────────────────
 
 /// Perform the full graceful shutdown on the main thread.
@@ -808,6 +1052,11 @@ fn execute_shutdown(
 fn main() -> anyhow::Result<()> {
     init_tracing();
 
+    // Slice 3 / D6: rotate the Wayland output to portrait before the Slint
+    // window is created, so the fullscreen surface is 480×854 (9:16).
+    // No-op on desktop / non-Wayland.
+    rotate_display_to_portrait();
+
     // ── Task 3.1 + 3.2: SQLite connection on main + migrations ────────────
     let cfg = crate::config::Config::load();
     info!(db_path = %cfg.db_path, "opening SQLite database");
@@ -829,6 +1078,10 @@ fn main() -> anyhow::Result<()> {
     // systemd readiness (Design D10): signal READY=1 after all bootstrap steps
     // complete even when Mopidy is not yet reachable.
     sd_notify_ready();
+
+    // Release builds on the Pi request a true full-screen borderless surface;
+    // debug builds stay at 480×854 for dev testing.
+    app_window.window().set_fullscreen(!cfg!(debug_assertions));
 
     info!("alarm-clock: bootstrap complete — application running");
 
@@ -888,7 +1141,16 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (reply_tx, mut reply_rx) = mpsc::channel(8);
 
-        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx);
+        let _dummy_ev = tokio_mpsc::channel::<mopidy_client::MopidyEvent>(4);
+        let _dummy_rep = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(4);
+        let client: MopidyClient = Arc::new(mopidy_client::transport::MopidyWsClient::spawn(
+            "ws://192.168.255.255/mopidy".to_string(),
+            None,
+            _dummy_ev.0, _dummy_rep.0, 
+            tokio_mpsc::channel::<MopidyConnectionState>(4).0,
+        ));
+
+        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx, client);
         tokio::pin!(dispatcher_fut);
 
         // Send a GetMopidyState command.
@@ -920,7 +1182,16 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (reply_tx, mut reply_rx) = mpsc::channel(8);
 
-        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx);
+        let _dummy_ev = tokio_mpsc::channel::<mopidy_client::MopidyEvent>(4);
+        let _dummy_rep = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(4);
+        let client: MopidyClient = Arc::new(mopidy_client::transport::MopidyWsClient::spawn(
+            "ws://192.168.255.255/mopidy".to_string(),
+            None,
+            _dummy_ev.0, _dummy_rep.0, 
+            tokio_mpsc::channel::<MopidyConnectionState>(4).0,
+        ));
+
+        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx, client);
         tokio::pin!(dispatcher_fut);
 
         cmd_tx.send(Cmd::CallMopidy {
@@ -948,6 +1219,10 @@ mod tests {
     /// the drain timer without panicking or deadlocking.
     #[test]
     fn bootstrap_creates_worker_and_timer() {
+        // Run with the headless Slint testing backend so this test works on
+        // CI / SSH sessions without a real Wayland/X11 display server.
+        i_slint_backend_testing::init_no_event_loop();
+
         // bootstrap now owns the single `Connection` (wrapped in `Arc<Mutex>`
         // so the `slint::Timer` closures are `Send`). Build a fresh migrated
         // temp DB for this run.
@@ -1130,7 +1405,16 @@ mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (reply_tx, _reply_rx) = mpsc::channel(8);
 
-        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx);
+        let _dummy_ev = tokio_mpsc::channel::<mopidy_client::MopidyEvent>(4);
+        let _dummy_rep = tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(4);
+        let client: MopidyClient = Arc::new(mopidy_client::transport::MopidyWsClient::spawn(
+            "ws://192.168.255.255/mopidy".to_string(),
+            None,
+            _dummy_ev.0, _dummy_rep.0, 
+            tokio_mpsc::channel::<MopidyConnectionState>(4).0,
+        ));
+
+        let dispatcher_fut = command_dispatcher(cmd_rx, reply_tx, client);
         tokio::pin!(dispatcher_fut);
 
         // Send Shutdown — proves the dispatcher loop with signal handlers is active.

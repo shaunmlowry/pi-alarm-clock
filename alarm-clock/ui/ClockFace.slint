@@ -1,0 +1,144 @@
+// Live analog clock face.
+//
+// Rust feeds `hour-angle`, `minute-angle`, `second-angle` (degrees, 0 = 12
+// o'clock) plus the date/day labels. Hands are drawn as stroked `Path`
+// lines whose endpoints are computed with simple trigonometry.
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+
+component Hand inherits Path {
+    in property <angle> angle: 0deg;
+    in property <length> hand-length: 80px;
+    in property <length> hand-width: 6px;
+    in property <color> hand-color: white;
+    in property <length> face-size: 280px;
+
+    // The Path element fills the face; the viewbox matches the face size
+    // so command coordinates map 1:1 to pixels (no scaling).
+    property <float> fs: face-size / 1px;
+    property <float> cx: fs / 2;
+    property <float> cy: fs / 2;
+    property <float> len: hand-length / 1px;
+    property <float> x1: cx + Math.cos(angle - 90deg) * len;
+    property <float> y1: cy + Math.sin(angle - 90deg) * len;
+
+    width: face-size;
+    height: face-size;
+    x: 0px;
+    y: 0px;
+    viewbox-x: 0;
+    viewbox-y: 0;
+    viewbox-width: fs;
+    viewbox-height: fs;
+    clip: false;
+
+    commands: "M \{cx} \{cy} L \{x1} \{y1}";
+    stroke: hand-color;
+    stroke-width: hand-width;
+    stroke-line-cap: round;
+    anti-alias: true;
+}
+
+export component ClockFace {
+    height: 400px;
+
+    VerticalLayout {
+        width: root.width;
+        alignment: center;
+        spacing: 16px;
+
+        Text {
+            text: ThemeGlobal.clock-weekday;
+            font-size: 26px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            horizontal-alignment: center;
+            font-weight: 600;
+        }
+
+        Text {
+            text: ThemeGlobal.clock-date;
+            font-size: 16px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            opacity: 0.7;
+            horizontal-alignment: center;
+        }
+
+        face := Rectangle {
+            width: 280px;
+            height: 280px;
+            x: (parent.width - self.width) / 2;
+            background: ThemeGlobal.clock-face-background;
+            border-radius: self.width / 2;
+
+            // Neuromorphic depth: dual extrusion shadows on the face itself.
+            // Two stacked drop-shadows (dark down/right, light up/left) sit
+            // behind a solid foreground circle that masks the duplicated shapes.
+            if ThemeGlobal.is-neuromorphic: Rectangle {
+                width: face.width;
+                height: face.height;
+                border-radius: self.width / 2;
+                drop-shadow-color: ThemeGlobal.card-shadow-color;
+                drop-shadow-blur: ThemeGlobal.card-shadow-blur * 1px;
+                drop-shadow-offset-x: ThemeGlobal.card-shadow-offset * 1px;
+                drop-shadow-offset-y: ThemeGlobal.card-shadow-offset * 1px;
+
+                Rectangle {
+                    width: face.width;
+                    height: face.height;
+                    background: ThemeGlobal.clock-face-background;
+                    border-radius: self.width / 2;
+                    drop-shadow-color: rgba(255, 255, 255, 0.5);
+                    drop-shadow-blur: ThemeGlobal.card-shadow-blur * 1px;
+                    drop-shadow-offset-x: -ThemeGlobal.card-shadow-offset * 1px;
+                    drop-shadow-offset-y: -ThemeGlobal.card-shadow-offset * 1px;
+                }
+
+                Rectangle {
+                    width: face.width;
+                    height: face.height;
+                    background: ThemeGlobal.clock-face-background;
+                    border-radius: self.width / 2;
+                }
+            }
+
+            // Hour hand.
+            Hand {
+                hand-length: 70px;
+                hand-width: 6px;
+                hand-color: ThemeGlobal.hand-color;
+                angle: ThemeGlobal.hour-angle * 1deg;
+                face-size: face.width;
+            }
+
+            // Minute hand.
+            Hand {
+                hand-length: 100px;
+                hand-width: 4px;
+                hand-color: ThemeGlobal.hand-color;
+                angle: ThemeGlobal.minute-angle * 1deg;
+                face-size: face.width;
+            }
+
+            // Second hand.
+            Hand {
+                hand-length: 110px;
+                hand-width: 2px;
+                hand-color: ThemeGlobal.second-hand-color;
+                angle: ThemeGlobal.second-angle * 1deg;
+                face-size: face.width;
+            }
+
+            // Centre pivot dot.
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                background: ThemeGlobal.hand-color;
+                border-radius: self.width / 2;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+    }
+}

@@ -20,6 +20,21 @@ use tracing::error;
 use crate::error::{ConfigError, Result};
 use crate::schedule::Schedule;
 
+// ── Escalation step (slice 2, design D1) ───────────────────────────────────
+
+/// A single step in an alarm's progressive volume escalation (slice 2 / D1).
+///
+/// After `after_secs` seconds elapsed since the episode fire instant, the
+/// episode volume becomes `volume` (clamped 0..=100) and holds until the next
+/// step. Steps are sorted ascending by `after_secs` by [`AlarmStore::upsert`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EscalationStep {
+    /// Seconds elapsed since fire at which this step's volume takes effect.
+    pub after_secs: u64,
+    /// Volume 0..=100 to apply from this step onward.
+    pub volume: u8,
+}
+
 // ── Alarm model ─────────────────────────────────────────────────────────────
 
 /// A persisted alarm row, mirroring the `alarms` table (migration `v2`).
@@ -51,6 +66,13 @@ pub struct Alarm {
     pub source_uri: String,
     /// Ceiling volume for the episode, `0..=100`.
     pub max_volume: i64,
+    /// Progressive volume escalation steps (slice 2 / D1). `None` or empty =
+    /// fixed `max_volume` (slice-1 behavior). Stored as JSON text.
+    pub escalation_steps: Option<Vec<EscalationStep>>,
+    /// Ordered backup source URIs tried in order on primary-source failure
+    /// (slice 2 / D2). `None` or empty = no fallback (slice-1 behavior). The
+    /// alarm's `source_uri` is the primary and is not duplicated here.
+    pub fallback_chain: Option<Vec<String>>,
     /// Cached next fire time (ISO-8601 UTC); derived, may be stale.
     pub next_fire: Option<String>,
     /// Creation timestamp (ISO-8601).
@@ -88,7 +110,8 @@ impl<'a> AlarmStore<'a> {
             .conn
             .prepare(
                 "SELECT id, enabled, name, time_local, timezone, rrule, once_at, \
-                 source_uri, max_volume, next_fire, created_at, updated_at \
+                 source_uri, max_volume, escalation_steps, fallback_chain, \
+                 next_fire, created_at, updated_at \
                  FROM alarms ORDER BY id",
             )
             .map_err(ConfigError::Database)?;
@@ -106,7 +129,8 @@ impl<'a> AlarmStore<'a> {
         self.conn
             .query_row(
                 "SELECT id, enabled, name, time_local, timezone, rrule, once_at, \
-                 source_uri, max_volume, next_fire, created_at, updated_at \
+                 source_uri, max_volume, escalation_steps, fallback_chain, \
+                 next_fire, created_at, updated_at \
                  FROM alarms WHERE id = ?",
                 [id],
                 row_to_alarm,
@@ -122,6 +146,9 @@ impl<'a> AlarmStore<'a> {
     ///
     /// Uses `INSERT OR REPLACE` so a second upsert of the same `id` updates the
     /// existing row (idempotent by `id`) rather than inserting a duplicate.
+    ///
+    /// `escalation_steps` is sorted ascending by `after_secs` before persisting
+    /// (slice 2 / D1) and both new columns are serialized as JSON text.
     pub fn upsert(&self, alarm: &Alarm) -> Result<()> {
         let tx = self
             .conn
@@ -129,11 +156,20 @@ impl<'a> AlarmStore<'a> {
             .map_err(ConfigError::Database)?;
 
         let enabled_i: i64 = alarm.enabled.into();
+        // Slice 2 / D1: sort escalation steps ascending by `after_secs`.
+        let sorted_steps = alarm.escalation_steps.as_ref().map(|steps| {
+            let mut s = steps.clone();
+            s.sort_by_key(|st| st.after_secs);
+            s
+        });
+        let escalation_json = serialize_escalation(&sorted_steps)?;
+        let fallback_json = serialize_fallback(&alarm.fallback_chain)?;
         if let Err(e) = tx.execute(
             "INSERT OR REPLACE INTO alarms \
              (id, enabled, name, time_local, timezone, rrule, once_at, \
-              source_uri, max_volume, next_fire, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              source_uri, max_volume, escalation_steps, fallback_chain, \
+              next_fire, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 alarm.id,
                 enabled_i,
@@ -144,6 +180,8 @@ impl<'a> AlarmStore<'a> {
                 alarm.once_at,
                 alarm.source_uri,
                 alarm.max_volume,
+                escalation_json,
+                fallback_json,
                 alarm.next_fire,
                 alarm.created_at,
                 alarm.updated_at,
@@ -266,6 +304,16 @@ impl<'a> AlarmStore<'a> {
 /// Map a `rusqlite::Row` to an [`Alarm`].
 fn row_to_alarm(row: &rusqlite::Row<'_>) -> rusqlite::Result<Alarm> {
     let enabled_i: i64 = row.get("enabled")?;
+    let escalation_json: Option<String> = row.get("escalation_steps")?;
+    let fallback_json: Option<String> = row.get("fallback_chain")?;
+    let escalation_steps = escalation_json
+        .as_deref()
+        .and_then(|s| deserialize_escalation(s).ok())
+        .flatten();
+    let fallback_chain = fallback_json
+        .as_deref()
+        .and_then(|s| deserialize_fallback(s).ok())
+        .flatten();
     Ok(Alarm {
         id: row.get("id")?,
         enabled: enabled_i != 0,
@@ -276,6 +324,8 @@ fn row_to_alarm(row: &rusqlite::Row<'_>) -> rusqlite::Result<Alarm> {
         once_at: row.get("once_at")?,
         source_uri: row.get("source_uri")?,
         max_volume: row.get("max_volume")?,
+        escalation_steps,
+        fallback_chain,
         next_fire: row.get("next_fire")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -342,6 +392,52 @@ fn parse_once_at(s: &str, tz: Tz) -> Result<DateTime<Tz>> {
     )))
 }
 
+/// Serialize `escalation_steps` to a JSON TEXT column value (`None`/empty → NULL).
+fn serialize_escalation(steps: &Option<Vec<EscalationStep>>) -> Result<Option<String>> {
+    match steps {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => serde_json::to_string(s)
+            .map(Some)
+            .map_err(|e| ConfigError::Database(rusqlite::Error::ToSqlConversionFailure(
+                format!("escalation_steps serialize: {e}").into(),
+            ))),
+    }
+}
+
+/// Serialize `fallback_chain` to a JSON TEXT column value (`None`/empty → NULL).
+fn serialize_fallback(chain: &Option<Vec<String>>) -> Result<Option<String>> {
+    match chain {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => serde_json::to_string(s)
+            .map(Some)
+            .map_err(|e| ConfigError::Database(rusqlite::Error::ToSqlConversionFailure(
+                format!("fallback_chain serialize: {e}").into(),
+            ))),
+    }
+}
+
+/// Deserialize `escalation_steps` from a JSON TEXT column value.
+fn deserialize_escalation(s: &str) -> std::result::Result<Option<Vec<EscalationStep>>, serde_json::Error> {
+    let v: Vec<EscalationStep> = serde_json::from_str(s)?;
+    if v.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(v))
+    }
+}
+
+/// Deserialize `fallback_chain` from a JSON TEXT column value.
+fn deserialize_fallback(s: &str) -> std::result::Result<Option<Vec<String>>, serde_json::Error> {
+    let v: Vec<String> = serde_json::from_str(s)?;
+    if v.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(v))
+    }
+}
+
 /// Current UTC time as an ISO-8601 string (for `updated_at` bumps).
 fn iso_now() -> String {
     Utc::now().to_rfc3339()
@@ -395,6 +491,8 @@ mod tests {
             once_at: None,
             source_uri: "coreaudio://alarm.mp3".to_string(),
             max_volume: 40,
+            escalation_steps: None,
+            fallback_chain: None,
             next_fire: None,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),
@@ -604,6 +702,99 @@ mod tests {
         cleanup(path);
     }
 
+    // ── Slice 2 / D1–D3: escalation + fallback persistence ───────────────
+
+    /// Scenario: upsert and read back an alarm with escalation steps and a
+    /// fallback chain preserves order and values exactly.
+    #[test]
+    fn upsert_and_read_back_escalation_and_fallback() {
+        let (path, store) = fresh_store();
+        let mut a = sample_alarm("alarm-esc");
+        a.escalation_steps = Some(vec![
+            EscalationStep { after_secs: 0, volume: 20 },
+            EscalationStep { after_secs: 60, volume: 80 },
+        ]);
+        a.fallback_chain = Some(vec![
+            "spotify:backup1".to_string(),
+            "file:///beep.mp3".to_string(),
+        ]);
+        store.upsert(&a).expect("upsert");
+
+        let got = store.get("alarm-esc").unwrap().expect("row present");
+        assert_eq!(got.escalation_steps, a.escalation_steps, "steps preserved");
+        assert_eq!(got.fallback_chain, a.fallback_chain, "chain preserved");
+
+        cleanup(path);
+    }
+
+    /// Scenario: a slice-1 alarm (no escalation/fallback) round-trips as None.
+    #[test]
+    fn slice1_alarm_round_trips_without_new_fields() {
+        let (path, store) = fresh_store();
+        let a = sample_alarm("alarm-slice1");
+        store.upsert(&a).unwrap();
+
+        let got = store.get("alarm-slice1").unwrap().unwrap();
+        assert!(got.escalation_steps.is_none());
+        assert!(got.fallback_chain.is_none());
+
+        cleanup(path);
+    }
+
+    /// Scenario: the store sorts escalation steps ascending by after_secs on
+    /// write, even if the caller supplies them out of order.
+    #[test]
+    fn store_sorts_escalation_steps_on_write() {
+        let (path, store) = fresh_store();
+        let mut a = sample_alarm("alarm-unsorted");
+        a.escalation_steps = Some(vec![
+            EscalationStep { after_secs: 60, volume: 80 },
+            EscalationStep { after_secs: 0, volume: 20 },
+            EscalationStep { after_secs: 30, volume: 60 },
+        ]);
+        store.upsert(&a).unwrap();
+
+        let got = store.get("alarm-unsorted").unwrap().unwrap();
+        let steps = got.escalation_steps.expect("steps present");
+        assert_eq!(steps[0].after_secs, 0);
+        assert_eq!(steps[1].after_secs, 30);
+        assert_eq!(steps[2].after_secs, 60);
+
+        cleanup(path);
+    }
+
+    /// Scenario: a fresh DB reaches the latest migration with the new
+    /// escalation_steps / fallback_chain columns, and a v2 alarm row upgrades
+    /// preserving its data (new columns NULL = slice-1 behavior).
+    #[test]
+    fn migration_v3_adds_columns_and_preserves_v2_rows() {
+        let (path, store) = fresh_store();
+        // fresh_store already runs migrations, so we are at the latest (v3).
+        let a = sample_alarm("alarm-v3");
+        store.upsert(&a).unwrap();
+
+        // The new columns exist and are readable (None for a slice-1 alarm).
+        let got = store.get("alarm-v3").unwrap().unwrap();
+        assert!(got.escalation_steps.is_none());
+        assert!(got.fallback_chain.is_none());
+
+        // The new columns are physically present on the alarms table.
+        let conn = store.conn;
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(alarms)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(cols.iter().any(|c| c == "escalation_steps"),
+            "escalation_steps column present");
+        assert!(cols.iter().any(|c| c == "fallback_chain"),
+            "fallback_chain column present");
+
+        cleanup(path);
+    }
+
     /// Task 9.5 — End-to-end DST: seed a daily alarm across a DST boundary;
     /// verify it fires at the same wall-clock local time on both sides.
     ///
@@ -627,6 +818,8 @@ mod tests {
             once_at: None,
             source_uri: "coreaudio://alarm.mp3".to_string(),
             max_volume: 40,
+            escalation_steps: None,
+            fallback_chain: None,
             next_fire: None,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),

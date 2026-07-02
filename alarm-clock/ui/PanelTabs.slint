@@ -1,0 +1,48 @@
+// Top-of-panel tabs for the non-clock panels.
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+
+component TabButton inherits Rectangle {
+    in property <string> label: "";
+    in property <int> tab-index: 0;
+
+    width: 82px;
+    height: 36px;
+    background: ThemeGlobal.current-panel == tab-index
+        ? ThemeGlobal.card-background
+        : transparent;
+    border-radius: 18px;
+
+    Text {
+        text: root.label;
+        font-size: 15px;
+        color: ThemeGlobal.text-color;
+        font-family: ThemeGlobal.font-family;
+        opacity: ThemeGlobal.current-panel == tab-index ? 1.0 : 0.55;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => {
+            ThemeGlobal.current-panel = root.tab-index;
+        }
+    }
+}
+
+export component PanelTabs {
+    height: 56px;
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 10px;
+        y: (parent.height - self.height) / 2;
+
+        TabButton { label: "Clock"; tab-index: 0; }
+        TabButton { label: "Data"; tab-index: 1; }
+        TabButton { label: "Media"; tab-index: 2; }
+        TabButton { label: "Settings"; tab-index: 3; }
+    }
+}

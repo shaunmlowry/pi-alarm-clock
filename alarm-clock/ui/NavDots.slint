@@ -1,0 +1,21 @@
+// Bottom-of-screen pagination dots.
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+
+export component NavDots {
+    height: 36px;
+
+    HorizontalLayout {
+        alignment: center;
+        spacing: 8px;
+        y: (parent.height - self.height) / 2;
+
+        for i in 4: Rectangle {
+            width: ThemeGlobal.current-panel == i ? 20px : 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: ThemeGlobal.text-color;
+            opacity: ThemeGlobal.current-panel == i ? 1.0 : 0.4;
+        }
+    }
+}

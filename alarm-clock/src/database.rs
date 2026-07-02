@@ -60,6 +60,16 @@ fn migrations() -> &'static [Migration] {
                 );
             ",
         },
+        // Slice 2 / D3: add nullable JSON columns for escalation steps and the
+        // fallback chain. Non-destructive: existing rows get NULL (slice-1
+        // behavior). Applied in a single transaction with the user_version bump.
+        Migration {
+            version: 3,
+            sql: "
+                ALTER TABLE alarms ADD COLUMN escalation_steps TEXT;
+                ALTER TABLE alarms ADD COLUMN fallback_chain TEXT;
+            ",
+        },
     ]
 }
 
@@ -428,8 +438,9 @@ mod tests {
 
     /// ── Task 3.2: Migration v2 idempotency ─────────────────────────────
 
-    /// Scenario: Starting at user_version=2 skips migration v2 and leaves
-    /// alarms table intact.
+    /// Scenario: Starting at user_version=2 skips re-applying v2 (row intact)
+    /// and then applies the additive v3 migration (escalation_steps /
+    /// fallback_chain columns added), ending at user_version=3.
     #[test]
     fn migration_v2_idempotent_skips_when_already_at_v2() {
         let path = format!(
@@ -468,17 +479,19 @@ mod tests {
             .unwrap();
         assert_eq!(alarm_count_before, 1);
 
-        // Run migrations — v2 should be skipped (user_version already 2).
-        run_migrations(&conn).expect("migrations should succeed with no work");
+        // Run migrations — v2 is skipped (user_version already 2); the
+        // additive v3 migration applies (escalation_steps / fallback_chain
+        // columns added) and user_version advances to 3.
+        run_migrations(&conn).expect("migrations should succeed");
 
-        // user_version remains at 2.
-        assert_eq!(read_user_version(&conn).unwrap(), 2);
+        // user_version is now 3 (v3 applied); v2 was not re-applied.
+        assert_eq!(read_user_version(&conn).unwrap(), 3);
 
         // alarms table intact — row count unchanged.
         let alarm_count_after: i64 = conn
             .query_row("SELECT COUNT(*) FROM alarms", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(alarm_count_after, alarm_count_before, "alarms data must be intact after idempotent skip");
+        assert_eq!(alarm_count_after, alarm_count_before, "alarms data must be intact");
 
         // Verify the specific row is still there.
         let name: String = conn.query_row(
@@ -486,7 +499,19 @@ mod tests {
             ["test-uuid"],
             |r| r.get(0),
         ).unwrap();
-        assert_eq!(name, "Morning Alarm", "alarm row must survive idempotent skip");
+        assert_eq!(name, "Morning Alarm", "alarm row must survive");
+
+        // v3 added the new columns; the pre-existing row has NULL for both
+        // (slice-1 behavior preserved).
+        let (es, fc): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT escalation_steps, fallback_chain FROM alarms WHERE id = ?",
+                ["test-uuid"],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(es.is_none(), "escalation_steps NULL on pre-v3 row");
+        assert!(fc.is_none(), "fallback_chain NULL on pre-v3 row");
 
         // schema_meta and kv_config from v1 are untouched.
         let has_schema_meta: bool = conn.query_row(

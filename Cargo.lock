@@ -162,6 +162,7 @@ dependencies = [
  "axum",
  "chrono",
  "chrono-tz",
+ "i-slint-backend-testing",
  "mopidy-client",
  "rrule",
  "rusqlite",

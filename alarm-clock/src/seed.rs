@@ -68,6 +68,13 @@ struct SeedAlarm {
     source_uri: String,
     /// Ceiling volume for the episode, `0..=100`.
     max_volume: i64,
+    /// Optional progressive volume escalation steps (slice 2). Absent →
+    /// fixed `max_volume` (slice-1 behavior).
+    #[serde(default)]
+    escalation_steps: Option<Vec<crate::alarm_store::EscalationStep>>,
+    /// Optional ordered backup source URIs (slice 2). Absent → no fallback.
+    #[serde(default)]
+    fallback_chain: Option<Vec<String>>,
     /// Full ISO-8601 local DateTime for a `Once` alarm; `None` otherwise.
     #[serde(default)]
     once_at: Option<String>,
@@ -98,6 +105,8 @@ impl SeedAlarm {
             once_at: self.once_at.clone(),
             source_uri: self.source_uri.clone(),
             max_volume: self.max_volume,
+            escalation_steps: self.escalation_steps.clone(),
+            fallback_chain: self.fallback_chain.clone(),
             next_fire: None,
             created_at: iso_now(),
             updated_at: iso_now(),
@@ -482,6 +491,67 @@ once_at = "2026-07-01T07:30:00"
         cleanup(path);
     }
 
+    /// Scenario: a seed entry with `escalation_steps` and `fallback_chain` is
+    /// upserted and round-trips through the store (slice 2 / D10).
+    #[test]
+    fn seed_entry_with_escalation_and_fallback_round_trips() {
+        let (path, store) = fresh_store();
+
+        let toml_str = r#"
+[[alarms]]
+id = "escalating"
+name = "Escalating"
+preset = "Daily"
+time = "07:30:00"
+timezone = "America/Edmonton"
+source_uri = "spotify:track:primary"
+max_volume = 80
+escalation_steps = [{ after_secs = 0, volume = 20 }, { after_secs = 60, volume = 80 }]
+fallback_chain = ["spotify:track:backup1", "file:///beep.mp3"]
+"#;
+        let seed: SeedFile = toml::from_str(toml_str).unwrap();
+        for entry in &seed.alarms {
+            store.upsert(&entry.to_alarm().unwrap()).unwrap();
+        }
+
+        let got = store.get("escalating").unwrap().unwrap();
+        assert_eq!(got.escalation_steps.as_ref().unwrap().len(), 2);
+        assert_eq!(got.escalation_steps.as_ref().unwrap()[0].volume, 20);
+        assert_eq!(got.fallback_chain.as_ref().unwrap(), &vec![
+            "spotify:track:backup1".to_string(),
+            "file:///beep.mp3".to_string(),
+        ]);
+
+        cleanup(path);
+    }
+
+    /// Scenario: a seed entry without the new fields seeds as None (slice-1).
+    #[test]
+    fn seed_entry_without_new_fields_seeds_as_none() {
+        let (path, store) = fresh_store();
+
+        let toml_str = r#"
+[[alarms]]
+id = "plain"
+name = "Plain"
+preset = "Daily"
+time = "07:30:00"
+timezone = "America/Edmonton"
+source_uri = "spotify:track:plain"
+max_volume = 40
+"#;
+        let seed: SeedFile = toml::from_str(toml_str).unwrap();
+        for entry in &seed.alarms {
+            store.upsert(&entry.to_alarm().unwrap()).unwrap();
+        }
+
+        let got = store.get("plain").unwrap().unwrap();
+        assert!(got.escalation_steps.is_none());
+        assert!(got.fallback_chain.is_none());
+
+        cleanup(path);
+    }
+
     /// Scenario: an unknown preset string is rejected with a seed error.
     #[test]
     fn unknown_preset_is_rejected() {
@@ -495,6 +565,8 @@ once_at = "2026-07-01T07:30:00"
             timezone: "America/Edmonton".into(),
             source_uri: "spotify:track:bad".into(),
             max_volume: 30,
+            escalation_steps: None,
+            fallback_chain: None,
             once_at: None,
         };
         let res = entry.to_alarm();
@@ -514,6 +586,8 @@ once_at = "2026-07-01T07:30:00"
             timezone: "America/Edmonton".into(),
             source_uri: "spotify:track:noday".into(),
             max_volume: 30,
+            escalation_steps: None,
+            fallback_chain: None,
             once_at: None,
         };
         let res = entry.to_alarm();

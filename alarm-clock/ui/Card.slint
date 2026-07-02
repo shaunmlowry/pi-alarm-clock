@@ -1,0 +1,97 @@
+// Themed container card.
+//
+// Liquid Glass: translucent fill + 1px translucent border + soft drop shadow.
+// Neuromorphic: same-bg dual extrusion shadows (Spike 1.4). Two layered
+// `drop-shadow` filters produce the light/dark extrusions; a solid foreground
+// rectangle masks the duplicated shadow shapes so only the halos remain.
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+
+export component Card inherits Rectangle {
+    in property <string> title: "";
+    // When `tappable` is true, the card receives the whole surface tap.
+    in property <bool> tappable: false;
+    callback tapped();
+
+    // Fill the slot the parent layout gives us; the parent provides the
+    // margins via its own padding or x/width.
+    width: 100%;
+    border-radius: ThemeGlobal.card-radius * 1px;
+
+    // Liquid Glass shell: single shadow.
+    if !ThemeGlobal.is-neuromorphic: Rectangle {
+        width: root.width;
+        height: root.height;
+        background: ThemeGlobal.card-background;
+        border-color: ThemeGlobal.card-border;
+        border-width: ThemeGlobal.card-border-width * 1px;
+        border-radius: ThemeGlobal.card-radius * 1px;
+        drop-shadow-color: ThemeGlobal.card-shadow-color;
+        drop-shadow-blur: ThemeGlobal.card-shadow-blur * 1px;
+        drop-shadow-offset-x: ThemeGlobal.card-shadow-offset * 1px;
+        drop-shadow-offset-y: ThemeGlobal.card-shadow-offset * 1px;
+    }
+
+    // Neuromorphic shell: two drop-shadows give the recessed/extruded look.
+    // 1. Dark shadow offset down/right. 2. Light shadow offset up/left.
+    // The final solid rectangle on top hides the duplicated opaque shapes.
+    if ThemeGlobal.is-neuromorphic: Rectangle {
+        width: root.width;
+        height: root.height;
+        background: ThemeGlobal.card-background;
+        border-radius: ThemeGlobal.card-radius * 1px;
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: ThemeGlobal.card-background;
+            border-radius: ThemeGlobal.card-radius * 1px;
+            drop-shadow-color: ThemeGlobal.card-shadow-color;
+            drop-shadow-blur: ThemeGlobal.card-shadow-blur * 1px;
+            drop-shadow-offset-x: ThemeGlobal.card-shadow-offset * 1px;
+            drop-shadow-offset-y: ThemeGlobal.card-shadow-offset * 1px;
+        }
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: ThemeGlobal.card-background;
+            border-radius: ThemeGlobal.card-radius * 1px;
+            drop-shadow-color: rgba(255, 255, 255, 0.5);
+            drop-shadow-blur: ThemeGlobal.card-shadow-blur * 1px;
+            drop-shadow-offset-x: -ThemeGlobal.card-shadow-offset * 1px;
+            drop-shadow-offset-y: -ThemeGlobal.card-shadow-offset * 1px;
+        }
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            background: ThemeGlobal.card-background;
+            border-radius: ThemeGlobal.card-radius * 1px;
+        }
+    }
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        if root.title != "": Text {
+            text: root.title;
+            font-size: 18px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+        }
+
+        @children
+    }
+
+    if root.tappable: TA := TouchArea {
+        width: root.width;
+        height: root.height;
+        clicked => {
+            // stop tap from propagating so a tappable card does not also
+            // trigger a swipe or panel dismiss underneath it.
+            root.tapped();
+        }
+    }
+}

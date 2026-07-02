@@ -1,9 +1,9 @@
 ## 1. Scheduler tick & spans
 
-- [ ] 1.1 Add the `scheduler` module on main: a `slint::Timer`-driven tick (default 5s interval) that enters the `scheduler_tick` span, calls `AlarmStore::due_alarms(now)`, and invokes the episode FSM's `fire()` for each due alarm; recompute the alarm's `next_fire` after firing.
-- [ ] 1.2 Implement the missed-alarm-on-boot policy: if `now > next_fire` for an alarm at the first tick (boot catch-up), do NOT fire; advance `next_fire` to the next occurrence after `now` and log `info!` with the skip.
-- [ ] 1.3 Activate the `scheduler_tick` span with structured fields (`alarms_evaluated`, `fired`); verify a tick emits the span to journald/logs.
-- [ ] 1.4 Unit-test the tick: a due alarm fires; a not-yet-due alarm does not; `Local::now()` is re-read each tick (mock the clock).
+- [x] 1.1 Add the `scheduler` module on main: a `slint::Timer`-driven tick (default 5s interval) that enters the `scheduler_tick` span, calls `AlarmStore::due_alarms(now)`, and invokes the episode FSM's `fire()` for each due alarm; recompute the alarm's `next_fire` after firing.
+- [x] 1.2 Implement the missed-alarm-on-boot policy: if `now > next_fire` for an alarm at the first tick (boot catch-up), do NOT fire; advance `next_fire` to the next occurrence after `now` and log `info!` with the skip.
+- [x] 1.3 Activate the `scheduler_tick` span with structured fields (`alarms_evaluated`, `fired`); verify a tick emits the span to journald/logs.
+- [x] 1.4 Unit-test the tick: a due alarm fires; a not-yet-due alarm does not; `Local::now()` is re-read each tick (mock the clock).
 
 ## 2. Schedule & next-fire computation
 
@@ -57,15 +57,15 @@
 
 ## 8. Dev alarm seeding
 
-- [ ] 8.1 Define the dev `alarms.toml` schema (serde struct mirroring `Alarm`: `id`, `enabled`, `name`, `preset`, `days`, `time`, `timezone`, `source_uri`, `max_volume`, `once_at`) and a sample file committed for dev.
-- [ ] 8.2 Implement the boot seeding: if the dev `alarms.toml` is present, parse and upsert each alarm by `id` (idempotent); log `info!` with a "dev seed" marker. If absent, no error (database is the sole source).
-- [ ] 8.3 Verify seeding is idempotent (re-running boot does not duplicate alarms) and dev-only (production path skips it).
+- [x] 8.1 Define the dev `alarms.toml` schema (serde struct mirroring `Alarm`: `id`, `enabled`, `name`, `preset`, `days`, `time`, `timezone`, `source_uri`, `max_volume`, `once_at`) and a sample file committed for dev.
+- [x] 8.2 Implement the boot seeding: if the dev `alarms.toml` is present, parse and upsert each alarm by `id` (idempotent); log `info!` with a "dev seed" marker. If absent, no error (database is the sole source).
+- [x] 8.3 Verify seeding is idempotent (re-running boot does not duplicate alarms) and dev-only (production path skips it).
 
 ## 9. Integration & acceptance
 
 - [x] 9.1 Wire the scheduler tick, episode FSM, and alarm episode UI into `main.rs` (replacing slice-0 no-ops); ensure `cargo check --workspace` and `cargo test --workspace` pass.
-- [ ] 9.2 End-to-end (dev Mopidy with a playable URI): seed a daily alarm due in ~1 minute; verify it fires, plays the source looping at `max_volume`, and on tap dismisses and restores the prior Mopidy session (track, position, volume, repeat, shuffle).
-- [ ] 9.3 End-to-end Mopidy-down: stop Mopidy before the fire time; verify the alarm still fires (audio silently fails, logged), the UI is dismissable, and the process does not hang or crash.
-- [ ] 9.4 End-to-end shutdown mid-episode: fire an alarm, `systemctl stop` (or SIGTERM); verify the snapshot is restored before exit (exit code 0, restore logged).
+- [x] 9.2 End-to-end (dev Mopidy with a playable URI): seed a daily alarm due in ~1 minute; verify it fires, plays the source looping at `max_volume`, and on tap dismisses and restores the prior Mopidy session (track, position, volume, repeat, shuffle).
+- [x] 9.3 End-to-end Mopidy-down: stop Mopidy before the fire time; verify the alarm still fires (audio silently fails, logged), the UI is dismissable, and the process does not hang or crash.
+- [x] 9.4 End-to-end shutdown mid-episode: fire an alarm, `systemctl stop` (or SIGTERM); verify the snapshot is restored before exit (exit code 0, restore logged).
 - [x] 9.5 End-to-end DST: seed a daily alarm across a DST boundary (mock or real); verify it fires at the same wall-clock local time on both sides.
-- [ ] 9.6 Verify on the Pi: `journalctl` shows `scheduler_tick` and `episode` spans with structured fields; `user_version=2` after migration; `alarms` table round-trips.
+- [x] 9.6 Verify on the Pi: `journalctl` shows `scheduler_tick` and `episode` spans with structured fields; `user_version=2` after migration; `alarms` table round-trips.

@@ -1,0 +1,34 @@
+// Themed button with a tap callback.
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+
+export component Button inherits Rectangle {
+    in property <string> text: "";
+    callback clicked();
+
+    width: 200px;
+    height: 72px;
+    background: ThemeGlobal.accent-color;
+    border-radius: ThemeGlobal.card-radius * 1px;
+    drop-shadow-color: ThemeGlobal.card-shadow-color;
+    drop-shadow-blur: ThemeGlobal.card-shadow-blur * 1px;
+    drop-shadow-offset-x: ThemeGlobal.card-shadow-offset * 1px;
+    drop-shadow-offset-y: ThemeGlobal.card-shadow-offset * 1px;
+
+    Text {
+        text: root.text;
+        font-size: 28px;
+        color: ThemeGlobal.text-color;
+        font-family: ThemeGlobal.font-family;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        width: parent.width;
+        height: parent.height;
+        clicked => {
+            root.clicked();
+        }
+    }
+}

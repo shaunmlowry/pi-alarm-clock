@@ -1,54 +1,287 @@
-// alarm-clock — UI shell (slice 0).
+// alarm-clock — UI shell (slice 3).
 //
-// Vertical 9:16 Slint application, touch-only, no text input, no scrolling.
-// Horizontal panel container with hard stops at both ends (no wraparound).
-// Slice 0 ships exactly one Clock panel; the scaffold is structured so that
-// later slices add panels without touching the navigation code.
+// Four-panel navigation scaffold with live analog clock, runtime theme system,
+// and themed components. Touch-only, no text input, no scrolling.
+// Portrait 9:16 (480×854) surface.
 
 import { AlarmPanel } from "AlarmPanel.slint";
+import { ThemeGlobal } from "ui/ThemeGlobal.slint";
+import { Card } from "ui/Card.slint";
+import { Button } from "ui/Button.slint";
+import { ClockFace } from "ui/ClockFace.slint";
+import { NavDots } from "ui/NavDots.slint";
+import { PanelTabs } from "ui/PanelTabs.slint";
 
-// ── ClockFace (task 5.2 + 5.4): placeholder with theme seam ────────────────
-// Exposes `clock-color` and `font-family` as in-properties so that a future
-// theming slice swaps the hardcoded feeder for a token system without
-// rewriting this component's internal structure.
-component ClockFace {
-    in property <color> clock-color;
-    in property <string> font-family;
+export { ThemeGlobal }
 
-    Rectangle {
-        background: clock-color;
-        width: parent.width;
-        height: parent.height;
+// ── Clock Panel ──────────────────────────────────────────────────────────
+component ClockPanel inherits Rectangle {
+    VerticalLayout {
+        width: root.width;
+        height: root.height;
+        padding: 20px;
+        spacing: 16px;
+        alignment: center;
 
-        Text {
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            text: "12:00";
-            font-size: 140px;
-            color: #f8fafc;
-            font-family: font-family;
+        ClockFace {}
+
+        Card {
+            title: "Current Conditions";
+            height: 72px;
+            Text {
+                text: "Weather slot — populated by calendar/weather slice";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+                wrap: word-wrap;
+            }
+        }
+
+        Card {
+            title: "Up Next";
+            height: 72px;
+            Text {
+                text: "Next event slot — populated by calendar slice";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+                wrap: word-wrap;
+            }
         }
     }
 }
 
-// ── PanelContainer (task 5.2): horizontal navigation scaffold ──────────────
-// Tracks `current-panel` index with hard stops at both ends (no wraparound).
-// Uses TouchArea's built-in pressed/mouse position properties for swipe
-// detection via the `moved` callback.
-//
-// Slice 0: only panel 0 (ClockFace) exists — swiping left or right is
-// immediately clamped by hard-stop guards, producing no visible change.
-// Vertical moves > 15 px cancel the gesture (reserved for future
-// quick-controls overlay per task 5.3).
+// ── Daily Data Panel ──────────────────────────────────────────────────────
+component DailyDataPanel inherits Rectangle {
+    VerticalLayout {
+        width: root.width;
+        height: root.height;
+        padding: 12px;
+        spacing: 14px;
+        alignment: start;
+
+        PanelTabs {}
+
+        Text {
+            text: "Daily Data";
+            font-size: 22px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            horizontal-alignment: center;
+        }
+
+        Card {
+            title: "Today's Agenda";
+            height: 120px;
+            Text {
+                text: "Agenda slot";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+            }
+        }
+
+        Card {
+            title: "Weather Tomorrow";
+            height: 100px;
+            Text {
+                text: "Forecast slot";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+            }
+        }
+
+        Card {
+            title: "Current Conditions";
+            height: 100px;
+            Text {
+                text: "Conditions slot";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+            }
+        }
+    }
+}
+
+// ── Media Panel ────────────────────────────────────────────────────────────
+component MediaPanel inherits Rectangle {
+    VerticalLayout {
+        width: root.width;
+        height: root.height;
+        padding: 12px;
+        spacing: 14px;
+        alignment: start;
+
+        PanelTabs {}
+
+        Text {
+            text: "Media";
+            font-size: 22px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            horizontal-alignment: center;
+        }
+
+        Card {
+            title: "Now Playing";
+            height: 120px;
+            Text {
+                text: "Playback slot — populated by media-player slice";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+                wrap: word-wrap;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 24px;
+            height: 80px;
+
+            Text {
+                text: "⏮";
+                font-size: 32px;
+                color: ThemeGlobal.text-color;
+                opacity: 0.8;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "▶";
+                font-size: 36px;
+                color: ThemeGlobal.text-color;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "⏭";
+                font-size: 32px;
+                color: ThemeGlobal.text-color;
+                opacity: 0.8;
+                vertical-alignment: center;
+            }
+        }
+
+        Card {
+            title: "Favorites";
+            height: 140px;
+            Text {
+                text: "Favorites slot";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+            }
+        }
+    }
+}
+
+// ── Settings Panel ─────────────────────────────────────────────────────────
+component InfoRow {
+    in property <string> label: "";
+    in property <string> value: "";
+
+    HorizontalLayout {
+        width: parent.width;
+        Text {
+            text: root.label;
+            font-size: 16px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            opacity: 0.85;
+            horizontal-stretch: 1;
+        }
+        Text {
+            text: root.value;
+            font-size: 16px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            horizontal-stretch: 0;
+        }
+    }
+}
+
+component SettingsPanel inherits Rectangle {
+    callback theme-tapped();
+    callback mode-tapped();
+
+    VerticalLayout {
+        width: root.width;
+        height: root.height;
+        padding: 12px;
+        spacing: 14px;
+        alignment: start;
+
+        PanelTabs {}
+
+        Text {
+            text: "Settings";
+            font-size: 22px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            horizontal-alignment: center;
+        }
+
+        Card {
+            title: "Theme";
+            height: 96px;
+            tappable: true;
+            tapped => { root.theme-tapped(); }
+
+            InfoRow {
+                label: "Active Theme";
+                value: ThemeGlobal.active-theme-name;
+            }
+        }
+
+        Card {
+            title: "Mode";
+            height: 96px;
+            tappable: true;
+            tapped => { root.mode-tapped(); }
+
+            InfoRow {
+                label: "Mode";
+                value: ThemeGlobal.active-mode-name;
+            }
+        }
+
+        Card {
+            title: "Alarms";
+            height: 96px;
+            InfoRow { label: "Active Alarms"; value: "—"; }
+            InfoRow { label: "Next Alarm"; value: "—"; }
+        }
+
+        Card {
+            title: "Display";
+            height: 96px;
+            InfoRow { label: "Brightness"; value: "Auto (75%)"; }
+            InfoRow { label: "Bedtime"; value: "10:00 PM - 6:00 AM"; }
+        }
+    }
+}
+
+// ── PanelContainer: horizontal navigation with hard stops ────────────────
 component PanelContainer {
-    property <int> current-panel: 0;
-    // Number of panels in the container. Set by whoever instantiates this
-    // component so the hard-stop guards self-adjust when panels are added.
-    property <int> max-panels: 1;
-    // When `false`, the swipe TouchArea is disabled (task 7.2): the alarm
-    // episode overlay sets this to `false` while an episode is `Firing` so
-    // panel-swipe is disabled even though the container is also hidden.
+    in property <int> max-panels: 4;
     in property <bool> swipe-enabled: true;
+
+    // Swipe origin for one-panel-per-swipe tracking.
+    property <length> swipe-origin-y: 0px;
+    // True once we've moved a panel during the current gesture; reset when
+    // the finger lifts. Ensures one panel per swipe regardless of distance.
+    property <bool> swipe-consumed: false;
+
+    callback theme-tapped();
+    callback mode-tapped();
 
     _ta := TouchArea {
         width: parent.width;
@@ -56,76 +289,86 @@ component PanelContainer {
         enabled: swipe-enabled;
 
         moved => {
-            // TouchArea's mouse_x / pressed_x are <length> types.
-            // Divide by 1px to convert to plain float numbers.
-            let dx: float = (_ta.mouse_x - _ta.pressed_x) / (1px);
-            let dy: float = (_ta.mouse_y - _ta.pressed_y) / (1px);
+            if !_ta.pressed { return; }
+            if root.swipe-consumed { return; }
 
-            // Vertical bail-out (task 5.3): if vertical displacement > 15 px,
-            // do not consume the gesture — reserved for future quick-controls
-            // overlay.
+            let dx: float = (_ta.mouse_x - _ta.pressed_x) / 1px;
+            let dy: float = (_ta.mouse_y - _ta.pressed_y) / 1px;
+
+            // Vertical gestures are reserved for quick-controls overlay.
             if dy > 15 { return; }
             if dy < (-15) { return; }
 
-            let threshold: float = 25;
+            // Any movement past a minimal threshold triggers exactly one
+            // panel change; the gesture is then consumed until finger-up.
+            let threshold: float = 10;
 
-            // Swipe right → previous panel (hard stop at 0).
             if dx < (-threshold) {
-                if current-panel == 0 {
-                    return;
+                if ThemeGlobal.current-panel > 0 {
+                    ThemeGlobal.current-panel -= 1;
+                    root.swipe-consumed = true;
                 }
-                current-panel -= 1;
+            } else if dx > threshold {
+                if ThemeGlobal.current-panel < (max-panels - 1) {
+                    ThemeGlobal.current-panel += 1;
+                    root.swipe-consumed = true;
+                }
             }
+        }
 
-            // Swipe left → next panel (hard stop at max_panels - 1).
-            if dx > threshold {
-                if current-panel >= (max-panels - 1) {
-                    return;
-                }
-                current-panel += 1;
-            }
+        // Reset on finger lift so the next swipe works.
+        clicked => {
+            root.swipe-consumed = false;
         }
     }
 
-    // ClockFace is the sole panel in slice 0.
-    ClockFace {
-        clock-color: #334155;
-        font-family: "sans-serif";
+    if ThemeGlobal.current-panel == 0: ClockPanel {}
+    if ThemeGlobal.current-panel == 1: DailyDataPanel {}
+    if ThemeGlobal.current-panel == 2: MediaPanel {}
+    if ThemeGlobal.current-panel == 3: SettingsPanel {
+        theme-tapped => { root.theme-tapped(); }
+        mode-tapped => { root.mode-tapped(); }
     }
 }
 
-// ── AppWindow: application shell (task 5.1) ────────────────────────────────
+// ── AppWindow: application shell ───────────────────────────────────────────
 export component AppWindow inherits Window {
+    // Debug build keeps the slice-0 logical window size; release goes
+    // full-screen from Rust via `set_fullscreen(true)`.
     preferred-width: 480px;
     preferred-height: 854px;
     title: "Alarm Clock";
+    background: ThemeGlobal.background;
 
-    // Episode FSM state exposed to Slint (task 7.2). `true` while an episode
-    // is `Firing`: the alarm overlay is shown exclusively and the navigation
-    // container is hidden + swipe disabled. `false` (Idle) restores the
-    // normal Clock panel. Main updates this from `EpisodeController::is_firing()`
-    // on each drain-timer tick.
+    // Episode FSM state exposed to Slint.
     in-out property <bool> episode-firing: false;
 
-    // Emitted when the user taps the alarm overlay (task 7.3). Main wires this
-    // to `EpisodeController::dismiss()` on the main thread.
     callback dismiss-requested();
+    callback snooze-requested();
+    callback theme-tapped();
+    callback mode-tapped();
 
-    // Navigation container (slice 0): hidden and swipe-disabled while an episode
-    // is `Firing` (task 7.2).
     panel := PanelContainer {
+        width: parent.width;
+        height: parent.height;
         visible: !root.episode-firing;
         swipe-enabled: !root.episode-firing;
+        max-panels: 4;
+        theme-tapped => { root.theme-tapped(); }
+        mode-tapped => { root.mode-tapped(); }
     }
 
-    // Alarm episode UI (task 7.1): rendered above the navigation container
-    // when `Firing`. Tap-anywhere-to-dismiss; no snooze affordance.
+    NavDots {
+        y: parent.height - self.height - 8px;
+        width: parent.width;
+        visible: !root.episode-firing;
+    }
+
     AlarmPanel {
+        width: parent.width;
+        height: parent.height;
         visible: root.episode-firing;
-        clock-color: #334155;
-        font-family: "sans-serif";
-        dismiss-requested => {
-            root.dismiss-requested();
-        }
+        dismiss-requested => { root.dismiss-requested(); }
+        snooze-requested => { root.snooze-requested(); }
     }
 }
