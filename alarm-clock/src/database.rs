@@ -70,6 +70,23 @@ fn migrations() -> &'static [Migration] {
                 ALTER TABLE alarms ADD COLUMN fallback_chain TEXT;
             ",
         },
+        // Slice 4 / D6: add JSON column for per-alarm visual alarm config.
+        // Non-destructive: existing rows get NULL (VisualConfig::Off).
+        Migration {
+            version: 4,
+            sql: "
+                ALTER TABLE alarms ADD COLUMN visual_config TEXT;
+            ",
+        },
+        // Slice 4a: add per-alarm snooze duration and cap.
+        // Non-destructive: existing rows get defaults (10 minutes, 3 max).
+        Migration {
+            version: 5,
+            sql: "
+                ALTER TABLE alarms ADD COLUMN snooze_minutes INTEGER NOT NULL DEFAULT 10;
+                ALTER TABLE alarms ADD COLUMN max_snoozes INTEGER NOT NULL DEFAULT 3;
+            ",
+        },
     ]
 }
 
@@ -480,12 +497,12 @@ mod tests {
         assert_eq!(alarm_count_before, 1);
 
         // Run migrations — v2 is skipped (user_version already 2); the
-        // additive v3 migration applies (escalation_steps / fallback_chain
-        // columns added) and user_version advances to 3.
+        // additive v3, v4, and v5 migrations apply (escalation_steps, fallback_chain,
+        // visual_config, snooze_minutes, max_snoozes columns added) and user_version advances to 5.
         run_migrations(&conn).expect("migrations should succeed");
 
-        // user_version is now 3 (v3 applied); v2 was not re-applied.
-        assert_eq!(read_user_version(&conn).unwrap(), 3);
+        // user_version is now 5 (v3+v4+v5 applied); v2 was not re-applied.
+        assert_eq!(read_user_version(&conn).unwrap(), 5);
 
         // alarms table intact — row count unchanged.
         let alarm_count_after: i64 = conn
@@ -527,6 +544,131 @@ mod tests {
             |r| r.get(0),
         ).unwrap();
         assert!(has_kv_config, "kv_config must still exist after v2 idempotent skip");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario: Migration v5 adds snooze_minutes and max_snoozes columns with
+    /// defaults; existing alarms get defaults (10, 3); new alarms preserve values.
+    #[test]
+    fn migration_v5_adds_snooze_columns_with_defaults() {
+        let path = format!(
+            "{}{}v5_snooze_migration_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).expect("open connection");
+        run_migrations(&conn).expect("migrations should succeed");
+
+        // Insert a test alarm without specifying snooze fields (v2-v4 alarm).
+        conn.execute(
+            "INSERT INTO alarms (id, name, time_local, timezone, source_uri, max_volume, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["test-v2-alarm", "Morning Alarm", "07:00:00", "America/Edmonton", "coreaudio://alarm.mp3", "50", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"],
+        )
+        .expect("should insert v2 alarm");
+
+        // Insert another alarm with explicit snooze values.
+        conn.execute(
+            "INSERT INTO alarms (id, name, time_local, timezone, source_uri, max_volume, snooze_minutes, max_snoozes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ["test-v5-alarm", "Evening Alarm", "22:00:00", "America/Edmonton", "coreaudio://evening.mp3", "60", "5", "2", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"],
+        )
+        .expect("should insert v5 alarm");
+
+        // Read back both alarms and verify snooze fields.
+        let mut stmt = conn.prepare("SELECT id, snooze_minutes, max_snoozes FROM alarms ORDER BY id").unwrap();
+        let rows: Vec<(String, i64, i64)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+
+        // v2 alarm gets defaults.
+        assert_eq!(rows[0], ("test-v2-alarm".to_string(), 10, 3));
+        // v5 alarm preserves explicit values.
+        assert_eq!(rows[1], ("test-v5-alarm".to_string(), 5, 2));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario: Migration v5 is idempotent - running it multiple times
+    /// doesn't change the database state.
+    #[test]
+    fn migration_v5_is_idempotent() {
+        let path = format!(
+            "{}{}v5_idempotent_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).expect("open connection");
+        run_migrations(&conn).expect("first migration should succeed");
+
+        // Insert an alarm
+        conn.execute(
+            "INSERT INTO alarms (id, name, time_local, timezone, source_uri, max_volume, snooze_minutes, max_snoozes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ["test-alarm", "Test Alarm", "07:00:00", "America/Edmonton", "coreaudio://alarm.mp3", "50", "7", "4", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"],
+        )
+        .expect("should insert alarm");
+
+        // Run migrations again - should be no-op
+        run_migrations(&conn).expect("second migration should succeed");
+
+        // Verify the alarm is still there with the same values
+        let mut stmt = conn.prepare("SELECT id, snooze_minutes, max_snoozes FROM alarms").unwrap();
+        let rows: Vec<(String, i64, i64)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], ("test-alarm".to_string(), 7, 4));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario: Upgrading from v4 to v5 applies defaults to existing alarms.
+    #[test]
+    fn migration_v5_upgrade_from_v4_applies_defaults() {
+        let path = format!(
+            "{}{}v5_upgrade_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).expect("open connection");
+
+        // Manually apply v1-v4 migrations to simulate an existing database
+        for version in 1..=4 {
+            let mig = migrations().iter().find(|m| m.version == version).unwrap();
+            conn.execute_batch(mig.sql).expect(&format!("migration v{} should succeed", version));
+            set_user_version(&conn, version).expect(&format!("setting user_version to {} should succeed", version));
+        }
+
+        // Insert a v4 alarm (without snooze fields)
+        conn.execute(
+            "INSERT INTO alarms (id, name, time_local, timezone, source_uri, max_volume, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ["test-v4-alarm", "V4 Alarm", "08:00:00", "America/Edmonton", "coreaudio://v4.mp3", "60", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z"],
+        )
+        .expect("should insert v4 alarm");
+
+        // Run all migrations (should apply v5)
+        run_migrations(&conn).expect("migrations should succeed");
+
+        // Verify user_version is now 5
+        assert_eq!(read_user_version(&conn).unwrap(), 5);
+
+        // Verify the v4 alarm now has snooze defaults
+        let mut stmt = conn.prepare("SELECT id, snooze_minutes, max_snoozes FROM alarms").unwrap();
+        let rows: Vec<(String, i64, i64)> = stmt.query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        }).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], ("test-v4-alarm".to_string(), 10, 3));
 
         let _ = std::fs::remove_file(&path);
     }

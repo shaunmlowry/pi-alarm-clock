@@ -78,10 +78,26 @@ struct SeedAlarm {
     /// Full ISO-8601 local DateTime for a `Once` alarm; `None` otherwise.
     #[serde(default)]
     once_at: Option<String>,
+    /// Per-alarm snooze duration in minutes (default 10).
+    /// 0 = snooze disabled for this alarm.
+    #[serde(default = "default_snooze_minutes")] 
+    snooze_minutes: i64,
+    /// Maximum number of snoozes allowed per alarm episode (default 3).
+    /// 0 = snooze disabled entirely; reached cap hides Snooze button.
+    #[serde(default = "default_max_snoozes")]
+    max_snoozes: i64,
 }
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_snooze_minutes() -> i64 {
+    10
+}
+
+fn default_max_snoozes() -> i64 {
+    3
 }
 
 impl SeedAlarm {
@@ -107,6 +123,9 @@ impl SeedAlarm {
             max_volume: self.max_volume,
             escalation_steps: self.escalation_steps.clone(),
             fallback_chain: self.fallback_chain.clone(),
+            visual_config: None,
+            snooze_minutes: 10,
+            max_snoozes: 3,
             next_fire: None,
             created_at: iso_now(),
             updated_at: iso_now(),
@@ -568,6 +587,8 @@ max_volume = 40
             escalation_steps: None,
             fallback_chain: None,
             once_at: None,
+            snooze_minutes: 10,
+            max_snoozes: 3,
         };
         let res = entry.to_alarm();
         assert!(res.is_err(), "unknown preset should fail");
@@ -589,6 +610,8 @@ max_volume = 40
             escalation_steps: None,
             fallback_chain: None,
             once_at: None,
+            snooze_minutes: 10,
+            max_snoozes: 3,
         };
         let res = entry.to_alarm();
         assert!(res.is_err(), "Specific-days with no days should fail");

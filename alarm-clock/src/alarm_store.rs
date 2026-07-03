@@ -73,6 +73,15 @@ pub struct Alarm {
     /// (slice 2 / D2). `None` or empty = no fallback (slice-1 behavior). The
     /// alarm's `source_uri` is the primary and is not duplicated here.
     pub fallback_chain: Option<Vec<String>>,
+    /// Per-alarm visual alarm configuration (slice 4). Stored as JSON text.
+    /// `None` or empty JSON means `VisualConfig::Off`.
+    pub visual_config: Option<String>,
+    /// Per-alarm snooze duration in minutes (default 10).
+    /// 0 = snooze disabled for this alarm.
+    pub snooze_minutes: i64,
+    /// Maximum number of snoozes allowed per alarm episode (default 3).
+    /// 0 = snooze disabled entirely; reached cap hides Snooze button.
+    pub max_snoozes: i64,
     /// Cached next fire time (ISO-8601 UTC); derived, may be stale.
     pub next_fire: Option<String>,
     /// Creation timestamp (ISO-8601).
@@ -111,7 +120,7 @@ impl<'a> AlarmStore<'a> {
             .prepare(
                 "SELECT id, enabled, name, time_local, timezone, rrule, once_at, \
                  source_uri, max_volume, escalation_steps, fallback_chain, \
-                 next_fire, created_at, updated_at \
+                 visual_config, snooze_minutes, max_snoozes, next_fire, created_at, updated_at \
                  FROM alarms ORDER BY id",
             )
             .map_err(ConfigError::Database)?;
@@ -130,7 +139,7 @@ impl<'a> AlarmStore<'a> {
             .query_row(
                 "SELECT id, enabled, name, time_local, timezone, rrule, once_at, \
                  source_uri, max_volume, escalation_steps, fallback_chain, \
-                 next_fire, created_at, updated_at \
+                 visual_config, snooze_minutes, max_snoozes, next_fire, created_at, updated_at \
                  FROM alarms WHERE id = ?",
                 [id],
                 row_to_alarm,
@@ -168,8 +177,8 @@ impl<'a> AlarmStore<'a> {
             "INSERT OR REPLACE INTO alarms \
              (id, enabled, name, time_local, timezone, rrule, once_at, \
               source_uri, max_volume, escalation_steps, fallback_chain, \
-              next_fire, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              visual_config, snooze_minutes, max_snoozes, next_fire, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 alarm.id,
                 enabled_i,
@@ -182,6 +191,9 @@ impl<'a> AlarmStore<'a> {
                 alarm.max_volume,
                 escalation_json,
                 fallback_json,
+                alarm.visual_config,
+                alarm.snooze_minutes,
+                alarm.max_snoozes,
                 alarm.next_fire,
                 alarm.created_at,
                 alarm.updated_at,
@@ -326,6 +338,9 @@ fn row_to_alarm(row: &rusqlite::Row<'_>) -> rusqlite::Result<Alarm> {
         max_volume: row.get("max_volume")?,
         escalation_steps,
         fallback_chain,
+        visual_config: row.get("visual_config")?,
+        snooze_minutes: row.get("snooze_minutes").unwrap_or(10),
+        max_snoozes: row.get("max_snoozes").unwrap_or(3),
         next_fire: row.get("next_fire")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -490,9 +505,12 @@ mod tests {
             rrule: Some("FREQ=DAILY".to_string()),
             once_at: None,
             source_uri: "coreaudio://alarm.mp3".to_string(),
+            visual_config: None,
             max_volume: 40,
             escalation_steps: None,
             fallback_chain: None,
+            snooze_minutes: 10,
+            max_snoozes: 3,
             next_fire: None,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),
@@ -741,6 +759,22 @@ mod tests {
         cleanup(path);
     }
 
+    /// Scenario: alarm with custom snooze_minutes and max_snoozes round-trips.
+    #[test]
+    fn alarm_with_snooze_fields_round_trips() {
+        let (path, store) = fresh_store();
+        let mut a = sample_alarm("alarm-snooze");
+        a.snooze_minutes = 5;
+        a.max_snoozes = 2;
+        store.upsert(&a).unwrap();
+
+        let got = store.get("alarm-snooze").unwrap().unwrap();
+        assert_eq!(got.snooze_minutes, 5);
+        assert_eq!(got.max_snoozes, 2);
+
+        cleanup(path);
+    }
+
     /// Scenario: the store sorts escalation steps ascending by after_secs on
     /// write, even if the caller supplies them out of order.
     #[test]
@@ -820,6 +854,9 @@ mod tests {
             max_volume: 40,
             escalation_steps: None,
             fallback_chain: None,
+            visual_config: None,
+            snooze_minutes: 10,
+            max_snoozes: 3,
             next_fire: None,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),

@@ -16,8 +16,21 @@ mod error;
 mod episode;
 mod schedule;
 mod scheduler;
+mod display;
 mod seed;
 mod theme;
+
+/// Resolve bundled asset path to file:// URI at boot (slice 4a / D3).
+/// Converts "asset:beep.mp3" to "file:///path/to/assets/beep.mp3".
+fn resolve_bundled_beep_asset(data_dir: &str) -> Option<String> {
+    let asset_path = std::path::Path::new(data_dir).join("assets").join("beep.mp3");
+    if asset_path.exists() {
+        Some(format!("file://{}", asset_path.display()))
+    } else {
+        warn!(asset_path = %asset_path.display(), "bundled beep asset not found");
+        None
+    }
+}
 
 use crate::alarm_store::{Alarm, AlarmStore};
 use crate::channel::{Cmd, CmdSender, Reply, MopidyEvent};
@@ -30,6 +43,7 @@ use mopidy_client::state::MopidyConnectionState;
 use rusqlite::Connection;
 use tokio::sync::mpsc as tokio_mpsc;
 use crate::config::Config;
+use crate::display::DisplayController;
 use crate::theme::ThemeController;
 use slint::ComponentHandle;
 use std::panic::{self, AssertUnwindSafe};
@@ -64,12 +78,20 @@ slint::include_modules!();
 #[derive(Clone)]
 pub struct ChannelMopidyControl {
     cmd_tx: CmdSender,
+    /// Reference to the `DisplayController` shared state for brightness
+    /// capture/restore (slice 4).
+    display: Option<Arc<Mutex<DisplayController>>>,
 }
 
 impl ChannelMopidyControl {
     /// Construct from the main-side command sender.
     pub fn new(cmd_tx: CmdSender) -> Self {
-        Self { cmd_tx }
+        Self { cmd_tx, display: None }
+    }
+
+    /// Construct with a display controller reference.
+    pub fn new_with_display(cmd_tx: CmdSender, display: Arc<Mutex<DisplayController>>) -> Self {
+        Self { cmd_tx, display: Some(display) }
     }
 
     /// Fire-and-forget a Mopidy JSON-RPC call across the `Cmd` channel.
@@ -94,6 +116,24 @@ impl MopidyControl for ChannelMopidyControl {
             "capture_snapshot: returning defaults (snapshot reply correlation not yet wired)"
         );
         MopidySnapshot::default()
+    }
+
+    fn capture_brightness(&self) -> u8 {
+        if let Some(ref d) = self.display {
+            if let Ok(dc) = d.lock() {
+                return dc.current_brightness();
+            }
+        }
+        100
+    }
+
+    fn restore_brightness(&self, level: u8) {
+        if let Some(ref d) = self.display {
+            if let Ok(mut dc) = d.lock() {
+                dc.set_brightness_target(level);
+                info!(level, "display: brightness restored after episode");
+            }
+        }
     }
     fn tracklist_add(&self, uri: &str) {
         self.send_call("tracklist.add", serde_json::json!({ "uris": [uri] }));
@@ -221,14 +261,18 @@ impl AlarmSource for StoreAlarmSource {
 pub struct EpisodeFsmAdapter {
     conn: SharedConnection,
     episode: Arc<Mutex<EpisodeController<ChannelMopidyControl>>>,
+    display: Arc<Mutex<DisplayController>>,
+    bundled_beep_path: Option<String>,
 }
 
 impl EpisodeFsmAdapter {
     pub fn new(
         conn: SharedConnection,
         episode: Arc<Mutex<EpisodeController<ChannelMopidyControl>>>,
+        display: Arc<Mutex<DisplayController>>,
+        bundled_beep_path: Option<String>,
     ) -> Self {
-        Self { conn, episode }
+        Self { conn, episode, display, bundled_beep_path }
     }
 
     /// Look up the alarm's `source_uri` / `max_volume` by id.
@@ -251,12 +295,26 @@ impl EpisodeFsm for EpisodeFsmAdapter {
                 return;
             }
         };
+        // Slice 4: arm visual strobe if the alarm has visual config.
+        if let Ok(mut dc) = self.display.lock() {
+            let visual_config = crate::display::VisualConfig::from_json(
+                alarm.visual_config.as_deref(),
+            );
+            if visual_config.is_on() {
+                dc.arm_strobe(&visual_config, false);
+            }
+            dc.set_episode_active(true);
+        }
+
         let max_volume = alarm.max_volume.clamp(0, 100) as u8;
         let plan = crate::episode::EpisodePlan::new(
             alarm.source_uri.clone(),
             max_volume,
             alarm.escalation_steps.clone(),
             alarm.fallback_chain.clone(),
+            alarm.snooze_minutes as u32,
+            alarm.max_snoozes as u32,
+            self.bundled_beep_path.clone(),
         );
         if let Ok(mut ctl) = self.episode.lock() {
             ctl.fire(alarm_id, &plan);
@@ -527,6 +585,14 @@ fn spawn_tokio_worker(
 pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimers) {
     let cfg = Config::load();
 
+    // Slice 4a / D3: resolve bundled beep asset path at boot
+    let bundled_beep_path = resolve_bundled_beep_asset(&cfg.data_dir);
+    if bundled_beep_path.is_some() {
+        info!(beep_path = ?bundled_beep_path, "bundled beep asset resolved");
+    } else {
+        info!("no bundled beep asset found");
+    }
+
     info!(
         db_path = %cfg.db_path,
         mopidy_ws_url = %cfg.mopidy_ws_url,
@@ -578,8 +644,40 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // scheduler's [`EpisodeFsmAdapter`] can all reach the FSM on the main
     // thread. (`slint::Timer` closures do not require `Send` in this version,
     // but `Arc` is kept for the shared-ownership pattern.)
+    // ── DisplayController (slice 4) ───────────────────────────────────
+    //
+    // Single backlight controller on main. Wrapped in `Arc<Mutex<..>>` so it
+    // can be shared with the episode FSM (for brightness capture/restore) and
+    // the scheduler tick (for policy resolution each tick).
+    let display_ctl: Arc<Mutex<DisplayController>> = Arc::new(Mutex::new(DisplayController::new()));
+
+    // Slice 4 / task 3.3: load persisted bedtime config and brightness floor.
+    {
+        if let Ok(mut dc) = display_ctl.lock() {
+            if let Ok(conn_guard) = conn.lock() {
+                let store = crate::database::ConfigStore::new(&*conn_guard);
+                let bedtime = store.get("bedtime_config").ok().flatten();
+                let floor = store.get("brightness_floor").ok().flatten();
+                if let Some(json) = bedtime {
+                    dc.set_bedtime_config(crate::display::BedtimeConfig::from_json(Some(&json)));
+                }
+                if let Some(val) = floor {
+                    if let Ok(pct) = val.parse::<u8>() {
+                        dc.set_brightness_target(pct);
+                    }
+                }
+                // Persist current values (round-trip ensures they are stored).
+                let _ = store.set("bedtime_config", &dc.bedtime_config().to_json());
+                let _ = store.set("brightness_floor", &dc.brightness_floor().to_string());
+            }
+        }
+    }
+
     let episode_ctl: Arc<Mutex<EpisodeController<ChannelMopidyControl>>> = Arc::new(
-        Mutex::new(EpisodeController::new(ChannelMopidyControl::new(cmd_sender))),
+        Mutex::new(EpisodeController::new(ChannelMopidyControl::new_with_display(
+            cmd_sender,
+            Arc::clone(&display_ctl),
+        ))),
     );
 
     // ── Slint AppWindow + episode UI wiring (tasks 7.2 / 7.3) ─────────────
@@ -598,10 +696,15 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // episode FSM is owned by main.
     {
         let ctl = Arc::clone(&episode_ctl);
+        let dc = Arc::clone(&display_ctl);
         let weak = app_window.as_weak();
         app_window.on_dismiss_requested(move || {
             if let Ok(mut ctl) = ctl.lock() {
                 ctl.dismiss();
+            }
+            // Slice 4: signal the display controller that the episode ended.
+            if let Ok(mut dc) = dc.lock() {
+                dc.set_episode_active(false);
             }
             // Optimistically restore the UI to Idle (the FSM is now `Dismissed`).
             if let Some(w) = weak.upgrade() {
@@ -633,9 +736,10 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // Theme selection and mode are loaded from `kv_config`, pushed into the
     // Slint `ThemeGlobal` singleton, and updated every second so the clock
     // and theme tokens stay in sync.
-    let theme_controller = Arc::new(Mutex::new(ThemeController::new(
-        Arc::clone(&conn),
-    )));
+    let theme_controller = Arc::new(Mutex::new(
+        ThemeController::new(Arc::clone(&conn))
+            .with_display(Arc::clone(&display_ctl)),
+    ));
 
     // Push the initially loaded theme into Slint.
     {
@@ -826,9 +930,10 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // Group 9.1: wire the real [`StoreAlarmSource`] (over [`AlarmStore`]) and
     // [`EpisodeFsmAdapter`] (over the [`EpisodeController`] above) in place of
     // the slice-0 no-op seams, so real alarms now drive the episode FSM.
+    let display_for_scheduler = Arc::clone(&display_ctl);
     let scheduler_state = Mutex::new(Scheduler::new(
         StoreAlarmSource::new(Arc::clone(&conn)),
-        EpisodeFsmAdapter::new(Arc::clone(&conn), episode_ctl_for_scheduler),
+        EpisodeFsmAdapter::new(Arc::clone(&conn), episode_ctl_for_scheduler, Arc::clone(&display_ctl), bundled_beep_path.clone()),
         LocalClock,
     ));
     let scheduler_timer = slint::Timer::default();
@@ -841,6 +946,10 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
             protected_tick(|| {
                 if let Ok(mut state) = scheduler_state.lock() {
                     state.tick();
+                }
+                // Slice 4: drive the display controller policy resolution.
+                if let Ok(mut dc) = display_for_scheduler.lock() {
+                    dc.tick();
                 }
             });
         },
