@@ -51,6 +51,16 @@ pub enum Cmd {
 
     /// Dismiss the current alarm episode (task 7.3).
     Dismiss,
+
+    /// Fetch weather data from Open-Meteo for the given lat/lon (slice 5).
+    /// Runs on the tokio worker; the result is returned as
+    /// [`Reply::WeatherResult`].
+    FetchWeather { lat: f64, lon: f64 },
+
+    /// Geocode a city name via Open-Meteo's geocoding API (slice 5). The
+    /// resolved lat/lon/name is returned as [`Reply::GeocodeResult`] so main
+    /// can persist it and trigger a weather refresh.
+    GeocodeCity { city: String },
 }
 
 /// Replies sent from the tokio worker back to main.
@@ -70,6 +80,15 @@ pub enum Reply {
     /// Published on every state change from `Disconnected` through
     /// `BackingOff`, `Connecting` to `Connected`.
     MopidyConnectionState(mopidy_client::MopidyConnectionState),
+
+    /// Weather fetch result (slice 5). Carries a successful snapshot or an
+    /// error string (the latter triggers the backoff retry path on main).
+    WeatherResult(Result<crate::WeatherSnapshot, String>),
+
+    /// Geocoding result (slice 5). Carries the resolved (lat, lon, name) on
+    /// success or an error string on failure. Main persists the result and
+    /// triggers a weather refresh.
+    GeocodeResult(Result<(f64, f64, String), String>),
 }
 
 // ── Channel handles ───────────────────────────────────────────────────────────

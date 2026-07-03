@@ -9,6 +9,10 @@ axum.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 mopidy-client = { path = "../mopidy-client" }
+reqwest = { version = "0.11", features = ["json"] }
+resvg = "0.47"
+usvg = "0.47"
+tiny-skia = "0.12"
 rrule.workspace = true
 rusqlite.workspace = true
 serde.workspace = true

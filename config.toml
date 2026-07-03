@@ -5,6 +5,11 @@
 # the working directory); in release builds it is
 # `/etc/alarm-clock/config.toml`.
 #
+# A second, gitignored file `./config.local.toml` (dev) or
+# `/etc/alarm-clock/config.local.toml` (release) is deep-merged on top of this
+# one. Put SECRETS (e.g. the PirateWeather API key) there — never in this
+# tracked file.
+#
 # Every field is optional: omit a key to fall back to its compiled default.
 # Compiled defaults are shown commented next to each key.
 
@@ -27,3 +32,43 @@ log_level = "info"
 # Runtime data directory (database, scratch).
 # default: ./data
 data_dir = "./data"
+
+# ── Weather (slice 5 + PirateWeather fallback) ───────────────────────────
+# These seed the DB defaults on first boot only. After first boot the DB is
+# the source of truth (city is changed via the web UI, not this file).
+#
+# City-only: if you omit lat/lon, the app geocodes `city` at boot (via
+# Open-Meteo's geocoding API) to resolve coordinates automatically. So either
+# of these works:
+#   [weather]
+#   city = "Edmonton"
+# or, to skip geocoding:
+#   [weather]
+#   city = "Edmonton"
+#   lat = 53.53
+#   lon = -113.5
+[weather]
+# default: "Calgary"
+city = "Canmore"
+# Optional. Omit to geocode `city` at boot. (default: none → geocode)
+# lat = 51.05
+# Optional. Omit to geocode `city` at boot. (default: none → geocode)
+# lon = -114.07
+
+# Primary provider (Open-Meteo) forecast API base URL.
+# default: "https://api.open-meteo.com/v1/forecast"
+# open_meteo_url = "https://api.open-meteo.com/v1/forecast"
+
+# Fallback provider (PirateWeather) API base URL.
+# default: "https://api.pirateweather.net/forecast"
+# pirateweather_url = "https://api.pirateweather.net/forecast"
+
+# PirateWeather API key. When set, PirateWeather is used as a fallback
+# whenever the Open-Meteo fetch fails. KEEP THIS OUT OF THIS FILE (which is
+# tracked in git) — put it in ./config.local.toml instead:
+#
+#   [weather]
+#   pirateweather_api_key = "your-key-here"
+#
+# default: none (fallback disabled)
+# pirateweather_api_key = ""

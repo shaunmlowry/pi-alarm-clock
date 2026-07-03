@@ -11,6 +11,7 @@ import { Button } from "ui/Button.slint";
 import { ClockFace } from "ui/ClockFace.slint";
 import { NavDots } from "ui/NavDots.slint";
 import { PanelTabs } from "ui/PanelTabs.slint";
+import { WeatherIcon } from "ui/WeatherIcon.slint";
 
 export { ThemeGlobal }
 
@@ -19,22 +20,73 @@ component ClockPanel inherits Rectangle {
     VerticalLayout {
         width: root.width;
         height: root.height;
-        padding: 20px;
+        padding-top: 5px;
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-bottom: 20px;
         spacing: 16px;
-        alignment: center;
+        alignment: start;
 
         ClockFace {}
 
         Card {
-            title: "Current Conditions";
+            title: "";
             height: 72px;
-            Text {
-                text: "Weather slot — populated by calendar/weather slice";
-                font-size: 14px;
-                color: ThemeGlobal.text-color;
-                font-family: ThemeGlobal.font-family;
-                opacity: 0.6;
-                wrap: word-wrap;
+            HorizontalLayout {
+                padding: 0px;
+                spacing: 16px;
+                alignment: start;
+
+                // Card title on the left
+                Text {
+                    text: "Current Conditions";
+                    font-size: 18px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    vertical-alignment: center;
+                }
+
+                // Spacer to push data right
+                Rectangle { horizontal-stretch: 1; }
+
+                // Weather condition icon
+                WeatherIcon {
+                    wmo-code: ThemeGlobal.weather_wmo_code;
+                    visible: ThemeGlobal.weather_available;
+                }
+
+                // Temperature and high/low
+                VerticalLayout {
+                    spacing: 0px;
+                    alignment: center;
+
+                    Text {
+                        text: ThemeGlobal.weather_temp + "°C";
+                        font-size: 18px;
+                        color: ThemeGlobal.text-color;
+                        horizontal-alignment: right;
+                        visible: ThemeGlobal.weather_available;
+                    }
+
+                    Text {
+                        text: ThemeGlobal.weather_high + "° / " + ThemeGlobal.weather_low + "°";
+                        font-size: 13px;
+                        color: ThemeGlobal.text-color;
+                        opacity: 0.8;
+                        horizontal-alignment: right;
+                        visible: ThemeGlobal.weather_available;
+                    }
+                }
+
+                // Fallback text when no weather data
+                Text {
+                    text: "Unavailable";
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    opacity: 0.6;
+                    vertical-alignment: center;
+                    visible: !ThemeGlobal.weather_available;
+                }
             }
         }
 
@@ -85,26 +137,117 @@ component DailyDataPanel inherits Rectangle {
         }
 
         Card {
-            title: "Weather Tomorrow";
+            title: "";
             height: 100px;
-            Text {
-                text: "Forecast slot";
-                font-size: 14px;
-                color: ThemeGlobal.text-color;
-                font-family: ThemeGlobal.font-family;
-                opacity: 0.6;
+            HorizontalLayout {
+                padding: 0px;
+                spacing: 16px;
+                alignment: start;
+
+                // Card title on the left
+                Text {
+                    text: "Weather Tomorrow";
+                    font-size: 18px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    vertical-alignment: center;
+                }
+
+                // Spacer to push data right
+                Rectangle { horizontal-stretch: 1; }
+
+                // Weather condition icon
+                WeatherIcon {
+                    wmo-code: ThemeGlobal.weather_wmo_code;
+                    visible: ThemeGlobal.weather_available;
+                }
+
+                // Tomorrow's forecast
+                VerticalLayout {
+                    spacing: 0px;
+                    alignment: center;
+
+                    Text {
+                        text: "Tomorrow";
+                        font-size: 13px;
+                        color: ThemeGlobal.text-color;
+                        opacity: 0.7;
+                        horizontal-alignment: right;
+                        visible: ThemeGlobal.weather_available;
+                    }
+
+                    Text {
+                        text: ThemeGlobal.weather_tomorrow_high + "° / " + ThemeGlobal.weather_tomorrow_low + "°";
+                        font-size: 18px;
+                        color: ThemeGlobal.text-color;
+                        horizontal-alignment: right;
+                        visible: ThemeGlobal.weather_available;
+                    }
+                }
+
+                // Fallback text when no weather data
+                Text {
+                    text: "Unavailable";
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    opacity: 0.6;
+                    vertical-alignment: center;
+                    visible: !ThemeGlobal.weather_available;
+                }
             }
         }
 
         Card {
-            title: "Current Conditions";
+            title: "";
             height: 100px;
-            Text {
-                text: "Conditions slot";
-                font-size: 14px;
-                color: ThemeGlobal.text-color;
-                font-family: ThemeGlobal.font-family;
-                opacity: 0.6;
+            HorizontalLayout {
+                padding: 0px;
+                spacing: 16px;
+                alignment: start;
+
+                // Card title on the left
+                Text {
+                    text: "Current Conditions";
+                    font-size: 18px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    vertical-alignment: center;
+                }
+
+                // Spacer to push data right
+                Rectangle { horizontal-stretch: 1; }
+
+                // Detailed current conditions on the right
+                VerticalLayout {
+                    spacing: 2px;
+                    alignment: center;
+
+                    Text {
+                        text: "Wind: " + ThemeGlobal.weather_wind + " km/h";
+                        font-size: 14px;
+                        color: ThemeGlobal.text-color;
+                        horizontal-alignment: right;
+                        visible: ThemeGlobal.weather_available;
+                    }
+
+                    Text {
+                        text: "Humidity: " + ThemeGlobal.weather_humidity + "%";
+                        font-size: 14px;
+                        color: ThemeGlobal.text-color;
+                        horizontal-alignment: right;
+                        visible: ThemeGlobal.weather_available;
+                    }
+                }
+
+                // Fallback text when no weather data
+                Text {
+                    text: "Unavailable";
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    opacity: 0.6;
+                    vertical-alignment: center;
+                    visible: !ThemeGlobal.weather_available;
+                }
             }
         }
     }

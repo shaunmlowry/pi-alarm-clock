@@ -87,6 +87,15 @@ fn migrations() -> &'static [Migration] {
                 ALTER TABLE alarms ADD COLUMN max_snoozes INTEGER NOT NULL DEFAULT 3;
             ",
         },
+        // Slice 5: add weather configuration
+        // Non-destructive: new kv_config keys for city, lat, and lon
+        Migration {
+            version: 6,
+            sql: "
+                -- Weather configuration will be stored in kv_config table
+                -- Keys: weather_city, weather_lat, weather_lon
+            ",
+        },
     ]
 }
 

@@ -2,9 +2,7 @@
 
 ## Purpose
 Slint-based vertical (9:16) touch-only UI shell for the Pi alarm clock. Hosts a four-panel navigation scaffold (Clock, Daily-data, Media, Settings) with nav-dots and panel-tabs, a live analog clock face, theme-token-bound `Card`/`Button` components, a touch-native Settings panel, a themed alarm overlay, and full-screen kiosk rendering on the Pi.
-
 ## Requirements
-
 ### Requirement: Slint application with vertical orientation
 The application SHALL render its UI using Slint, oriented vertically (9:16), touch-only, with no text input and no scrolling. The Slint event loop SHALL run on the main thread.
 
@@ -81,3 +79,19 @@ The `AppWindow` SHALL run full-screen on the Raspberry Pi touchscreen with no wi
 #### Scenario: Alarm overlay covers the full screen
 - **WHEN** an alarm fires
 - **THEN** the alarm overlay covers the entire display edge-to-edge (no title bar or border interrupts the tap-anywhere-to-dismiss surface)
+
+### Requirement: Weather cards populated on the Clock and Daily-data panels
+The Clock-panel weather card (slot defined in slice 3) SHALL display the brief weather view (icon + current temp + today's high). The Daily-data panel's "Weather Tomorrow" and "Current Conditions" cards (slots defined in slice 3) SHALL display tomorrow's H/L + conditions and current wind/humidity respectively. The cards SHALL render in the active theme and show stale-retained data (with no error state) when offline.
+
+#### Scenario: Clock-panel weather card shows brief data
+- **WHEN** the Clock panel is shown and weather data is present
+- **THEN** the weather card shows the themed icon, current temp, and today's high
+
+#### Scenario: Daily-data panel shows detailed weather
+- **WHEN** the Daily-data panel is shown and weather data is present
+- **THEN** the "Weather Tomorrow" card shows tomorrow's H/L and conditions, and the "Current Conditions" card shows wind and humidity
+
+#### Scenario: Stale data shows without an error indicator
+- **WHEN** the device is offline and the last weather fetch is stale
+- **THEN** the weather cards continue to show the last data with no error/broken state
+

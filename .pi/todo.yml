@@ -1,0 +1,44 @@
+# TODO: Finish wiring live Mopidy RPC into the Tokio command dispatcher
+#
+# Context: Scenario A (alarm plays sound) failed because `Cmd::CallMopidy`
+# in `command_dispatcher` was a placeholder. The dispatcher now issues live
+# `client.send_and_await(...)` calls via an `Arc<MopidyWsClient>` handle.
+#
+# File: alarm-clock/src/main.rs
+
+- [x] 1. Fix type alias (line ~307)
+        `type MopidyClient = Arc<mopidy_client::transport::MopidyWsClient>;`
+
+- [x] 2. Fix client creation in spawn_tokio_worker (line ~464)
+        `let client: MopidyClient = Arc::new(mopidy_client::transport::MopidyWsClient::spawn(...));`
+        Closing `));` verified.
+
+- [x] 3. Fix three test client creation blocks (lines ~940, ~981, ~1200)
+        All use `mopidy_client::transport::MopidyWsClient::spawn` with corrected
+        module paths, struct names, and channel types (`tokio_mpsc`).
+
+- [x] 4. GetMopidyState match arm (line ~335) — live RPC
+        Calls `client.send_and_await("core.get_state", None)`, extracts
+        `res.result.as_str()`, replies via `Reply::MopidyState(String)`.
+        Falls back to "STOPPED" on disconnect/error.
+
+- [x] 5. CallMopidy match arm (line ~371) — live RPC dispatch
+        Destructures `Cmd::CallMopidy { method, params }`, calls
+        `client.send_and_await(&method, Some(params))`, replies via
+        `Reply::CallResult(Value)` using `msg.result` / `msg.error`.
+
+- [x] 6. `use std::sync::Arc` in scope (line 32) — verified present.
+
+- [x] 7. Build the workspace
+        `cargo build -p alarm-clock` — succeeds (16 pre-existing warnings only).
+
+- [x] 8. Run unit tests
+        `cargo test -p alarm-clock` — 85 passed, 0 failed.
+        Includes: command_dispatcher_handles_get_mopidy_state,
+                  command_dispatcher_handles_call_mopidy,
+                  command_dispatcher_sends_shutdown_requested_on_command_shutdown.
+
+- [ ] 9. Re-run Scenario A of the manual playbook (slice-1-manual-playbook.md)
+        Confirm: alarm fires -> CallMopidy { playback.play } reaches Mopidy
+        over WebSocket -> audio playback begins.
+        (Requires a running Mopidy instance + hardware; manual test.)

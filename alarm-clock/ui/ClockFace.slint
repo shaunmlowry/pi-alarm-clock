@@ -65,12 +65,15 @@ export component ClockFace {
             horizontal-alignment: center;
         }
 
+        // Face dimensions adjusted for physical pixel aspect ratio to appear circular.
+        // Originally 280px × 280px appeared 51mm × 54mm (slightly tall).
+        // Compensate by making it slightly wider: 297px × 280px.
         face := Rectangle {
-            width: 280px;
+            width: 297px;
             height: 280px;
             x: (parent.width - self.width) / 2;
             background: ThemeGlobal.clock-face-background;
-            border-radius: self.width / 2;
+            border-radius: self.height / 2;
 
             // Neuromorphic depth: dual extrusion shadows on the face itself.
             // Two stacked drop-shadows (dark down/right, light up/left) sit
@@ -136,8 +139,10 @@ export component ClockFace {
                 height: 10px;
                 background: ThemeGlobal.hand-color;
                 border-radius: self.width / 2;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
+                // Position at the same center as the hands use for their calculations
+                // Hands use face.width as their coordinate system size
+                x: (face.width - self.width) / 2;
+                y: (face.width - self.height) / 2;
             }
         }
     }

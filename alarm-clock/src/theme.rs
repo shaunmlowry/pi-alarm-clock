@@ -5,6 +5,8 @@
 //! themes at runtime is just re-writing those properties.
 
 use crate::database::ConfigStore;
+use crate::display::DisplayController;
+use crate::WeatherSnapshot;
 use chrono::{DateTime, Local, Timelike};
 use rusqlite::Connection;
 use std::sync::{Arc, Mutex};
@@ -195,6 +197,8 @@ pub struct ThemeController {
     shared: Arc<Mutex<Connection>>,
     active_theme: Theme,
     mode: Mode,
+    /// Reference to the DisplayController for Follow-Bedtime resolution (slice 4).
+    display: Option<Arc<Mutex<DisplayController>>>,
 }
 
 impl ThemeController {
@@ -204,9 +208,63 @@ impl ThemeController {
             shared,
             active_theme: liquid_glass_theme(),
             mode: Mode::default(),
+            display: None,
         };
         this.load();
         this
+    }
+
+    /// Map WMO weather code to a short text label (emoji fonts are not
+    /// available on the Pi's minimal font set, so we use plain text).
+    fn wmo_code_to_icon(wmo_code: i32) -> String {
+        match wmo_code {
+            0 => "Clear".to_string(),
+            1 => "Mainly Clear".to_string(),
+            2 => "Partly Cloudy".to_string(),
+            3 => "Cloudy".to_string(),
+            45 | 48 => "Fog".to_string(),
+            51 | 53 | 55 => "Drizzle".to_string(),
+            56 | 57 => "Freezing Drizzle".to_string(),
+            61 | 63 | 65 => "Rain".to_string(),
+            66 | 67 => "Freezing Rain".to_string(),
+            71 | 73 | 75 => "Snow".to_string(),
+            77 => "Snow Grains".to_string(),
+            80 | 81 | 82 => "Showers".to_string(),
+            85 | 86 => "Snow Showers".to_string(),
+            95 => "Thunderstorm".to_string(),
+            96 | 99 => "Thunderstorm + Hail".to_string(),
+            _ => "Clear".to_string(),
+        }
+    }
+
+    /// Push weather data to the ThemeGlobal
+    pub fn push_weather(&self, window: &AppWindow, weather_available: bool, weather_data: Option<WeatherSnapshot>) {
+        let global = window.global::<ThemeGlobal>();
+        global.set_weather_available(weather_available);
+        
+        if let Some(snapshot) = weather_data {
+            // Set the weather data properties
+            global.set_weather_temp(snapshot.current_temp.to_string().into());
+            global.set_weather_high(snapshot.today_high.to_string().into());
+            global.set_weather_low(snapshot.today_low.to_string().into());
+            global.set_weather_tomorrow_high(snapshot.tomorrow_high.to_string().into());
+            global.set_weather_tomorrow_low(snapshot.tomorrow_low.to_string().into());
+            global.set_weather_wind(snapshot.wind_speed.to_string().into());
+            global.set_weather_humidity(snapshot.humidity.to_string().into());
+            global.set_weather_wmo_code(snapshot.wmo_code);
+            global.set_weather_icon(Self::wmo_code_to_icon(snapshot.wmo_code).into());
+            
+            // Push the first frame of the animated icon.
+            if let Some(first_frame) = crate::weather_icons::get_icon_first_frame(snapshot.wmo_code) {
+                global.set_weather_icon_image(first_frame);
+            }
+        }
+    }
+
+    /// Attach a `DisplayController` for Follow-Bedtime resolution.
+    pub fn with_display(mut self, display: Arc<Mutex<DisplayController>>) -> Self {
+        self.display = Some(display);
+        self
     }
 
     /// Current theme name.
@@ -271,10 +329,19 @@ impl ThemeController {
         match self.mode {
             Mode::ManualLight => false,
             Mode::ManualDark => true,
-            // Slice-4 will replace this with a real DisplayController lookup.
             Mode::FollowBedtime => {
-                let hour = now.hour();
-                hour >= 22 || hour < 6
+                // Use DisplayController for precise bedtime window resolution.
+                if let Some(ref dc) = self.display {
+                    if let Ok(d) = dc.lock() {
+                        d.is_bedtime(now)
+                    } else {
+                        let hour = now.hour();
+                        hour >= 22 || hour < 6
+                    }
+                } else {
+                    let hour = now.hour();
+                    hour >= 22 || hour < 6
+                }
             }
         }
     }

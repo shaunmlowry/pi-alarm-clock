@@ -28,6 +28,20 @@ export global ThemeGlobal {
     in-out property <string> active-theme-name: "Liquid Glass";
     in-out property <string> active-mode-name: "Follow Bedtime";
 
+    // Weather data
+    in-out property <string> weather_icon: "";
+    in-out property <int> weather_wmo_code: 0;
+    in-out property <image> weather_icon_image;
+    in-out property <int> weather_frame_index: 0;
+    in-out property <string> weather_temp: "";
+    in-out property <string> weather_high: "";
+    in-out property <string> weather_low: "";
+    in-out property <string> weather_tomorrow_high: "";
+    in-out property <string> weather_tomorrow_low: "";
+    in-out property <string> weather_wind: "";
+    in-out property <string> weather_humidity: "";
+    in-out property <bool> weather_available: false;
+
     // Neuromorphic cards need a dual-extrusion shadow. This flag lets a
     // single `Card` component branch between the two rendering techniques.
     in-out property <bool> is-neuromorphic: false;

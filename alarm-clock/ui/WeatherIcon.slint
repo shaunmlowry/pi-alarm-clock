@@ -1,0 +1,21 @@
+// Weather icon display using pre-rendered animated Meteocons SVGs.
+//
+// The actual rasterized frames are pushed from Rust into
+// `ThemeGlobal.weather_icon_image`. This component simply displays that image,
+// sized to fit the card layout.
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+
+export component WeatherIcon inherits Rectangle {
+    in property <int> wmo-code: 0;
+    width: 48px;
+    height: 48px;
+
+    Image {
+        width: parent.width;
+        height: parent.height;
+        source: ThemeGlobal.weather_icon_image;
+        image-fit: contain;
+        visible: ThemeGlobal.weather_available;
+    }
+}
