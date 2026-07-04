@@ -1479,21 +1479,28 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     //
     // (removed — calibration is now handled via udev LIBINPUT_CALIBRATION_MATRIX)
 
-    // 1-second clock timer: compute hand angles and refresh the theme tokens.
+    // Clock timer: drives the analog hands. Fires at ~30 Hz so the second
+    // hand can sweep continuously (sub-second angle precision) instead of
+    // ticking once per second. The relatively expensive date text, theme
+    // token refresh, and weather snapshot push only change at whole-second
+    // granularity, so they are gated to run once per whole second.
     let clock_timer = slint::Timer::default();
     {
         let ctl = Arc::clone(&theme_controller);
         let weak = app_window.as_weak();
         let weather_store_ref = Arc::clone(&weather_store);
+        let mut last_second: i64 = -1;
         clock_timer.start(
             slint::TimerMode::Repeated,
-            Duration::from_secs(1),
+            Duration::from_millis(33),
             move || {
                 protected_tick(|| {
                     let now = Local::now();
                     let h = (now.hour() % 12) as f32;
                     let m = now.minute() as f32;
-                    let s = now.second() as f32;
+                    // Sub-second precision: include the nanoseconds within the
+                    // current second so the second hand glides smoothly.
+                    let s = (now.second() as f32) + (now.nanosecond() as f32) / 1_000_000_000.0;
 
                     let second_angle = s * 6.0;
                     let minute_angle = (m * 60.0 + s) * 0.1;
@@ -1504,23 +1511,31 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
                         global.set_hour_angle(hour_angle);
                         global.set_minute_angle(minute_angle);
                         global.set_second_angle(second_angle);
-                        global.set_clock_weekday(slint::SharedString::from(
-                            now.format("%A").to_string(),
-                        ));
-                        global.set_clock_date(slint::SharedString::from(
-                            now.format("%B %-d, %Y").to_string(),
-                        ));
 
-                        if let Ok(ctl) = ctl.lock() {
-                            ctl.push(&w);
-                            // Push weather data to the UI
-                            let (weather_available, weather_data) = if let Ok(ws) = weather_store_ref.lock() {
-                                let snapshot = ws.get_snapshot().cloned();
-                                (snapshot.is_some(), snapshot)
-                            } else {
-                                (false, None)
-                            };
-                            ctl.push_weather(&w, weather_available, weather_data);
+                        // Date text, theme tokens, and weather snapshot only
+                        // change at second (or coarser) granularity — refresh
+                        // them once per whole second, not every frame.
+                        let sec = now.second() as i64;
+                        if sec != last_second {
+                            last_second = sec;
+                            global.set_clock_weekday(slint::SharedString::from(
+                                now.format("%A").to_string(),
+                            ));
+                            global.set_clock_date(slint::SharedString::from(
+                                now.format("%B %-d, %Y").to_string(),
+                            ));
+
+                            if let Ok(ctl) = ctl.lock() {
+                                ctl.push(&w);
+                                // Push weather data to the UI
+                                let (weather_available, weather_data) = if let Ok(ws) = weather_store_ref.lock() {
+                                    let snapshot = ws.get_snapshot().cloned();
+                                    (snapshot.is_some(), snapshot)
+                                } else {
+                                    (false, None)
+                                };
+                                ctl.push_weather(&w, weather_available, weather_data);
+                            }
                         }
                     }
                 });
