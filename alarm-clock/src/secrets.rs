@@ -38,6 +38,12 @@ pub struct Secrets {
     /// without re-pairing. `None` until the user completes device-flow pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub google_refresh_token: Option<String>,
+
+    /// Web configuration bearer token (slice 8). Shared secret used by the
+    /// axum REST API and the SPA. `None` until the user initiates pairing on
+    /// the Pi touchscreen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_bearer_token: Option<String>,
 }
 
 impl Secrets {
@@ -127,6 +133,27 @@ impl Secrets {
         let had = self.google_refresh_token.is_some();
         if had {
             self.google_refresh_token = None;
+            self.save(path)?;
+        }
+        Ok(had)
+    }
+
+    /// Convenience: store the web bearer token, persisting immediately.
+    ///
+    /// # Main-thread only
+    pub fn set_web_bearer_token(&mut self, token: String, path: &Path) -> Result<()> {
+        self.web_bearer_token = Some(token);
+        self.save(path)
+    }
+
+    /// Convenience: clear the web bearer token (revoke & re-pair), persisting
+    /// immediately. Returns whether a token was present.
+    ///
+    /// # Main-thread only
+    pub fn clear_web_bearer_token(&mut self, path: &Path) -> Result<bool> {
+        let had = self.web_bearer_token.is_some();
+        if had {
+            self.web_bearer_token = None;
             self.save(path)?;
         }
         Ok(had)

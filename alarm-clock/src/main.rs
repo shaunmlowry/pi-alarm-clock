@@ -13,6 +13,7 @@ mod calendar;
 mod channel;
 mod config;
 mod database;
+mod display;
 mod error;
 mod episode;
 mod media;
@@ -20,10 +21,11 @@ mod qr;
 mod schedule;
 mod scheduler;
 mod secrets;
-mod display;
 mod seed;
 mod theme;
 mod weather_icons;
+mod web;
+mod web_config;
 
 /// Resolve bundled asset path to file:// URI at boot (slice 4a / D3).
 /// Converts "asset:beep.mp3" to "file:///path/to/assets/beep.mp3".
@@ -1917,6 +1919,9 @@ fn spawn_tokio_worker(
     mopidy_reply_tx: tokio_mpsc::Sender<mopidy_client::transport::JsonRpcMessage>,
     weather_cfg: Arc<crate::config::WeatherConfig>,
     calendar_cfg: Arc<crate::config::CalendarConfig>,
+    web_sender: crate::web_config::WebCommandSender,
+    axum_bind_addr: std::net::SocketAddr,
+    tls_cert: Option<crate::web::tls::TlsCert>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("tokio-worker".into())
@@ -1956,9 +1961,41 @@ fn spawn_tokio_worker(
                     }}
                 }});
 
-// Run the command dispatcher with the live MopidyClient handle.
+                // Slice 8: start the embedded axum web config server over TLS.
+                let mut web_shutdown = None;
+                if let Some(tls_cert) = tls_cert {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    web_shutdown = Some(tx);
+                    tokio::spawn(async move {
+                        if let Err(e) = crate::web_config::serve_axum(axum_bind_addr, web_sender, tls_cert, rx).await {
+                            warn!(error = %e, "axum web server exited with error");
+                        }
+                    });
+                    info!(addr = %axum_bind_addr, "axum web server started over TLS");
+                } else {
+                    info!("TLS certificate unavailable — axum web server not started");
+                }
+
+                // Slice 8: advertise `alarm.local` over mDNS.
+                let _mdns = match crate::web::mdns::advertise_alarm_local(axum_bind_addr.port()) {
+                    Ok(daemon) => {
+                        info!("mDNS advertisement started for alarm.local");
+                        Some(daemon)
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "failed to start mDNS advertisement");
+                        None
+                    }
+                };
+
+                // Run the command dispatcher with the live MopidyClient handle.
                 let result = command_dispatcher(cmd_rx, reply_tx, client, weather_cfg, calendar_cfg).await;
                 info!(result = ?result, "tokio command dispatcher exited");
+
+                // Signal the web server to shut down gracefully.
+                if let Some(tx) = web_shutdown {
+                    let _ = tx.send(());
+                }
             }});
 
             info!("tokio worker thread shutting down");
@@ -2026,6 +2063,24 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     let weather_cfg = Arc::new(cfg.weather.clone());
     let calendar_cfg = Arc::new(cfg.calendar.clone());
 
+    // Slice 8: web config channel (tokio → main) and TLS certificate.
+    let (web_sender, mut web_cmd_rx) = crate::web_config::create_web_channels();
+    let axum_bind_addr: std::net::SocketAddr = cfg
+        .axum_bind_addr
+        .parse()
+        .expect("invalid axum_bind_addr in config");
+    let web_port = axum_bind_addr.port();
+    let tls_cert = match crate::web::tls::TlsCert::ensure(std::path::Path::new(&cfg.data_dir)) {
+        Ok(cert) => {
+            info!(fingerprint = %cert.fingerprint(), "TLS certificate ready");
+            Some(cert)
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to load/generate TLS certificate");
+            None
+        }
+    };
+
     // Spawn tokio worker on a dedicated thread (task 2.2).
     let worker_handle = spawn_tokio_worker(
         tokio_handles.cmd_receiver,
@@ -2035,6 +2090,9 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         mopidy_reply_tx,
         Arc::clone(&weather_cfg),
         Arc::clone(&calendar_cfg),
+        web_sender,
+        axum_bind_addr,
+        tls_cert.clone(),
     );
 
     info!("tokio worker thread spawned successfully");
@@ -2729,9 +2787,12 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // so calendar fetch / device-flow replies can be routed on main.
     let calendar_state_for_drain = Arc::clone(&calendar_state);
     let secrets_for_drain = Arc::clone(&secrets);
+    let secrets_path_for_drain = cfg.calendar.secrets_path.clone();
     let calendar_cfg_for_drain = Arc::clone(&calendar_cfg);
     let media_state_for_drain = Arc::clone(&media_state);
     let ui_weak_for_drain = app_window.as_weak();
+    let tls_cert_for_drain = tls_cert.clone();
+    let web_port_for_drain = web_port;
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
@@ -2761,6 +2822,19 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
             // Drain Mopidy event channel (non-blocking).
             while let Ok(event) = event_rx.try_recv() {
                 dispatch_event_to_domain(event);
+            }
+
+            // Slice 8: drain web config commands (non-blocking).
+            while let Ok(cmd) = web_cmd_rx.try_recv() {
+                dispatch_web_cmd(
+                    cmd,
+                    &conn_for_drain,
+                    &secrets_for_drain,
+                    &secrets_path_for_drain,
+                    tls_cert_for_drain.as_ref().map(|c| c.fingerprint()).unwrap_or_default(),
+                    web_port_for_drain,
+                    &ui_weak_for_drain,
+                );
             }
 
             // Task 7.2: reflect the episode FSM state into the UI. When the
@@ -3292,6 +3366,150 @@ fn dispatch_reply_to_domain(
     }
 }
 
+/// Dispatch a [`WebCmd`] from the tokio web server to the domain.
+///
+/// Runs on main via the drain timer callback. This is where the web server's
+/// config operations are fulfilled: main owns the SQLite connection and
+/// `secrets.json`, so all DB and secret mutations happen here.
+///
+/// Slice 8: `Pair` and `Revoke` rotate the bearer token persisted in
+/// `secrets.json` and update the Pi's pairing QR. Other variants are
+/// acknowledged with an unimplemented error so the oneshot channel does not
+/// hang.
+fn dispatch_web_cmd(
+    cmd: crate::web_config::WebCmd,
+    conn: &SharedConnection,
+    secrets: &Arc<Mutex<crate::secrets::Secrets>>,
+    secrets_path: &str,
+    fingerprint: String,
+    web_port: u16,
+    ui_weak: &slint::Weak<AppWindow>,
+) {
+    use crate::web_config::{WebCmd, WebReply};
+    let path = std::path::Path::new(secrets_path);
+
+    match cmd {
+        WebCmd::Pair { reply } => {
+            let token = crate::web_config::generate_bearer_token();
+            let saved = secrets
+                .lock()
+                .ok()
+                .and_then(|mut s| s.set_web_bearer_token(token.clone(), path).ok())
+                .is_some();
+            if saved {
+                let url = crate::web_config::pairing_url("alarm.local", web_port, &token, &fingerprint);
+                let ip_url = crate::web_config::ip_pairing_url(web_port, &token, &fingerprint);
+                info!(url = %url, ip_url = ?ip_url, "web pairing initiated");
+                if let Some(img) = crate::qr::render_qr_image(&url) {
+                    if let Some(w) = ui_weak.upgrade() {
+                        let global = w.global::<crate::ThemeGlobal>();
+                        global.set_web_pairing_qr_image(img);
+                        global.set_web_pairing_url(url.into());
+                        if let Some(ip_url) = ip_url {
+                            global.set_web_pairing_ip_url(ip_url.into());
+                        }
+                        global.set_web_pairing_in_progress(true);
+                    }
+                }
+                let _ = reply.send(WebReply::PairSuccess { bearer_token: token, fingerprint });
+            } else {
+                let _ = reply.send(WebReply::Error {
+                    message: "failed to save bearer token".to_string(),
+                });
+            }
+        }
+        WebCmd::Revoke { reply } => {
+            let cleared = secrets
+                .lock()
+                .ok()
+                .and_then(|mut s| s.clear_web_bearer_token(path).ok())
+                .unwrap_or(false);
+            if cleared {
+                info!("web pairing revoked");
+                if let Some(w) = ui_weak.upgrade() {
+                    let global = w.global::<crate::ThemeGlobal>();
+                    global.set_web_pairing_in_progress(false);
+                }
+                let _ = reply.send(WebReply::Success);
+            } else {
+                let _ = reply.send(WebReply::Error {
+                    message: "no active web pairing to revoke".to_string(),
+                });
+            }
+        }
+        WebCmd::ListAlarms { reply } => {
+            let alarms = conn.lock().ok().and_then(|g| {
+                crate::alarm_store::AlarmStore::new(&*g).list().ok()
+            }).unwrap_or_default();
+            let _ = reply.send(WebReply::Alarms { alarms });
+        }
+        WebCmd::UpsertAlarm { alarm, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::alarm_store::AlarmStore::new(&*g).upsert(&alarm).ok()
+            }).is_some();
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "upsert alarm failed".into() } });
+        }
+        WebCmd::DeleteAlarm { alarm_id, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::alarm_store::AlarmStore::new(&*g).delete(&alarm_id).ok()
+            }).unwrap_or(false);
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "delete alarm failed".into() } });
+        }
+        WebCmd::ListFavorites { reply } => {
+            let favorites = conn.lock().ok().and_then(|g| {
+                crate::media::FavoriteStore::new(&*g).list().ok()
+            }).unwrap_or_default();
+            let _ = reply.send(WebReply::Favorites { favorites });
+        }
+        WebCmd::UpsertFavorite { favorite, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::media::FavoriteStore::new(&*g).upsert(&favorite).ok()
+            }).is_some();
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "upsert favorite failed".into() } });
+        }
+        WebCmd::DeleteFavorite { favorite_id, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::media::FavoriteStore::new(&*g).delete(&favorite_id).ok()
+            }).is_some();
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "delete favorite failed".into() } });
+        }
+        WebCmd::ListCalendars { reply } => {
+            let calendars = conn.lock().ok().and_then(|g| {
+                crate::alarm_store::CalendarStore::new(&*g).list().ok()
+            }).unwrap_or_default();
+            let _ = reply.send(WebReply::Calendars { calendars });
+        }
+        WebCmd::SetWeatherCity { city, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::database::ConfigStore::new(&*g).set("weather_city", &city).ok()
+            }).is_some();
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "set weather city failed".into() } });
+        }
+        WebCmd::SetBedtime { config, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::database::ConfigStore::new(&*g).set("bedtime_config", &config.to_json()).ok()
+            }).is_some();
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "set bedtime failed".into() } });
+        }
+        WebCmd::SetTheme { theme, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::database::ConfigStore::new(&*g).set("theme_name", &theme).ok()
+            }).is_some();
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "set theme failed".into() } });
+        }
+        WebCmd::SetDisplay { brightness_floor, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::database::ConfigStore::new(&*g).set("brightness_floor", &brightness_floor.to_string()).ok()
+            }).is_some();
+            let _ = reply.send(if ok { WebReply::Success } else { WebReply::Error { message: "set display failed".into() } });
+        }
+        WebCmd::GetToken { reply } => {
+            let token = secrets.lock().ok().and_then(|s| s.web_bearer_token.clone());
+            let _ = reply.send(WebReply::Token { bearer_token: token });
+        }
+    }
+}
+
 /// Slice 6 (task 6.2): persist a slice of [`CalendarSource`] rows to the
 /// `calendars` table and update the UI's configured-calendar count.
 fn seed_calendars(
@@ -3803,6 +4021,7 @@ mod tests {
             tokio_mpsc::channel::<mopidy_client::MopidyEvent>(16);
         let (test_reply_tx, _test_reply_rx) =
             tokio_mpsc::channel::<mopidy_client::transport::JsonRpcMessage>(16);
+        let (web_sender, _web_cmd_rx) = crate::web_config::create_web_channels();
         let _worker_handle = spawn_tokio_worker(
             handles.tokio.cmd_receiver,
             handles.tokio.reply_sender,
@@ -3811,6 +4030,9 @@ mod tests {
             test_reply_tx,
             Arc::new(crate::config::WeatherConfig::default()),
             Arc::new(crate::config::CalendarConfig::default()),
+            web_sender,
+            "127.0.0.1:0".parse().unwrap(),
+            None,
         );
 
         // Give the worker thread a moment to start its recv loop.

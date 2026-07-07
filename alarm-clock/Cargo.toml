@@ -6,25 +6,35 @@ edition.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 chrono.workspace = true
 chrono-tz.workspace = true
+mdns-sd = "0.13"
 mopidy-client = { path = "../mopidy-client" }
 qrcode = "0.14"
+rand = "0.8"
+rcgen = "0.12"
 reqwest = { version = "0.11", features = ["json"] }
 resvg = "0.47"
-usvg = "0.47"
-tiny-skia = "0.12"
+ring = "0.17"
 rrule.workspace = true
 rusqlite.workspace = true
+rustls = "0.23"
+rustls-pemfile = "2"
 serde.workspace = true
 serde_json.workspace = true
 slint = { workspace = true, features = ["backend-linuxkms-noseat"] }
 thiserror.workspace = true
-tokio = { workspace = true, features = ["signal"] }
+tiny-skia = "0.12"
+tokio = { workspace = true, features = ["signal", "sync", "net", "io-util"] }
+tokio-rustls = "0.26"
 toml.workspace = true
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
 tracing.workspace = true
 tracing-journald.workspace = true
 tracing-subscriber.workspace = true
+usvg = "0.47"
 
 [build-dependencies]
 slint-build = "1.17"

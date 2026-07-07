@@ -64,6 +64,12 @@ export global ThemeGlobal {
     in-out property <bool> pairing_in_progress: false;
     in-out property <int> configured_calendars_count: 0;
 
+    // Web config pairing (slice 8): QR + URL shown on the Pi touchscreen.
+    in-out property <string> web_pairing_url: "";
+    in-out property <string> web_pairing_ip_url: "";
+    in-out property <image> web_pairing_qr_image;
+    in-out property <bool> web_pairing_in_progress: false;
+
     // Neuromorphic cards need a dual-extrusion shadow. This flag lets a
     // single `Card` component branch between the two rendering techniques.
     in-out property <bool> is-neuromorphic: false;
