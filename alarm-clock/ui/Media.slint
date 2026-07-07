@@ -1,0 +1,14 @@
+// Shared media data structs (slice 7). Exported so the Slint compiler
+// generates matching Rust types for `slint::include_modules!()`.
+
+export struct FavoriteItem {
+    id: string,
+    name: string,
+    // "File" | "Spotify" | "Radio" | "PodcastFeed"
+    source-type: string,
+}
+
+export struct FeedEpisodeItem {
+    uri: string,
+    name: string,
+}

@@ -61,6 +61,59 @@ pub enum Cmd {
     /// resolved lat/lon/name is returned as [`Reply::GeocodeResult`] so main
     /// can persist it and trigger a weather refresh.
     GeocodeCity { city: String },
+
+    /// Fetch Google Calendar events for a set of configured [`CalendarSource`]s
+    /// (slice 6). Runs on the tokio worker; the result is returned as
+    /// [`Reply::CalendarEvents`]. Main splits the returned events by role into
+    /// the `HolidayStore` and `AgendaStore`.
+    FetchCalendarEvents {
+        refresh_token: String,
+        client_id: String,
+        client_secret: String,
+        oauth_token_url: String,
+        calendar_api_url: String,
+        calendars: Vec<crate::alarm_store::CalendarSource>,
+        time_min: chrono::DateTime<chrono::Utc>,
+        time_max: chrono::DateTime<chrono::Utc>,
+    },
+
+    /// List the user's Google calendars (slice 6). Used by the post-pairing
+    /// convenience to auto-add `primary` (Agenda) and the Canadian holidays
+    /// calendar (Holiday) to the `calendars` table. The reply is
+    /// [`Reply::CalendarList`].
+    ListCalendars {
+        refresh_token: String,
+        client_id: String,
+        client_secret: String,
+        oauth_token_url: String,
+        calendar_api_url: String,
+    },
+
+    /// Start Google OAuth2 device-flow pairing on the Pi (slice 6). The worker
+    /// requests a device code and polls until consent or expiry; the result is
+    /// returned as [`Reply::DeviceFlowResult`] so main can persist the refresh
+    /// token in `secrets.json`.
+    PairDeviceFlow {
+        client_id: String,
+        client_secret: String,
+        oauth_device_url: String,
+        oauth_token_url: String,
+    },
+
+    /// Browse a podcast feed via Mopidy's `library.browse` (slice 7 / D2). The
+    /// worker calls `library.browse(feed_uri)` and returns the most-recent 5
+    /// episodes as [`Reply::FeedBrowse`]. Degrades to an empty list if the
+    /// podcast backend is uninstalled.
+    BrowseFeed { feed_uri: String },
+
+    /// Play a Mopidy URI immediately (slice 7). The worker sequences
+    /// `tracklist.clear` → `tracklist.add(uris=[uri])` → a short settle for
+    /// the backend to resolve the stream → `playback.play(tlid=<added>)`.
+    /// This avoids the race where `playback.play` fired immediately after
+    /// `tracklist.add` no-ops because the TuneIn/Spotify backend hasn't
+    /// resolved the stream URL yet (verified against live Mopidy: immediate
+    /// play → stopped; 1 s settle → playing).
+    PlayUri { uri: String },
 }
 
 /// Replies sent from the tokio worker back to main.
@@ -89,6 +142,31 @@ pub enum Reply {
     /// success or an error string on failure. Main persists the result and
     /// triggers a weather refresh.
     GeocodeResult(Result<(f64, f64, String), String>),
+
+    /// Calendar fetch result (slice 6). Carries per-role event lists on
+    /// success or an error string on failure. On a 401 (refresh token
+    /// revoked/expired) the error string begins with `unauthorized:` so main
+    /// can clear the token and re-prompt device flow (task 2.3).
+    CalendarEvents(Result<crate::calendar::CalendarFetchResult, String>),
+
+    /// Calendar list result (slice 6). Carries the `(google_calendar_id,
+    /// summary)` pairs of the user's calendars on success or an error string
+    /// on failure.
+    CalendarList(Result<Vec<(String, String)>, String>),
+
+    /// Device-flow pairing result (slice 6). Carries the refresh token on
+    /// success or an error string on failure (e.g. `expired`, `access_denied`).
+    DeviceFlowResult(Result<String, String>),
+
+    /// Device-flow device code (slice 6). Emitted by the worker *before* it
+    /// starts polling, so main can display the QR + user code on the Pi. The
+    /// final outcome arrives later as [`Reply::DeviceFlowResult`].
+    DeviceCode(crate::calendar::DeviceCode),
+
+    /// Podcast feed browse result (slice 7 / D2). Carries the most-recent 5
+    /// episodes (or fewer) on success; an empty list signals an uninstalled
+    /// backend or empty feed (graceful degrade).
+    FeedBrowse(Vec<crate::media::FeedEpisode>),
 }
 
 // ── Channel handles ───────────────────────────────────────────────────────────
@@ -217,7 +295,7 @@ mod tests {
     fn cmd_variants_compile() {
         let _s1 = Cmd::GetMopidyState;
         let _s2 = Cmd::CallMopidy {
-            method: "core.get_state".into(),
+            method: "core.playback.get_state".into(),
             params: Value::Null,
         };
         let _s3 = Cmd::Shutdown;

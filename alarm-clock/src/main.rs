@@ -9,13 +9,17 @@
 //! dispatching them to the domain without ever sleeping main.
 
 mod alarm_store;
+mod calendar;
 mod channel;
 mod config;
 mod database;
 mod error;
 mod episode;
+mod media;
+mod qr;
 mod schedule;
 mod scheduler;
+mod secrets;
 mod display;
 mod seed;
 mod theme;
@@ -252,6 +256,198 @@ impl Default for WeatherStore {
 /// Steady-state weather refresh interval (30 minutes).
 const WEATHER_STEADY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
+// ── Calendar state (slice 6) ─────────────────────────────────────────────────
+
+/// Steady-state calendar refresh interval (30 minutes, shared with weather
+/// per the slice-6 design — joins slice 5's `RefreshTick`).
+const CALENDAR_STEADY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Main-thread calendar coordination state (slice 6). Holds the holiday and
+/// agenda stores plus the refresh backoff / in-flight flags, mirroring
+/// [`WeatherStore`].
+///
+/// - `HolidayStore` feeds the scheduler's `HolidayLookup` (O(1) date lookup).
+/// - `AgendaStore` feeds the Daily-data panel agenda card (cap 4, past dimmed).
+/// - On a 401 (`unauthorized:` error), the refresh token is cleared and
+///   `re_pair_needed` is set so the Settings panel can re-prompt device flow.
+pub struct CalendarState {
+    /// Holiday dates for scheduler suppression (design D3).
+    pub holidays: crate::calendar::HolidayStore,
+    /// Today's agenda (design D4).
+    pub agenda: crate::calendar::AgendaStore,
+    /// True while a `Cmd::FetchCalendarEvents` is in flight.
+    fetch_in_flight: bool,
+    /// True while a `Cmd::PairDeviceFlow` is in flight.
+    pairing_in_flight: bool,
+    /// True when the refresh token is missing/revoked and the user must
+    /// re-pair via device flow on the Pi (task 2.3).
+    pub re_pair_needed: bool,
+    /// Consecutive fetch failures (exponential backoff).
+    failure_count: u32,
+    /// Next retry time during a backoff window.
+    next_retry: Option<std::time::Instant>,
+    /// When the last successful fetch completed (drives the 30-min cadence).
+    last_success: Option<std::time::Instant>,
+    /// Last device-flow pairing URL+user_code to display (for the QR card).
+    pub pairing_display: Option<(String, String)>,
+}
+
+impl Default for CalendarState {
+    fn default() -> Self {
+        Self {
+            holidays: crate::calendar::HolidayStore::new(),
+            agenda: crate::calendar::AgendaStore::new(),
+            fetch_in_flight: false,
+            pairing_in_flight: false,
+            re_pair_needed: false,
+            failure_count: 0,
+            next_retry: None,
+            last_success: None,
+            pairing_display: None,
+        }
+    }
+}
+
+/// Main-thread media coordination state (slice 7). Mirrors the
+/// [`WeatherStore`] / [`CalendarState`] pattern. Holds the favorites list,
+/// the most-recently-browsed feed episodes, the now-playing card, transport
+/// caps derived from the active source, and the quick-controls overlay
+/// visibility / slider values.
+pub struct MediaState {
+    /// Cached favorites (re-read from the DB on demand by the media panel).
+    pub favorites: Vec<crate::media::Favorite>,
+    /// Most-recent feed browse reply (≤5 episodes on the Pi).
+    pub feed_episodes: Vec<crate::media::FeedEpisode>,
+    /// Id of the expanded podcast favorite, if any.
+    pub expanded_feed_id: Option<String>,
+    /// Now-playing card text (track / artist / stream name).
+    pub now_playing: Option<(String, String)>,
+    /// True while Mopidy reports playback is actively playing (drives the
+    /// play/pause glyph). Reconciled from `Reply::MopidyState`.
+    pub media_playing: bool,
+    /// True while a `Cmd::PlayUri` is in flight and Mopidy hasn't yet
+    /// reported `playing` (drives a spinner in place of the transport glyph).
+    /// Cleared when `Reply::MopidyState` reports `playing`/`paused`, or by
+    /// a 15 s safety timeout in `push_media_to_ui`.
+    pub buffering: bool,
+    /// Deadline for the buffering safety timeout.
+    pub buffering_deadline: Option<std::time::Instant>,
+    /// Transport capabilities for the active source.
+    pub caps: crate::media::TransportCaps,
+    /// Quick-controls overlay visible.
+    pub overlay_visible: bool,
+    /// Overlay idle-dismiss deadline (5 s from last interaction).
+    pub overlay_idle_deadline: Option<std::time::Instant>,
+}
+
+impl Default for MediaState {
+    fn default() -> Self {
+        Self {
+            favorites: Vec::new(),
+            feed_episodes: Vec::new(),
+            expanded_feed_id: None,
+            now_playing: None,
+            media_playing: false,
+            buffering: false,
+            buffering_deadline: None,
+            caps: crate::media::TransportCaps::default(),
+            overlay_visible: false,
+            overlay_idle_deadline: None,
+        }
+    }
+}
+
+impl MediaState {
+    pub fn set_feed_episodes(&mut self, episodes: Vec<crate::media::FeedEpisode>) {
+        self.feed_episodes = episodes;
+    }
+}
+
+/// `HolidayLookup` adapter over the live [`CalendarState`] (slice 6).
+/// The scheduler consults this on each due alarm; it locks the calendar
+/// state and checks the holiday set (O(1)).
+#[derive(Clone)]
+pub struct CalendarHolidayLookup {
+    state: Arc<Mutex<CalendarState>>,
+}
+
+impl CalendarHolidayLookup {
+    pub fn new(state: Arc<Mutex<CalendarState>>) -> Self {
+        Self { state }
+    }
+}
+
+impl crate::scheduler::HolidayLookup for CalendarHolidayLookup {
+    fn is_holiday(&self, date: chrono::NaiveDate) -> bool {
+        match self.state.lock() {
+            Ok(s) => s.holidays.is_holiday(date),
+            Err(_) => false, // poisoned — never suppress on a poison
+        }
+    }
+}
+
+impl CalendarState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mark_fetch_in_flight(&mut self) {
+        self.fetch_in_flight = true;
+    }
+    pub fn clear_fetch_in_flight(&mut self) {
+        self.fetch_in_flight = false;
+    }
+    pub fn fetch_in_flight(&self) -> bool {
+        self.fetch_in_flight
+    }
+    pub fn mark_pairing_in_flight(&mut self) {
+        self.pairing_in_flight = true;
+    }
+    pub fn clear_pairing_in_flight(&mut self) {
+        self.pairing_in_flight = false;
+    }
+    pub fn pairing_in_flight(&self) -> bool {
+        self.pairing_in_flight
+    }
+
+    pub fn record_success(&mut self) {
+        self.failure_count = 0;
+        self.next_retry = None;
+        self.last_success = Some(std::time::Instant::now());
+        self.fetch_in_flight = false;
+        self.re_pair_needed = false;
+    }
+    pub fn handle_failure(&mut self) {
+        self.failure_count += 1;
+        let delay_secs =
+            std::cmp::min(60 * (1 << (self.failure_count - 1)), 60 * 16);
+        self.next_retry =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(delay_secs));
+        self.fetch_in_flight = false;
+    }
+    pub fn in_backoff(&self) -> bool {
+        match self.next_retry {
+            Some(t) => std::time::Instant::now() < t,
+            None => false,
+        }
+    }
+    pub fn is_retry_due(&self) -> bool {
+        match self.next_retry {
+            Some(t) => std::time::Instant::now() >= t,
+            None => false,
+        }
+    }
+    pub fn is_steady_due(&self) -> bool {
+        if self.in_backoff() || self.is_retry_due() {
+            return false;
+        }
+        match self.last_success {
+            None => true,
+            Some(t) => t.elapsed() >= CALENDAR_STEADY_INTERVAL,
+        }
+    }
+}
+
 /// The persisted weather location, read from the config store.
 ///
 /// `Known` when both `weather_lat` and `weather_lon` are present and
@@ -294,6 +490,90 @@ fn read_weather_location(conn: &Arc<std::sync::Mutex<Connection>>) -> LocationSt
     match (lat_opt, lon_opt) {
         (Some(lat), Some(lon)) => LocationState::Known { lat, lon },
         _ => LocationState::Unknown { city },
+    }
+}
+
+/// Decide whether a calendar refresh is due (slice 6) and, if so, dispatch
+/// `Cmd::FetchCalendarEvents` on the tokio worker. Joins the shared 30-min
+/// `RefreshTick` (slice 5) — the weather scheduler timer calls this on the
+/// same 30 s polling granularity.
+///
+/// Reads the configured `CalendarSource` list from SQLite (main-thread
+/// `&Connection`) and the refresh token from `secrets.json`. If either is
+/// missing, the fetch is skipped (no calendars configured, or not yet paired).
+/// On a dispatch, the fetch-in-flight flag is set; the drain timer clears it
+/// when the `Reply::CalendarEvents` arrives.
+fn maybe_dispatch_calendar_fetch(
+    cmd_tx: &mpsc::Sender<Cmd>,
+    conn: &SharedConnection,
+    calendar_cfg: &crate::config::CalendarConfig,
+    secrets: &Arc<Mutex<crate::secrets::Secrets>>,
+    state: &Arc<Mutex<CalendarState>>,
+) {
+    // Refuse to dispatch if a fetch or pairing is already in flight.
+    if state.lock().map(|s| s.fetch_in_flight() || s.pairing_in_flight()).unwrap_or(false) {
+        return;
+    }
+    // Only dispatch when a fetch is actually due (steady cadence or retry).
+    let due = state.lock().map(|s| s.is_steady_due() || s.is_retry_due()).unwrap_or(false);
+    if !due {
+        return;
+    }
+
+    // Read the refresh token from the in-memory secrets (loaded once at boot,
+    // updated on the main thread).
+    let refresh_token = match secrets.lock() {
+        Ok(g) => g.google_refresh_token.clone(),
+        Err(_) => return,
+    };
+    let refresh_token = match refresh_token {
+        Some(t) => t,
+        None => {
+            // Not paired — set the re-pair flag so the Settings panel can prompt.
+            if let Ok(mut s) = state.lock() {
+                s.re_pair_needed = true;
+            }
+            return;
+        }
+    };
+    let (client_id, client_secret) = match (&calendar_cfg.client_id, &calendar_cfg.client_secret) {
+        (Some(id), Some(sec)) => (id.clone(), sec.clone()),
+        _ => return, // calendar disabled (no OAuth creds configured)
+    };
+
+    // Read the configured CalendarSource list from SQLite.
+    let calendars = match conn.lock() {
+        Ok(g) => crate::alarm_store::CalendarStore::new(&*g).list().unwrap_or_default(),
+        Err(_) => return,
+    };
+    if calendars.is_empty() {
+        return;
+    }
+
+    // Fetch a ~2-day window around now: today + tomorrow (agenda + holidays).
+    let now = Utc::now();
+    let time_min = now - chrono::Duration::hours(6);
+    let time_max = now + chrono::Duration::days(2);
+
+    match cmd_tx.try_send(Cmd::FetchCalendarEvents {
+        refresh_token,
+        client_id,
+        client_secret,
+        oauth_token_url: calendar_cfg.oauth_token_url.clone(),
+        calendar_api_url: calendar_cfg.calendar_api_url.clone(),
+        calendars,
+        time_min,
+        time_max,
+    }) {
+        Ok(()) => {
+            if let Ok(mut s) = state.lock() {
+                s.mark_fetch_in_flight();
+            }
+            info!("calendar: dispatched FetchCalendarEvents");
+        }
+        Err(e) => {
+            warn!(error = %e, "calendar: could not dispatch FetchCalendarEvents");
+        }
     }
 }
 
@@ -822,7 +1102,12 @@ impl AlarmSource for StoreAlarmSource {
                 }
             };
             if nf_dt <= now {
-                due.push(DueAlarm { id: alarm.id, next_fire: nf_dt });
+                due.push(DueAlarm {
+                    id: alarm.id,
+                    next_fire: nf_dt,
+                    policy: alarm.holiday_policy,
+                    timezone: alarm.timezone.clone(),
+                });
             }
         }
         due
@@ -840,6 +1125,26 @@ impl AlarmSource for StoreAlarmSource {
         let now_utc = now.with_timezone(&Utc);
         if let Err(e) = store.recompute_next_fires(now_utc) {
             error!(error = %e, "failed to recompute next_fire caches");
+        }
+    }
+
+    fn set_next_fire(
+        &mut self,
+        id: crate::scheduler::AlarmId,
+        target: DateTime<Local>,
+        _now: DateTime<Local>,
+    ) {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(e) => {
+                error!(error = %e, "alarm DB mutex poisoned — skipping set_next_fire");
+                return;
+            }
+        };
+        let store = AlarmStore::new(&*conn);
+        let target_utc = target.with_timezone(&Utc);
+        if let Err(e) = store.set_next_fire(&id, target_utc) {
+            error!(error = %e, "failed to override next_fire for alarm {}", id);
         }
     }
 }
@@ -939,6 +1244,8 @@ pub struct AppTimers {
     _clock: slint::Timer,
     _weather: slint::Timer,
     _icon: slint::Timer,
+    _spinner: slint::Timer,
+    _marquee: slint::Timer,
 }
 
 // ── Observability (tracing → journald / fmt fallback) ────────────────────────
@@ -989,6 +1296,7 @@ pub async fn command_dispatcher(
     reply_tx: mpsc::Sender<Reply>,
     client: MopidyClient,
     weather_cfg: Arc<crate::config::WeatherConfig>,
+    calendar_cfg: Arc<crate::config::CalendarConfig>,
 ) -> CmdLoopResult {
     // Set up signal listeners for SIGTERM (systemd stop) and SIGINT (Ctrl+C).
     let mut sigterm = unix_signal(SignalKind::terminate())
@@ -1014,7 +1322,10 @@ pub async fn command_dispatcher(
                     Cmd::GetMopidyState => {
                         info!(action = "GetMopidyState", "command received");
                         if client.is_connected() {
-                            match client.send_and_await("core.get_state", None).await {
+                            // Mopidy's playback state is `core.playback.get_state`
+                            // (NOT `core.get_state` — that returns -32601
+                            // "No object found at 'core'").
+                            match client.send_and_await("core.playback.get_state", None).await {
                                 Ok(res) => {
                                     let state = res
                                         .result
@@ -1136,6 +1447,309 @@ pub async fn command_dispatcher(
                         };
                         let _ = reply_tx.send(reply).await;
                     }
+                    // Slice 6: fetch Google Calendar events on the tokio worker.
+                    Cmd::FetchCalendarEvents {
+                        refresh_token,
+                        client_id,
+                        client_secret,
+                        oauth_token_url,
+                        calendar_api_url,
+                        calendars,
+                        time_min,
+                        time_max,
+                    } => {
+                        let _guard = info_span!(
+                            "calendar_fetch",
+                            calendars = calendars.len()
+                        )
+                        .entered();
+                        info!("FetchCalendarEvents command received");
+                        let http = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(15))
+                            .build()
+                            .map_err(|e| e.to_string());
+                        let result = match http {
+                            Ok(http) => match crate::calendar::fetch_calendar_events(
+                                http,
+                                refresh_token,
+                                client_id,
+                                client_secret,
+                                oauth_token_url,
+                                calendar_api_url,
+                                calendars,
+                                time_min,
+                                time_max,
+                            )
+                            .await
+                            {
+                                Ok(r) => {
+                                    info!(
+                                        holidays = r.holiday_dates.len(),
+                                        agenda = r.agenda_events.len(),
+                                        "calendar fetch successful"
+                                    );
+                                    Ok(r)
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "calendar fetch failed");
+                                    Err(e)
+                                }
+                            },
+                            Err(e) => {
+                                warn!(error = %e, "http client build failed");
+                                Err(e)
+                            }
+                        };
+                        let _ = reply_tx.send(Reply::CalendarEvents(result)).await;
+                    }
+                    // Slice 6: list the user's Google calendars (post-pairing
+                    // auto-seed convenience).
+                    Cmd::ListCalendars {
+                        refresh_token,
+                        client_id,
+                        client_secret,
+                        oauth_token_url,
+                        calendar_api_url,
+                    } => {
+                        let _guard = info_span!("calendar_list").entered();
+                        info!("ListCalendars command received");
+                        let http = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(15))
+                            .build();
+                        let result = match http {
+                            Ok(http) => {
+                                let client = crate::calendar::CalendarClient::new(
+                                    http,
+                                    calendar_api_url,
+                                    oauth_token_url,
+                                    client_id,
+                                    client_secret,
+                                    refresh_token,
+                                );
+                                match client.list_calendars().await {
+                                    Ok(list) => {
+                                        info!(count = list.len(), "calendar list successful");
+                                        Ok(list)
+                                    }
+                                    Err(e) => {
+                                        warn!(error = ?e, "calendar list failed");
+                                        Err(format!("{:?}", e))
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "http client build failed");
+                                Err(e.to_string())
+                            }
+                        };
+                        let _ = reply_tx.send(Reply::CalendarList(result)).await;
+                    }
+                    // Slice 6: run Google OAuth2 device-flow pairing on the
+                    // tokio worker and return the refresh token.
+                    Cmd::PairDeviceFlow {
+                        client_id,
+                        client_secret,
+                        oauth_device_url,
+                        oauth_token_url,
+                    } => {
+                        let _guard = info_span!("device_flow").entered();
+                        info!("PairDeviceFlow command received");
+                        let http = reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(15))
+                            .build();
+                        let result = match http {
+                            Ok(http) => {
+                                // Step 1: request the device code and surface it
+                                // to main so the QR can be displayed.
+                                let device = match crate::calendar::request_device_code(
+                                    &http,
+                                    &oauth_device_url,
+                                    &client_id,
+                                )
+                                .await
+                                {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        warn!(error = %e, "device-code request failed");
+                                        let _ = reply_tx
+                                            .send(Reply::DeviceFlowResult(Err(e)))
+                                            .await;
+                                        continue;
+                                    }
+                                };
+                                let user_code = device.user_code.clone();
+                                let verification_url = device.verification_url.clone();
+                                info!(user_code = %user_code, "device code received — displaying QR");
+                                let _ = reply_tx
+                                    .send(Reply::DeviceCode(device.clone()))
+                                    .await;
+
+                                // Step 2: poll until consent or expiry.
+                                let mut interval = device.interval.max(5);
+                                let deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_secs(
+                                        device.expires_in.max(60),
+                                    );
+                                let dc = device.device_code.clone();
+                                let outcome: Result<String, String> = loop {
+                                    if std::time::Instant::now() >= deadline {
+                                        break Err("device code expired".to_string());
+                                    }
+                                    let (status, body) = match crate::calendar::poll_token_once(
+                                        &http,
+                                        &oauth_token_url,
+                                        &client_id,
+                                        &client_secret,
+                                        &dc,
+                                    )
+                                    .await
+                                    {
+                                        Ok(r) => r,
+                                        Err(e) => break Err(e),
+                                    };
+                                    match crate::calendar::classify_poll(status, &body) {
+                                        crate::calendar::PollResponse::Pending => {
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_secs(interval),
+                                            )
+                                            .await;
+                                        }
+                                        crate::calendar::PollResponse::SlowDown => {
+                                            interval = interval.saturating_add(5);
+                                            tokio::time::sleep(
+                                                std::time::Duration::from_secs(interval),
+                                            )
+                                            .await;
+                                        }
+                                        crate::calendar::PollResponse::AccessToken {
+                                            access_token: _,
+                                            refresh_token,
+                                            expires_in: _,
+                                        } => {
+                                            match refresh_token {
+                                                Some(rt) => break Ok(rt),
+                                                None => break Err(
+                                                    "token response missing refresh_token"
+                                                        .to_string(),
+                                                ),
+                                            }
+                                        }
+                                        crate::calendar::PollResponse::Error(e) => {
+                                            break Err(e)
+                                        }
+                                    }
+                                };
+                                let _ = (user_code, verification_url); // (already sent in DeviceCode)
+                                match &outcome {
+                                    Ok(_rt) => info!("device-flow pairing successful"),
+                                    Err(e) => warn!(error = %e, "device-flow pairing failed"),
+                                }
+                                outcome
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "http client build failed");
+                                Err(e.to_string())
+                            }
+                        };
+                        let _ = reply_tx.send(Reply::DeviceFlowResult(result)).await;
+                    }
+
+                    Cmd::BrowseFeed { feed_uri } => {
+                        let _guard =
+                            info_span!("mopidy_browse_feed", feed_uri = %feed_uri).entered();
+                        info!(action = "BrowseFeed", "command received");
+                        if client.is_connected() {
+                            let call = crate::media::browse_feed_call(&feed_uri);
+                            match client
+                                .send_and_await(call.method, Some(call.params))
+                                .await
+                            {
+                                Ok(msg) => {
+                                    let result = msg.result.unwrap_or_else(|| {
+                                        msg.error
+                                            .unwrap_or(serde_json::json!({"error": "empty"}))
+                                    });
+                                    let episodes = crate::media::parse_feed_episodes(
+                                        &result,
+                                        crate::media::FEED_EPISODES_PI_CAP,
+                                    );
+                                    info!(
+                                        episode_count = episodes.len(),
+                                        "feed browse complete"
+                                    );
+                                    let _ = reply_tx
+                                        .send(Reply::FeedBrowse(episodes))
+                                        .await;
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "feed browse failed");
+                                    // Graceful degrade: empty episode list.
+                                    let _ = reply_tx
+                                        .send(Reply::FeedBrowse(Vec::new()))
+                                        .await;
+                                }
+                            }
+                        } else {
+                            // Backend not connected — degrade to empty list.
+                            let _ = reply_tx
+                                .send(Reply::FeedBrowse(Vec::new()))
+                                .await;
+                        }
+                    }
+
+                    Cmd::PlayUri { uri } => {
+                        let _guard = info_span!("mopidy_play_uri", uri = %uri).entered();
+                        info!(action = "PlayUri", "command received");
+                        if !client.is_connected() {
+                            info!("mopidy not connected; PlayUri no-op");
+                        } else {
+                            // Sequence clear → add → settle → play(tlid) to
+                            // avoid the add/play race (backend stream
+                            // resolution latency).
+                            let _ = client
+                                .send_and_await("core.tracklist.clear", None)
+                                .await;
+                            let add_params = serde_json::json!({ "uris": [uri] });
+                            match client
+                                .send_and_await("core.tracklist.add", Some(add_params))
+                                .await
+                            {
+                                Ok(msg) => {
+                                    // Extract the first added tlid, if any.
+                                    let tlid: Option<i64> = msg
+                                        .result
+                                        .as_ref()
+                                        .and_then(|v| v.as_array())
+                                        .and_then(|a| a.first())
+                                        .and_then(|t| t.get("tlid"))
+                                        .and_then(|t| t.as_i64());
+
+                                    // Brief settle so the backend resolves the
+                                    // stream URL before we issue play. 800 ms
+                                    // is enough for TuneIn in testing without
+                                    // feeling sluggish.
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_millis(800),
+                                    )
+                                    .await;
+
+                                    let play_params = tlid
+                                        .map(|id| serde_json::json!({ "tlid": id }))
+                                        .unwrap_or(serde_json::Value::Array(vec![]));
+                                    let _ = client
+                                        .send_and_await(
+                                            "core.playback.play",
+                                            Some(play_params),
+                                        )
+                                        .await;
+                                    info!(tlid = ?tlid, "play-uri sequence complete");
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "tracklist.add failed in PlayUri");
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1149,6 +1763,148 @@ pub async fn command_dispatcher(
 
 /// Start the tokio worker runtime on a dedicated thread.
 ///
+/// Push the media-panel + quick-controls state from `MediaState` (and the
+/// favorites DB) into the Slint `ThemeGlobal` singleton (slice 7 / task 4.1).
+///
+/// Runs on the whole-second clock tick. Favorites are re-read from the DB (≤8
+/// rows) so reordering / seeding is reflected; episodes / now-playing / caps /
+/// overlay come from `MediaState`. Also enforces the quick-controls 5 s idle
+/// dismiss (task 4.2) and re-arms the bedtime idle timer on dismiss (4.3).
+fn push_media_to_ui(
+    w: &AppWindow,
+    media: &Arc<Mutex<MediaState>>,
+    conn: &SharedConnection,
+    dc: &Arc<Mutex<DisplayController>>,
+) {
+    use slint::{ModelRc, VecModel, SharedString};
+
+    // Read favorites from the DB (Pi cap 8).
+    let favorites: Vec<crate::media::Favorite> = conn
+        .lock()
+        .ok()
+        .and_then(|g| crate::media::FavoriteStore::new(&*g).list().ok())
+        .unwrap_or_default();
+    let capped: Vec<&crate::media::Favorite> =
+        favorites.iter().take(crate::media::FAVORITES_PI_CAP).collect();
+
+    // Cache the (cap-8) favorites list in MediaState so tap handlers can
+    // resolve an index → favorite without a second DB read.
+    if let Ok(mut ms) = media.lock() {
+        ms.favorites = capped.iter().map(|f| (*f).clone()).collect();
+    }
+
+    let global = w.global::<ThemeGlobal>();
+
+    // Favorites model.
+    let fav_model: ModelRc<FavoriteItem> = {
+        let vm = VecModel::default();
+        for f in &capped {
+            vm.push(FavoriteItem {
+                id: SharedString::from(f.id.as_str()),
+                name: SharedString::from(f.name.as_str()),
+                source_type: SharedString::from(f.source.type_tag()),
+            });
+        }
+        ModelRc::from(std::rc::Rc::new(vm))
+    };
+    global.set_media_favorites(fav_model);
+
+    // Episodes + expanded index + now-playing + caps + overlay + sliders.
+    if let Ok(ms) = media.lock() {
+        let ep_model: ModelRc<FeedEpisodeItem> = {
+            let vm = VecModel::default();
+            for ep in &ms.feed_episodes {
+                vm.push(FeedEpisodeItem {
+                    uri: SharedString::from(ep.uri.as_str()),
+                    name: SharedString::from(ep.name.as_str()),
+                });
+            }
+            ModelRc::from(std::rc::Rc::new(vm))
+        };
+        global.set_media_episodes(ep_model);
+
+        let expanded_index = match &ms.expanded_feed_id {
+            Some(id) => capped
+                .iter()
+            .position(|f| f.id == *id)
+            .map(|i| i as i32)
+            .unwrap_or(-1),
+            None => -1,
+        };
+        global.set_media_expanded_index(expanded_index);
+
+        let now_playing = ms
+            .now_playing
+            .as_ref()
+            .map(|(t, a)| {
+                if a.is_empty() {
+                    t.clone()
+                } else {
+                    format!("{} — {}", t, a)
+                }
+            })
+            .unwrap_or_default();
+        global.set_media_now_playing(SharedString::from(now_playing.as_str()));
+
+        global.set_media_playing(ms.media_playing);
+        global.set_media_buffering(ms.buffering);
+        global.set_media_caps_play(ms.caps.play);
+        global.set_media_caps_pause(ms.caps.pause);
+        global.set_media_caps_stop(ms.caps.stop);
+        global.set_media_caps_next(ms.caps.next);
+        global.set_media_caps_prev(ms.caps.prev);
+        global.set_media_caps_seek(ms.caps.seek);
+
+        global.set_quick_controls_visible(ms.overlay_visible);
+        if let Ok(dc) = dc.lock() {
+            global.set_quick_volume(dc.current_brightness() as i32);
+            global.set_quick_brightness(dc.current_brightness() as i32);
+        }
+    }
+
+    // Enforce the 5 s idle dismiss for the quick-controls overlay.
+    let mut dismiss = false;
+    if let Ok(ms) = media.lock() {
+        if ms.overlay_visible {
+            if let Some(deadline) = ms.overlay_idle_deadline {
+                if std::time::Instant::now() >= deadline {
+                    dismiss = true;
+                }
+            }
+        }
+    }
+    if dismiss {
+        if let Ok(mut ms) = media.lock() {
+            ms.overlay_visible = false;
+            ms.overlay_idle_deadline = None;
+        }
+        if let Ok(mut dcg) = dc.lock() {
+            dcg.resume_wake_timer();
+        }
+        global.set_quick_controls_visible(false);
+    }
+
+    // Enforce the buffering safety timeout: if a PlayUri was dispatched but
+    // Mopidy hasn't reported a state within 15 s, stop spinning.
+    let mut clear_buffering = false;
+    if let Ok(ms) = media.lock() {
+        if ms.buffering {
+            if let Some(deadline) = ms.buffering_deadline {
+                if std::time::Instant::now() >= deadline {
+                    clear_buffering = true;
+                }
+            }
+        }
+    }
+    if clear_buffering {
+        if let Ok(mut ms) = media.lock() {
+            ms.buffering = false;
+            ms.buffering_deadline = None;
+        }
+        global.set_media_buffering(false);
+    }
+}
+
 /// The Mopidy WS client and its connection-state-forwarding task are spawned
 /// *inside* the worker runtime (via `block_on`) — `MopidyWsClient::spawn`
 /// calls `tokio::spawn`, which requires an active runtime context, so it must
@@ -1160,6 +1916,7 @@ fn spawn_tokio_worker(
     mopidy_event_tx: tokio_mpsc::Sender<mopidy_client::MopidyEvent>,
     mopidy_reply_tx: tokio_mpsc::Sender<mopidy_client::transport::JsonRpcMessage>,
     weather_cfg: Arc<crate::config::WeatherConfig>,
+    calendar_cfg: Arc<crate::config::CalendarConfig>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("tokio-worker".into())
@@ -1200,7 +1957,7 @@ fn spawn_tokio_worker(
                 }});
 
 // Run the command dispatcher with the live MopidyClient handle.
-                let result = command_dispatcher(cmd_rx, reply_tx, client, weather_cfg).await;
+                let result = command_dispatcher(cmd_rx, reply_tx, client, weather_cfg, calendar_cfg).await;
                 info!(result = ?result, "tokio command dispatcher exited");
             }});
 
@@ -1267,6 +2024,7 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // Cloned into an `Arc` so it can be shared with the tokio worker (which
     // performs the actual fetches) without further copying.
     let weather_cfg = Arc::new(cfg.weather.clone());
+    let calendar_cfg = Arc::new(cfg.calendar.clone());
 
     // Spawn tokio worker on a dedicated thread (task 2.2).
     let worker_handle = spawn_tokio_worker(
@@ -1276,6 +2034,7 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         mopidy_event_tx,
         mopidy_reply_tx,
         Arc::clone(&weather_cfg),
+        Arc::clone(&calendar_cfg),
     );
 
     info!("tokio worker thread spawned successfully");
@@ -1302,6 +2061,30 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
 
     // Weather store for holding weather data
     let weather_store = Arc::new(Mutex::new(WeatherStore::new()));
+
+    // Slice 6: main-thread calendar state (holidays + agenda + refresh coord).
+    // Load secrets once at boot from `secrets.json` (0600); if no refresh token
+    // is present, `re_pair_needed` will be set on the first fetch attempt.
+    let calendar_state = Arc::new(Mutex::new(CalendarState::new()));
+    let media_state: Arc<Mutex<MediaState>> = Arc::new(Mutex::new(MediaState::default()));
+    let secrets: Arc<Mutex<crate::secrets::Secrets>> = {
+        let path = std::path::Path::new(&cfg.calendar.secrets_path);
+        match crate::secrets::Secrets::load(path) {
+            Ok(s) => {
+                if s.google_refresh_token.is_none() {
+                    if let Ok(mut st) = calendar_state.lock() {
+                        st.re_pair_needed = true;
+                    }
+                    info!("no Google refresh token in secrets.json — calendar pairing needed");
+                }
+                Arc::new(Mutex::new(s))
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to load secrets.json; starting with empty secrets");
+                Arc::new(Mutex::new(crate::secrets::Secrets::default()))
+            }
+        }
+    };
 
     // Slice 4 / task 3.3: load persisted bedtime config and brightness floor.
     {
@@ -1475,9 +2258,268 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         });
     }
 
-    // Debug tap logging — remove once calibration is finalised.
+    // Slice 6: Settings panel — tap "Calendars" card to start Google
+    // device-flow pairing. Dispatches `Cmd::PairDeviceFlow` to the tokio
+    // worker; the worker emits `Reply::DeviceCode` (QR) then
+    // `Reply::DeviceFlowResult` (token / error).
+    {
+        let cmd_tx = cmd_sender_for_weather.clone();
+        let calendar_cfg_ref = Arc::clone(&calendar_cfg);
+        let calendar_state_ref = Arc::clone(&calendar_state);
+        let weak = app_window.as_weak();
+        app_window.on_pair_calendars_tapped(move || {
+            protected_tick(|| {
+                // Don't stack a second pairing if one is in flight.
+                if calendar_state_ref
+                    .lock()
+                    .map(|s| s.pairing_in_flight() || s.fetch_in_flight())
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                let (client_id, client_secret) =
+                    match (&calendar_cfg_ref.client_id, &calendar_cfg_ref.client_secret) {
+                        (Some(id), Some(sec)) => (id.clone(), sec.clone()),
+                        _ => {
+                            warn!("calendar pairing requested but no client_id/secret configured");
+                            if let Some(w) = weak.upgrade() {
+                                let global = w.global::<ThemeGlobal>();
+                                global.set_calendar_repair_needed(true);
+                            }
+                            return;
+                        }
+                    };
+                match cmd_tx.try_send(Cmd::PairDeviceFlow {
+                    client_id,
+                    client_secret,
+                    oauth_device_url: calendar_cfg_ref.oauth_device_url.clone(),
+                    oauth_token_url: calendar_cfg_ref.oauth_token_url.clone(),
+                }) {
+                    Ok(()) => {
+                        if let Ok(mut st) = calendar_state_ref.lock() {
+                            st.mark_pairing_in_flight();
+                        }
+                        if let Some(w) = weak.upgrade() {
+                            let global = w.global::<ThemeGlobal>();
+                            global.set_pairing_in_progress(true);
+                        }
+                        info!("calendar: dispatched PairDeviceFlow");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "calendar: could not dispatch PairDeviceFlow");
+                    }
+                }
+            });
+        });
+    }
+
+    // ── Slice 7: media-panel + quick-controls overlay callbacks ──────────
     //
-    // (removed — calibration is now handled via udev LIBINPUT_CALIBRATION_MATRIX)
+    // Favorite tap (index): resolve from the cached favorites list and either
+    // play (non-feed) or browse the feed (podcast). Episode tap (uri): play
+    // the episode. Transport tap: dispatch per TransportCaps via Mopidy calls.
+    {
+        let cmd_tx = cmd_sender_for_weather.clone();
+        let conn_ref = Arc::clone(&conn);
+        let media_ref = Arc::clone(&media_state);
+        let weak = app_window.as_weak();
+        app_window.on_favorite_tapped(move |idx| {
+            protected_tick(|| {
+                let fav = {
+                    let ms = media_ref.lock();
+                    ms.ok().and_then(|m| {
+                        m.favorites.get(idx as usize).cloned()
+                    })
+                };
+                let Some(fav) = fav else { return };
+                if fav.source.is_feed() {
+                    // Expand: dispatch a feed browse; mark this favorite
+                    // expanded so the panel shows the episodes on reply.
+                    if let Ok(mut ms) = media_ref.lock() {
+                        ms.expanded_feed_id = Some(fav.id.clone());
+                        ms.feed_episodes.clear();
+                    }
+                    let _ = cmd_tx.try_send(Cmd::BrowseFeed {
+                        feed_uri: fav.source.uri().to_string(),
+                    });
+                } else {
+                    // Tap-to-play: dispatch a single PlayUri so the worker
+                    // can sequence clear → add → settle → play (avoids the
+                    // add/play race where immediate play no-ops).
+                    let _ = cmd_tx.try_send(Cmd::PlayUri {
+                        uri: fav.source.uri().to_string(),
+                    });
+                    if let Ok(mut ms) = media_ref.lock() {
+                        ms.now_playing = Some((fav.name.clone(), String::new()));
+                        // Set transport caps from the active source; the state
+                        // poll reconciles media-playing once Mopidy reports
+                        // PLAYING.
+                        ms.caps = crate::media::TransportCaps::for_source(&fav.source);
+                        // Mark buffering until the play sequence completes and
+                        // Mopidy reports playing.
+                        ms.buffering = true;
+                        ms.buffering_deadline =
+                            Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
+                    }
+                }
+                let _ = conn_ref; // (favorites re-read on the push tick)
+                let _ = &weak;
+            });
+        });
+
+        let cmd_tx = cmd_sender_for_weather.clone();
+        let media_ref = Arc::clone(&media_state);
+        app_window.on_episode_tapped(move |uri| {
+            protected_tick(|| {
+                // The episode URI from Mopidy browse is a podcast+https://...
+                // URI; play it via the sequenced PlayUri path (clear → add →
+                // settle → play) to avoid the add/play race.
+                let uri_string = uri.to_string();
+                let _ = cmd_tx.try_send(Cmd::PlayUri { uri: uri_string.clone() });
+                if let Ok(mut ms) = media_ref.lock() {
+                    // Podcast episodes have full transport caps.
+                    ms.caps = crate::media::TransportCaps::for_source(
+                        &crate::media::AudioSource::PodcastFeed(String::new()),
+                    );
+                    // Look up the episode name and the podcast (favorite) name.
+                    // The expanded_feed_id indicates which podcast was expanded.
+                    let episode_name = ms
+                        .feed_episodes
+                        .iter()
+                        .find(|ep| ep.uri == uri_string)
+                        .map(|ep| ep.name.clone())
+                        .unwrap_or_else(|| "Unknown episode".to_string());
+                    let podcast_name = ms
+                        .expanded_feed_id
+                        .as_ref()
+                        .and_then(|id| {
+                            ms.favorites
+                                .iter()
+                                .find(|fav| &fav.id == id)
+                                .map(|fav| fav.name.clone())
+                        })
+                        .unwrap_or_else(|| "Unknown podcast".to_string());
+                    // Format: "Podcast — Episode"
+                    ms.now_playing =
+                        Some((format!("{} — {}", podcast_name, episode_name), String::new()));
+                    ms.buffering = true;
+                    ms.buffering_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(15));
+                }
+            });
+        });
+
+        let cmd_tx = cmd_sender_for_weather.clone();
+        let media_ref = Arc::clone(&media_state);
+        app_window.on_transport_tapped(move |cmd| {
+            protected_tick(|| {
+                let caps = media_ref
+                    .lock()
+                    .ok()
+                    .map(|m| m.caps)
+                    .unwrap_or_default();
+                let cmd_enum = match cmd.as_str() {
+                    "play" => crate::media::TransportCmd::Play,
+                    "pause" => crate::media::TransportCmd::Pause,
+                    "stop" => crate::media::TransportCmd::Stop,
+                    "next" => crate::media::TransportCmd::Next,
+                    "previous" => crate::media::TransportCmd::Previous,
+                    _ => return,
+                };
+                // Resolve against the active source's caps. We need a source
+                // to derive radio-pause=stop; reconstruct from stored caps only
+                // (a Radio caps pattern signals radio).
+                let synthetic_source = if !caps.pause && caps.stop {
+                    crate::media::AudioSource::Radio(String::new())
+                } else {
+                    crate::media::AudioSource::Spotify(String::new())
+                };
+                if let Some(call) = crate::media::resolve_transport(cmd_enum, caps, &synthetic_source) {
+                    let _ = cmd_tx.try_send(Cmd::CallMopidy {
+                        method: call.method.to_string(),
+                        params: call.params,
+                    });
+                    // Optimistic play-state toggle.
+                    if let Ok(mut ms) = media_ref.lock() {
+                        // toggle handled by event/snapshot; just refresh flag below
+                    }
+                }
+            });
+        });
+    }
+
+    // Slice 7 / D3: quick-controls overlay open/close + sliders.
+    {
+        let dc_ref = Arc::clone(&display_ctl);
+        let media_ref = Arc::clone(&media_state);
+        app_window.on_quick_controls_requested(move || {
+            protected_tick(|| {
+                if let Ok(mut dc) = dc_ref.lock() {
+                    dc.suspend_wake_timer();
+                }
+                if let Ok(mut ms) = media_ref.lock() {
+                    ms.overlay_visible = true;
+                    ms.overlay_idle_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+                }
+            });
+        });
+
+        let dc_ref = Arc::clone(&display_ctl);
+        let media_ref = Arc::clone(&media_state);
+        app_window.on_quick_dismiss_requested(move || {
+            protected_tick(|| {
+                if let Ok(mut dc) = dc_ref.lock() {
+                    dc.resume_wake_timer();
+                }
+                if let Ok(mut ms) = media_ref.lock() {
+                    ms.overlay_visible = false;
+                    ms.overlay_idle_deadline = None;
+                }
+            });
+        });
+
+        let cmd_tx = cmd_sender_for_weather.clone();
+        app_window.on_quick_volume_changed(move |vol| {
+            protected_tick(|| {
+                let _ = cmd_tx.try_send(Cmd::CallMopidy {
+                    method: "playback.set_volume".to_string(),
+                    params: serde_json::json!({ "volume": vol }),
+                });
+            });
+        });
+
+        let dc_ref = Arc::clone(&display_ctl);
+        app_window.on_quick_brightness_changed(move |b| {
+            protected_tick(|| {
+                if let Ok(mut dc) = dc_ref.lock() {
+                    dc.set_brightness_target(b as u8);
+                }
+            });
+        });
+    }
+
+    // Slice 6: push the initial calendar state to the UI (re-pair flag +
+    // configured calendar count from the DB).
+    {
+        let repair = calendar_state
+            .lock()
+            .map(|s| s.re_pair_needed)
+            .unwrap_or(false);
+        let count = conn
+            .lock()
+            .ok()
+            .map(|g| {
+                crate::alarm_store::CalendarStore::new(&*g)
+                    .list()
+                    .map(|c| c.len())
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0) as i32;
+        let global = app_window.global::<ThemeGlobal>();
+        global.set_calendar_repair_needed(repair);
+        global.set_configured_calendars_count(count);
+    }
 
     // Clock timer: drives the analog hands. Fires at ~30 Hz so the second
     // hand can sweep continuously (sub-second angle precision) instead of
@@ -1489,6 +2531,10 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         let ctl = Arc::clone(&theme_controller);
         let weak = app_window.as_weak();
         let weather_store_ref = Arc::clone(&weather_store);
+        let media_ref = Arc::clone(&media_state);
+        let conn_ref = Arc::clone(&conn);
+        let dc_ref = Arc::clone(&display_ctl);
+        let cmd_tx_for_clock = cmd_sender_for_weather.clone();
         let mut last_second: i64 = -1;
         clock_timer.start(
             slint::TimerMode::Repeated,
@@ -1536,6 +2582,16 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
                                 };
                                 ctl.push_weather(&w, weather_available, weather_data);
                             }
+
+                            // Slice 7: push media state (favorites, episodes,
+                            // now-playing, transport caps, overlay) to the UI,
+                            // and enforce the quick-controls 5 s idle dismiss.
+                            push_media_to_ui(&w, &media_ref, &conn_ref, &dc_ref);
+
+                            // Poll Mopidy playback state once per whole second
+                            // so the play/pause glyph reflects reality (slice 7).
+                            // The reply is reconciled in `dispatch_reply_to_domain`.
+                            let _ = cmd_tx_for_clock.try_send(Cmd::GetMopidyState);
                         }
                     }
                 });
@@ -1572,6 +2628,84 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         );
     }
 
+    // ── Buffering spinner timer (slice 7) ───────────────────────────────
+    //
+    // Advances `media-spinner-frame` 0→1→2→3 at ~80 ms while
+    // `media-buffering` is true, drawing a rotating bar spinner in place of
+    // the transport glyph. The glyph itself is gated on `media-buffering` in
+    // Slint, so the timer only needs to advance the frame while spinning.
+    let spinner_timer = slint::Timer::default();
+    {
+        let weak = app_window.as_weak();
+        spinner_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(80),
+            move || {
+                protected_tick(|| {
+                    if let Some(w) = weak.upgrade() {
+                        let global = w.global::<ThemeGlobal>();
+                        if global.get_media_buffering() {
+                            let next = (global.get_media_spinner_frame() + 1) % 4;
+                            global.set_media_spinner_frame(next);
+                        }
+                    }
+                });
+            },
+        );
+    }
+
+    // ── Now-playing marquee timer (slice 7) ─────────────────────────────
+    //
+    // Scrolls the now-playing text horizontally when media is playing and the
+    // text is long enough to overflow the card. Uses a smooth left-right
+    // ping-pong motion so the full title is readable.
+    let marquee_timer = slint::Timer::default();
+    {
+        let weak = app_window.as_weak();
+        // Direction: -1.0 = scrolling left (offset becoming more negative),
+        // +1.0 = scrolling right (offset returning toward 0).
+        let mut direction = -1.0f32;
+        // Approximate viewport width in logical pixels for the Now Playing card.
+        const VIEWPORT_WIDTH: f32 = 420.0;
+        // Approximate character width at 16px font size.
+        const CHAR_WIDTH: f32 = 9.0;
+        // Scroll speed in logical pixels per frame (16 ms ~ 60 Hz).
+        const SCROLL_SPEED: f32 = 0.7;
+        marquee_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(16),
+            move || {
+                protected_tick(|| {
+                    if let Some(w) = weak.upgrade() {
+                        let global = w.global::<ThemeGlobal>();
+                        if global.get_media_playing() {
+                            let text = global.get_media_now_playing();
+                            let text_width = text.len() as f32 * CHAR_WIDTH;
+                            let max_offset = (text_width - VIEWPORT_WIDTH).max(0.0);
+                            if max_offset > 0.0 {
+                                let offset = global.get_media_now_playing_offset();
+                                let mut next = offset + direction * SCROLL_SPEED;
+                                if next <= -max_offset {
+                                    next = -max_offset;
+                                    direction = 1.0;
+                                } else if next >= 0.0 {
+                                    next = 0.0;
+                                    direction = -1.0;
+                                }
+                                global.set_media_now_playing_offset(next);
+                            } else {
+                                global.set_media_now_playing_offset(0.0);
+                            }
+                        } else {
+                            global.set_media_now_playing_offset(0.0);
+                            direction = -1.0;
+                        }
+                    }
+                });
+            },
+        );
+    }
+
     // ── Slint drain timer (non-blocking try_recv on each tick) ────────────
     //
     // This single repeating timer polls both the reply channel and the Mopidy
@@ -1591,6 +2725,13 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // `Cmd::FetchWeather` for the new coordinates.
     let cmd_sender_for_drain = cmd_sender_for_weather.clone();
     let conn_for_drain = Arc::clone(&conn);
+    // Slice 6: calendar state, secrets, and config cloned for the drain timer
+    // so calendar fetch / device-flow replies can be routed on main.
+    let calendar_state_for_drain = Arc::clone(&calendar_state);
+    let secrets_for_drain = Arc::clone(&secrets);
+    let calendar_cfg_for_drain = Arc::clone(&calendar_cfg);
+    let media_state_for_drain = Arc::clone(&media_state);
+    let ui_weak_for_drain = app_window.as_weak();
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
@@ -1609,6 +2750,11 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
                     &weather_store_for_drain,
                     &conn_for_drain,
                     &cmd_sender_for_drain,
+                    &calendar_state_for_drain,
+                    &secrets_for_drain,
+                    &calendar_cfg_for_drain,
+                    &media_state_for_drain,
+                    &ui_weak_for_drain,
                 );
             }
 
@@ -1673,6 +2819,21 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         }
     }
 
+    // Slice 7 / task 3.3: pre-populate CBC Radio 1 Calgary + CKUA as favorites
+    // on first boot when the `favorites` table is empty (idempotent; a non-empty
+    // table is left untouched). Runs in all builds (curated radio defaults ship
+    // out-of-the-box).
+    {
+        if let Ok(conn_guard) = conn.lock() {
+            let store = crate::media::FavoriteStore::new(&*conn_guard);
+            if let Err(e) = crate::media::seed_default_favorites(&store) {
+                error!(error = %e, "default favorites seeding failed; continuing");
+            }
+        } else {
+            error!("favorites DB mutex poisoned at boot; skipping default seed");
+        }
+    }
+
     // Boot recompute (task 3.4): populate/refresh the `next_fire` caches
     // from each alarm's rule once before the first tick (design D1).
     {
@@ -1692,11 +2853,15 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     // [`EpisodeFsmAdapter`] (over the [`EpisodeController`] above) in place of
     // the slice-0 no-op seams, so real alarms now drive the episode FSM.
     let display_for_scheduler = Arc::clone(&display_ctl);
-    let scheduler_state = Mutex::new(Scheduler::new(
-        StoreAlarmSource::new(Arc::clone(&conn)),
-        EpisodeFsmAdapter::new(Arc::clone(&conn), episode_ctl_for_scheduler, Arc::clone(&display_ctl), bundled_beep_path.clone()),
-        LocalClock,
-    ));
+    let scheduler_holiday_lookup = CalendarHolidayLookup::new(Arc::clone(&calendar_state));
+    let scheduler_state = Mutex::new(
+        Scheduler::new(
+            StoreAlarmSource::new(Arc::clone(&conn)),
+            EpisodeFsmAdapter::new(Arc::clone(&conn), episode_ctl_for_scheduler, Arc::clone(&display_ctl), bundled_beep_path.clone()),
+            LocalClock,
+        )
+        .with_holidays(scheduler_holiday_lookup),
+    );
     let scheduler_timer = slint::Timer::default();
     scheduler_timer.start(
         slint::TimerMode::Repeated,
@@ -1753,21 +2918,42 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         let cmd_tx = cmd_sender_for_weather.clone();
         let conn_for_weather = Arc::clone(&conn);
         let weather_store_ref = Arc::clone(&weather_store);
+        // Slice 6: calendar refresh joins this shared 30-s polling tick (the
+        // actual calendar fetch happens at the 30-min cadence / backoff retry
+        // cadence decided by `maybe_dispatch_calendar_fetch`).
+        let calendar_cfg_ref = Arc::clone(&calendar_cfg);
+        let secrets_ref = Arc::clone(&secrets);
+        let calendar_state_ref = Arc::clone(&calendar_state);
 
         // Initial fetch — fire immediately on boot.
         protected_tick(|| {
             maybe_dispatch_weather(&cmd_tx, &conn_for_weather, &weather_store_ref);
+            maybe_dispatch_calendar_fetch(
+                &cmd_tx,
+                &conn_for_weather,
+                &calendar_cfg_ref,
+                &secrets_ref,
+                &calendar_state_ref,
+            );
         });
 
         // 30 s scheduler tick. The short interval is the polling granularity
         // only; actual fetches still happen at the 30-min steady cadence (or
-        // the backoff retry cadence) as decided by `maybe_dispatch_weather`.
+        // the backoff retry cadence) as decided by `maybe_dispatch_weather` /
+        // `maybe_dispatch_calendar_fetch`.
         weather_timer.start(
             slint::TimerMode::Repeated,
             Duration::from_secs(30),
             move || {
                 protected_tick(|| {
                     maybe_dispatch_weather(&cmd_tx, &conn_for_weather, &weather_store_ref);
+                    maybe_dispatch_calendar_fetch(
+                        &cmd_tx,
+                        &conn_for_weather,
+                        &calendar_cfg_ref,
+                        &secrets_ref,
+                        &calendar_state_ref,
+                    );
                 });
             },
         );
@@ -1784,6 +2970,8 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         _clock: clock_timer,
         _weather: weather_timer,
         _icon: icon_timer,
+        _spinner: spinner_timer,
+        _marquee: marquee_timer,
     };
 
     (worker_handle, _app_window, timers)
@@ -1802,10 +2990,38 @@ fn dispatch_reply_to_domain(
     weather_store: &Arc<Mutex<WeatherStore>>,
     conn: &SharedConnection,
     cmd_tx: &mpsc::Sender<Cmd>,
+    calendar_state: &Arc<Mutex<CalendarState>>,
+    secrets: &Arc<Mutex<crate::secrets::Secrets>>,
+    calendar_cfg: &Arc<crate::config::CalendarConfig>,
+    media_state: &Arc<Mutex<MediaState>>,
+    ui_weak: &slint::Weak<AppWindow>,
 ) {
     match reply {
         Reply::MopidyState(state) => {
             info!(reply = "MopidyState", state = %state, "dispatched reply to domain");
+            // Reflect Mopidy's playback state into the media-panel play/pause
+            // glyph (slice 7). Mopidy 3.x returns lowercase state strings
+            // ("playing"/"paused"/"stopped"); compare case-insensitively
+            // to be robust. `playing` → media-playing=true; anything else
+            // → false. Caps are set when a favorite/episode is tapped; this
+            // only reconciles the glyph.
+            let playing = state.eq_ignore_ascii_case("PLAYING");
+            let paused = state.eq_ignore_ascii_case("PAUSED");
+            if let Ok(mut ms) = media_state.lock() {
+                ms.media_playing = playing;
+                // Keep the spinner going until we have confirmed the audio has
+                // actually started. A "stopped" reply can arrive while the
+                // PlayUri sequence (clear → add → settle → play) is still in
+                // flight, so clearing on "stopped" would hide the spinner long
+                // before playback begins on slow-starting streams such as CBC
+                // Radio via TuneIn. "playing" (and "paused") are the only
+                // states that mean buffering is over; otherwise rely on the
+                // safety timeout in push_media_to_ui.
+                if playing || paused {
+                    ms.buffering = false;
+                    ms.buffering_deadline = None;
+                }
+            }
         }
         Reply::CallResult(result) => {
             info!(reply = "CallResult", result = ?result, "dispatched reply to domain");
@@ -1886,6 +3102,287 @@ fn dispatch_reply_to_domain(
                 }
             }
         }
+        // Slice 6: calendar fetch result — update the holiday + agenda stores
+        // on main (stale retention on failure), push the agenda to the UI,
+        // and surface a 401 as a re-pair-needed state.
+        Reply::CalendarEvents(result) => {
+            match result {
+                Ok(fetch) => {
+                    info!(
+                        holidays = fetch.holiday_dates.len(),
+                        agenda = fetch.agenda_events.len(),
+                        "calendar fetch result received — updating stores"
+                    );
+                    if let Ok(mut st) = calendar_state.lock() {
+                        st.holidays.replace(fetch.holiday_dates);
+                        st.agenda.replace_from_events(&fetch.agenda_events, Utc::now());
+                        st.record_success();
+                        // Push the agenda to the UI (Daily-data panel card).
+                        if let Some(w) = ui_weak.upgrade() {
+                            push_agenda_to_ui(&w, &st.agenda);
+                        }
+                    }
+                }
+                Err(msg) => {
+                    if msg.starts_with("unauthorized:") {
+                        // Task 2.3: refresh token revoked/expired — clear it
+                        // and set the re-pair flag so the Settings panel can
+                        // re-prompt device flow on the Pi.
+                        warn!(error = %msg, "calendar refresh token unauthorized — re-pair needed");
+                        if let Ok(mut s) = secrets.lock() {
+                            let _ = s.clear_google_refresh_token(
+                                std::path::Path::new(&calendar_cfg.secrets_path),
+                            );
+                        }
+                        if let Ok(mut st) = calendar_state.lock() {
+                            st.re_pair_needed = true;
+                            st.clear_fetch_in_flight();
+                            // Stale retention: the holiday + agenda stores are
+                            // NOT cleared — the agenda stays visible (dimmed).
+                        }
+                    } else {
+                        warn!(error = %msg, "calendar fetch failed — applying backoff (stale retained)");
+                        if let Ok(mut st) = calendar_state.lock() {
+                            st.handle_failure();
+                        }
+                    }
+                }
+            }
+        }
+        // Slice 6: device-flow device code received — display the QR + user
+        // code on the Pi while the worker polls for consent.
+        Reply::DeviceCode(code) => {
+            info!(user_code = %code.user_code, "device code received — rendering QR");
+            let qr = crate::qr::render_qr_image(&format!(
+                "{}/?user_code={}",
+                code.verification_url, code.user_code
+            ));
+            if let Some(w) = ui_weak.upgrade() {
+                let global = w.global::<ThemeGlobal>();
+                global.set_pairing_user_code(slint::SharedString::from(code.user_code.clone()));
+                global.set_pairing_url(slint::SharedString::from(code.verification_url.clone()));
+                global.set_pairing_in_progress(true);
+                if let Some(img) = qr {
+                    global.set_pairing_qr_image(img);
+                }
+            }
+        }
+        // Slice 6: device-flow pairing result — persist the refresh token to
+        // `secrets.json` (0600) and trigger an immediate calendar fetch.
+        Reply::DeviceFlowResult(result) => {
+            match result {
+                Ok(refresh_token) => {
+                    info!("device-flow pairing successful — persisting refresh token");
+                    let saved = if let Ok(mut s) = secrets.lock() {
+                        s.set_google_refresh_token(
+                            refresh_token,
+                            std::path::Path::new(&calendar_cfg.secrets_path),
+                        )
+                        .is_ok()
+                    } else {
+                        false
+                    };
+                    if saved {
+                        if let Ok(mut st) = calendar_state.lock() {
+                            st.re_pair_needed = false;
+                            st.clear_pairing_in_flight();
+                            st.clear_fetch_in_flight();
+                        }
+                        if let Some(w) = ui_weak.upgrade() {
+                            let global = w.global::<ThemeGlobal>();
+                            global.set_pairing_in_progress(false);
+                            global.set_pairing_user_code(slint::SharedString::from(""));
+                            global.set_pairing_url(slint::SharedString::from(""));
+                            global.set_calendar_repair_needed(false);
+                        }
+                        // Trigger an immediate fetch.
+                        maybe_dispatch_calendar_fetch(
+                            cmd_tx,
+                            conn,
+                            calendar_cfg,
+                            secrets,
+                            calendar_state,
+                        );
+                    }
+                }
+                Err(msg) => {
+                    warn!(error = %msg, "device-flow pairing failed");
+                    if let Ok(mut st) = calendar_state.lock() {
+                        st.clear_pairing_in_flight();
+                    }
+                    if let Some(w) = ui_weak.upgrade() {
+                        let global = w.global::<ThemeGlobal>();
+                        global.set_pairing_in_progress(false);
+                    }
+                }
+            }
+        }
+        // Slice 6: calendar list result (post-pairing auto-seed). Auto-add the
+        // user's `primary` calendar as Agenda and the Canadian holidays
+        // calendar (by id prefix) as Holiday, then trigger an immediate fetch.
+        Reply::CalendarList(result) => {
+            match result {
+                Ok(list) => {
+                    info!(count = list.len(), "calendar list received — auto-seeding");
+                    let to_seed: Vec<crate::alarm_store::CalendarSource> = list
+                        .iter()
+                        .filter_map(|(id, summary)| {
+                            if id == "primary" || id.ends_with("@gmail.com") {
+                                Some(crate::alarm_store::CalendarSource {
+                                    google_calendar_id: id.clone(),
+                                    display_name: summary.clone(),
+                                    role: crate::alarm_store::CalendarRole::Agenda,
+                                })
+                            } else if id.contains("holiday") || id.contains("#holiday@") {
+                                Some(crate::alarm_store::CalendarSource {
+                                    google_calendar_id: id.clone(),
+                                    display_name: summary.clone(),
+                                    role: crate::alarm_store::CalendarRole::Holiday,
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if to_seed.is_empty() {
+                        // Fall back to the well-known Canadian holidays calendar
+                        // + primary so the calendar features are testable.
+                        to_seed_default_calendars(conn, calendar_state, ui_weak);
+                    } else {
+                        seed_calendars(conn, &to_seed, calendar_state, ui_weak);
+                    }
+                    // Trigger an immediate calendar fetch with the new sources.
+                    maybe_dispatch_calendar_fetch(
+                        cmd_tx,
+                        conn,
+                        calendar_cfg,
+                        secrets,
+                        calendar_state,
+                    );
+                }
+                Err(msg) => {
+                    warn!(error = %msg, "calendar list failed — seeding defaults");
+                    // Even if the list fails, seed the defaults so a fetch is
+                    // attempted (the holidays calendar is public-readable).
+                    to_seed_default_calendars(conn, calendar_state, ui_weak);
+                    maybe_dispatch_calendar_fetch(
+                        cmd_tx,
+                        conn,
+                        calendar_cfg,
+                        secrets,
+                        calendar_state,
+                    );
+                }
+            }
+        }
+        // Slice 7: podcast feed browse result — episodes for the media panel.
+        // The reply is forwarded to the media-state store; the UI reads it on
+        // the next tick. An empty list signals an uninstalled backend / empty
+        // feed (graceful degrade).
+        Reply::FeedBrowse(episodes) => {
+            info!(
+                reply = "FeedBrowse",
+                count = episodes.len(),
+                "feed browse reply received — forwarding to media state"
+            );
+            if let Ok(mut ms) = media_state.lock() {
+                ms.set_feed_episodes(episodes);
+            }
+        }
+    }
+}
+
+/// Slice 6 (task 6.2): persist a slice of [`CalendarSource`] rows to the
+/// `calendars` table and update the UI's configured-calendar count.
+fn seed_calendars(
+    conn: &SharedConnection,
+    to_seed: &[crate::alarm_store::CalendarSource],
+    calendar_state: &Arc<Mutex<CalendarState>>,
+    ui_weak: &slint::Weak<AppWindow>,
+) {
+    let count = conn.lock().ok().map(|g| {
+        let store = crate::alarm_store::CalendarStore::new(&*g);
+        for c in to_seed {
+            if let Err(e) = store.upsert(c) {
+                warn!(calendar_id = %c.google_calendar_id, error = %e, "failed to upsert calendar");
+            }
+        }
+        store.list().map(|l| l.len()).unwrap_or(0)
+    }).unwrap_or(0);
+    info!(seeded = to_seed.len(), total = count, "auto-seeded calendars");
+    let _ = calendar_state; // (state already reflects via the upcoming fetch)
+    if let Some(w) = ui_weak.upgrade() {
+        let global = w.global::<ThemeGlobal>();
+        global.set_configured_calendars_count(count as i32);
+    }
+}
+
+/// Slice 6 (task 6.2): seed the well-known defaults (`primary` as Agenda +
+/// the Canadian holidays calendar as Holiday) when the list call returns no
+/// matchable calendars.
+fn to_seed_default_calendars(
+    conn: &SharedConnection,
+    calendar_state: &Arc<Mutex<CalendarState>>,
+    ui_weak: &slint::Weak<AppWindow>,
+) {
+    let defaults = vec![
+        crate::alarm_store::CalendarSource {
+            google_calendar_id: "primary".to_string(),
+            display_name: "My Calendar".to_string(),
+            role: crate::alarm_store::CalendarRole::Agenda,
+        },
+        crate::alarm_store::CalendarSource {
+            google_calendar_id: "en.canadian#holiday@group.v.calendar.google.com".to_string(),
+            display_name: "Holidays in Canada".to_string(),
+            role: crate::alarm_store::CalendarRole::Holiday,
+        },
+    ];
+    seed_calendars(conn, &defaults, calendar_state, ui_weak);
+}
+
+/// Push the current agenda store to the UI's `ThemeGlobal` agenda
+/// properties (slice 6 / task 5.2). Past events are flagged for dim styling.
+fn push_agenda_to_ui(w: &AppWindow, agenda: &crate::calendar::AgendaStore) {
+    let global = w.global::<ThemeGlobal>();
+    let items = agenda.items();
+    global.set_agenda_count(items.len() as i32);
+    global.set_agenda_available(!items.is_empty());
+
+    // Helper: set the i-th slot.
+    let set_slot = |i: usize, label: String, past: bool| {
+        let label = slint::SharedString::from(label);
+        match i {
+            0 => {
+                global.set_agenda_item0(label);
+                global.set_agenda_past0(past);
+            }
+            1 => {
+                global.set_agenda_item1(label);
+                global.set_agenda_past1(past);
+            }
+            2 => {
+                global.set_agenda_item2(label);
+                global.set_agenda_past2(past);
+            }
+            3 => {
+                global.set_agenda_item3(label);
+                global.set_agenda_past3(past);
+            }
+            _ => {}
+        }
+    };
+
+    for (i, item) in items.iter().take(4).enumerate() {
+        let label = if item.summary.is_empty() {
+            "(no title)".to_string()
+        } else {
+            item.summary.clone()
+        };
+        set_slot(i, label, item.past);
+    }
+    // Clear any slots beyond the current count.
+    for i in items.len()..4 {
+        set_slot(i, String::new(), false);
     }
 }
 
@@ -2153,6 +3650,7 @@ mod tests {
             reply_tx,
             client,
             Arc::new(crate::config::WeatherConfig::default()),
+            Arc::new(crate::config::CalendarConfig::default()),
         );
         tokio::pin!(dispatcher_fut);
 
@@ -2234,6 +3732,7 @@ mod tests {
             reply_tx,
             client,
             Arc::new(crate::config::WeatherConfig::default()),
+            Arc::new(crate::config::CalendarConfig::default()),
         );
         tokio::pin!(dispatcher_fut);
 
@@ -2311,6 +3810,7 @@ mod tests {
             test_event_tx,
             test_reply_tx,
             Arc::new(crate::config::WeatherConfig::default()),
+            Arc::new(crate::config::CalendarConfig::default()),
         );
 
         // Give the worker thread a moment to start its recv loop.
@@ -2333,7 +3833,14 @@ mod tests {
             last_reply.is_some(),
             "should receive MopidyState reply from tokio worker"
         );
-        assert_eq!(last_reply, Some("STOPPED".to_string()));
+        // Mopidy 3.x `core.playback.get_state` returns a lowercase state
+        // string ("stopped"/"playing"/"paused"); when Mopidy is unreachable
+        // the dispatcher falls back to uppercase "STOPPED". Accept either.
+        let s = last_reply.unwrap();
+        assert!(
+            s.eq_ignore_ascii_case("STOPPED"),
+            "expected STOPPED, got {s}"
+        );
 
         // Clean shutdown.
         main_cmd_sender.blocking_send(Cmd::Shutdown).unwrap();
@@ -2463,6 +3970,7 @@ mod tests {
             reply_tx,
             client,
             Arc::new(crate::config::WeatherConfig::default()),
+            Arc::new(crate::config::CalendarConfig::default()),
         );
         tokio::pin!(dispatcher_fut);
 

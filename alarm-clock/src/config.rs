@@ -123,6 +123,73 @@ impl Default for WeatherConfig {
     }
 }
 
+// ── Calendar / Google OAuth config (slice 6) ──────────────────────────────
+
+pub const DEFAULT_SECRETS_PATH: &str = "./data/secrets.json";
+pub const DEFAULT_GOOGLE_OAUTH_DEVICE_URL: &str = "https://oauth2.googleapis.com/device/code";
+pub const DEFAULT_GOOGLE_OAUTH_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+pub const DEFAULT_GOOGLE_CALENDAR_API_URL: &str = "https://www.googleapis.com/calendar/v3";
+
+fn default_secrets_path() -> String {
+    DEFAULT_SECRETS_PATH.to_string()
+}
+fn default_google_oauth_device_url() -> String {
+    DEFAULT_GOOGLE_OAUTH_DEVICE_URL.to_string()
+}
+fn default_google_oauth_token_url() -> String {
+    DEFAULT_GOOGLE_OAUTH_TOKEN_URL.to_string()
+}
+fn default_google_calendar_api_url() -> String {
+    DEFAULT_GOOGLE_CALENDAR_API_URL.to_string()
+}
+
+/// Google Calendar / OAuth2 device-flow configuration (slice 6).
+///
+/// `client_id` and `client_secret` are obtained from the Google Cloud
+/// console (an OAuth2 desktop-client credential). They are *not* highly
+/// secret for an installed app, but storing them in the gitignored local
+/// override keeps them out of version control. When `client_id` is `None`,
+/// calendar features are disabled (no pairing is attempted).
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct CalendarConfig {
+    /// Filesystem path to the `secrets.json` secret store (0600).
+    #[serde(default = "default_secrets_path")]
+    pub secrets_path: String,
+
+    /// Google OAuth2 device-code endpoint.
+    #[serde(default = "default_google_oauth_device_url")]
+    pub oauth_device_url: String,
+
+    /// Google OAuth2 token endpoint.
+    #[serde(default = "default_google_oauth_token_url")]
+    pub oauth_token_url: String,
+
+    /// Google Calendar REST API base URL.
+    #[serde(default = "default_google_calendar_api_url")]
+    pub calendar_api_url: String,
+
+    /// OAuth2 client ID. `None` disables calendar features.
+    #[serde(default)]
+    pub client_id: Option<String>,
+
+    /// OAuth2 client secret. `None` when `client_id` is `None`.
+    #[serde(default)]
+    pub client_secret: Option<String>,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            secrets_path: default_secrets_path(),
+            oauth_device_url: default_google_oauth_device_url(),
+            oauth_token_url: default_google_oauth_token_url(),
+            calendar_api_url: default_google_calendar_api_url(),
+            client_id: None,
+            client_secret: None,
+        }
+    }
+}
+
 /// Bootstrap configuration.
 ///
 /// Every field carries a `#[serde(default = ...)]` so a partial `config.toml`
@@ -156,6 +223,10 @@ pub struct Config {
     /// Weather provider configuration (slice 5 + PirateWeather fallback).
     #[serde(default)]
     pub weather: WeatherConfig,
+
+    /// Google Calendar / OAuth2 device-flow configuration (slice 6).
+    #[serde(default)]
+    pub calendar: CalendarConfig,
 }
 
 impl Default for Config {
@@ -167,6 +238,7 @@ impl Default for Config {
             log_level: default_log_level(),
             data_dir: default_data_dir(),
             weather: WeatherConfig::default(),
+            calendar: CalendarConfig::default(),
         }
     }
 }

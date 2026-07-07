@@ -126,6 +126,7 @@ impl SeedAlarm {
             visual_config: None,
             snooze_minutes: 10,
             max_snoozes: 3,
+            holiday_policy: crate::alarm_store::HolidayPolicy::default(),
             next_fire: None,
             created_at: iso_now(),
             updated_at: iso_now(),

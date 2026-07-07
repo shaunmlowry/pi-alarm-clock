@@ -1,0 +1,217 @@
+// Media panel content (slice 7 / task 4.1).
+//
+// Now-playing card, source-capability-adapted transport row, and a favorites
+// list (Pi cap 8). Reads its data from `ThemeGlobal` (set by Rust on each
+// tick). Tap a non-feed favorite → play; tap a podcast feed → expand to
+// episodes (most-recent 5). All colors/font come from the active theme.
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+import { Card } from "Card.slint";
+import { FavoriteItem, FeedEpisodeItem } from "Media.slint";
+
+export component MediaPanel inherits Rectangle {
+    // Favorite tap by index (0-based). Rust resolves the favorite and either
+    // plays it (non-feed) or browses the feed (podcast).
+    callback favorite-tapped(int);
+    // Episode tap (uri) — plays the episode.
+    callback episode-tapped(string);
+    // Transport control tapped: "play" | "pause" | "stop" | "next" | "previous".
+    callback transport-tapped(string);
+
+    VerticalLayout {
+        width: root.width;
+        height: root.height;
+        padding: 12px;
+        spacing: 14px;
+        alignment: start;
+
+        Text {
+            text: "Media";
+            font-size: 22px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            horizontal-alignment: center;
+        }
+
+        // ── Now-playing card ───────────────────────────────────────────
+        Card {
+            title: "Now Playing";
+            height: 110px;
+            if ThemeGlobal.media-now-playing != "": Rectangle {
+                // Viewport for the scrolling now-playing text. The Card's
+                // VerticalLayout provides the width; we just clip overflow.
+                height: 40px;
+                clip: true;
+                Text {
+                    text: ThemeGlobal.media-now-playing;
+                    font-size: 16px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    horizontal-alignment: left;
+                    vertical-alignment: center;
+                    height: parent.height;
+                    x: ThemeGlobal.media-now-playing-offset * 1px;
+                }
+            }
+            if ThemeGlobal.media-now-playing == "": Text {
+                text: "Nothing playing";
+                font-size: 14px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                opacity: 0.6;
+            }
+        }
+
+        // ── Transport row (caps-driven) ────────────────────────────────
+        HorizontalLayout {
+            alignment: center;
+            spacing: 28px;
+            height: 70px;
+
+            // Previous (hidden when cap absent).
+            if ThemeGlobal.media-caps-prev: Rectangle {
+                width: 56px; height: 56px;
+                border-radius: 28px;
+                TA-prev := TouchArea {
+                    width: parent.width; height: parent.height;
+                    clicked => { root.transport-tapped("previous"); }
+                }
+                Text {
+                    text: "⏮";
+                    font-size: 30px;
+                    color: ThemeGlobal.text-color;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Play / Pause / Stop toggle — single button, source-adaptive.
+            //
+            // Radio (caps.pause=false, caps.stop=true): ▶ when stopped, ⏹ when
+            // playing — tapping the playing state stops (radio has no pause;
+            // "pause" = stop per design D4). No separate stop button renders.
+            //
+            // Full sources (spotify/file/podcast): ▶ when stopped, ⏸ when
+            // playing — tapping the playing state pauses; a separate ⏹ stop
+            // button renders below when caps.stop.
+            Rectangle {
+                width: 64px; height: 64px;
+                border-radius: 32px;
+                background: ThemeGlobal.accent-color;
+                TA-play := TouchArea {
+                    width: parent.width; height: parent.height;
+                    enabled: !ThemeGlobal.media-buffering;
+                    clicked => {
+                        if ThemeGlobal.media-playing {
+                            // Radio: stop. Full source: pause.
+                            root.transport-tapped(ThemeGlobal.media-caps-pause ? "pause" : "stop");
+                        } else {
+                            root.transport-tapped("play");
+                        }
+                    }
+                }
+                Text {
+                    text: ThemeGlobal.media-buffering
+                        ? ["|", "/", "–", "\\"][ThemeGlobal.media-spinner-frame]
+                        : (ThemeGlobal.media-playing
+                            ? (ThemeGlobal.media-caps-pause ? "⏸" : "⏹")
+                            : "▶");
+                    font-size: 34px;
+                    color: ThemeGlobal.text-color;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Stop button — only for full sources (radio uses the toggle
+            // above for stop). Hidden when caps.stop is false.
+            if ThemeGlobal.media-caps-stop && ThemeGlobal.media-caps-pause: Rectangle {
+                width: 56px; height: 56px;
+                border-radius: 28px;
+                TA-stop := TouchArea {
+                    width: parent.width; height: parent.height;
+                    clicked => { root.transport-tapped("stop"); }
+                }
+                Text {
+                    text: "⏹";
+                    font-size: 30px;
+                    color: ThemeGlobal.text-color;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            // Next (hidden when cap absent).
+            if ThemeGlobal.media-caps-next: Rectangle {
+                width: 56px; height: 56px;
+                border-radius: 28px;
+                TA-next := TouchArea {
+                    width: parent.width; height: parent.height;
+                    clicked => { root.transport-tapped("next"); }
+                }
+                Text {
+                    text: "⏭";
+                    font-size: 30px;
+                    color: ThemeGlobal.text-color;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        // ── Favorites list (cap 8) + expanded episodes ─────────────────
+        Card {
+            title: "Favorites";
+            VerticalLayout {
+                spacing: 8px;
+
+                for fav[i] in ThemeGlobal.media-favorites: Rectangle {
+                    height: 44px;
+                    width: parent.width;
+                    border-radius: 8px;
+                    background: i == ThemeGlobal.media-expanded-index
+                        ? ThemeGlobal.accent-color : transparent;
+                    TA-fav := TouchArea {
+                        width: parent.width; height: parent.height;
+                        clicked => { root.favorite-tapped(i); }
+                    }
+                    HorizontalLayout {
+                        padding: 8px;
+                        Text {
+                            text: fav.name;
+                            font-size: 15px;
+                            color: ThemeGlobal.text-color;
+                            font-family: ThemeGlobal.font-family;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: fav.source-type == "PodcastFeed" ? "🎙" : "";
+                            font-size: 16px;
+                            color: ThemeGlobal.text-color;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                        }
+                    }
+                }
+
+                // Expanded episode list for the tapped podcast feed.
+                for ep in ThemeGlobal.media-episodes: Rectangle {
+                    height: 40px;
+                    width: parent.width;
+                    border-radius: 8px;
+                    TA-ep := TouchArea {
+                        width: parent.width; height: parent.height;
+                        clicked => { root.episode-tapped(ep.uri); }
+                    }
+                    Text {
+                        text: "  ▶ " + ep.name;
+                        font-size: 14px;
+                        color: ThemeGlobal.text-color;
+                        font-family: ThemeGlobal.font-family;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}

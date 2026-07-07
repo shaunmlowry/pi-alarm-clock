@@ -5,7 +5,7 @@ openspec/changes/*/.apply/
 target/**
 
 # temp data
-data/**
+data/
 
 # Local config override (secrets, e.g. PirateWeather API key)
 config.local.toml

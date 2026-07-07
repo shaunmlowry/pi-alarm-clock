@@ -370,11 +370,28 @@ impl MopidyWsClient {
         }
 
         // Build and dispatch the frame.
+        //
+        // Mopidy's JSON-RPC surface is rooted under `core.*` (e.g.
+        // `core.tracklist.add`, `core.playback.play`); `core.describe` shows
+        // `core` is the only mounted object, so extension backends (TuneIn,
+        // Spotify, Podcast) are reached via the `core.library` /
+        // `core.playback` / `core.tracklist` frontends, not bare `tunein.*`
+        // etc. (those return -32601 Method not found). Callers in this crate
+        // and the app historically used the bare form (`tracklist.add`),
+        // which Mopidy 3.x rejects. Normalize here — the single chokepoint
+        // every call flows through — so callers keep the bare, PRD-natural
+        // names. Already-prefixed `core.*` methods pass through unchanged.
+        let method_owned = normalize_method(method.into());
+        // Mopidy rejects "params": null with -32600 Invalid Request
+        // ("'params', if given, must be an array or an object"); only an
+        // array, object, or omitted params are valid. Defensively coerce
+        // Value::Null / None to an empty array so no caller can trip this.
+        let params_val = coerce_params(params);
         let msg = JsonRpcRequest {
             jsonrpc: "2.0",
             request_id,
-            method: method.into(),
-            params: Some(params.unwrap_or_else(|| Value::Array(vec![]))),
+            method: method_owned,
+            params: Some(params_val),
         }
         .to_message()?;
 
@@ -474,6 +491,43 @@ impl MopidyWsClient {
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────
+
+/// Normalize a JSON-RPC method name for Mopidy.
+///
+/// Mopidy's JSON-RPC surface is rooted under `core.*` (the only mounted
+/// object per `core.describe`); extension backends (TuneIn, Spotify,
+/// Podcast) are reached via `core.library` / `core.playback` /
+/// `core.tracklist` frontends, not bare `tunein.*` / `spotify.*` methods.
+/// Bare names like `tracklist.add` are rejected with `-32601 Method not
+/// found / No object found at 'tracklist'`. This prepends `core.` when the
+/// method isn't already prefixed; already-prefixed `core.*` names pass
+/// through unchanged.
+///
+/// Exposed as a free function so unit tests can pin the normalization
+/// without spinning up a live WebSocket session.
+pub(crate) fn normalize_method(method: String) -> String {
+    if method.starts_with("core.") {
+        method
+    } else {
+        format!("core.{}", method)
+    }
+}
+
+/// Coerce a caller-supplied `params` `Option<Value>` into a value Mopidy
+/// accepts.
+///
+/// Mopidy's JSON-RPC validator rejects `"params": null` with `-32600
+/// Invalid Request / 'params', if given, must be an array or an object`
+/// (see `mopidy/internal/jsonrpc.py::_get_params` in 3.x; the
+/// `params: list | dict` pydantic field in 4.x). Only an array, an object,
+/// or omitted params are valid. `None` and `Some(Value::Null)` both become
+/// an empty array; everything else passes through untouched.
+pub(crate) fn coerce_params(params: Option<Value>) -> Value {
+    match params {
+        Some(Value::Null) | None => Value::Array(vec![]),
+        Some(other) => other,
+    }
+}
 
 /// Establish a TCP + WebSocket connection to the given URL.
 async fn connect_ws(
@@ -603,6 +657,52 @@ pub fn default_backoff_policy() -> BackoffPolicy {
 mod tests {
     use super::*;
 
+    // ── Method-name normalization (Mopidy core.* root) ─────────────────
+
+    #[test]
+    fn normalize_bare_tracklist_method() {
+        assert_eq!(normalize_method("tracklist.add".into()), "core.tracklist.add");
+    }
+
+    #[test]
+    fn normalize_bare_playback_method() {
+        assert_eq!(normalize_method("playback.play".into()), "core.playback.play");
+    }
+
+    #[test]
+    fn normalize_passes_through_core_prefixed() {
+        assert_eq!(normalize_method("core.get_version".into()), "core.get_version");
+        assert_eq!(
+            normalize_method("core.library.browse".into()),
+            "core.library.browse"
+        );
+    }
+
+    #[test]
+    fn normalize_single_segment_method() {
+        // `get_uri_schemes` → `core.get_uri_schemes` (defensive: even a
+        // method with no dot gets the prefix).
+        assert_eq!(normalize_method("get_uri_schemes".into()), "core.get_uri_schemes");
+    }
+
+    // ── params normalization (Mopidy rejects "params": null) ───────────
+    //
+    // Mopidy's JSON-RPC validator (mopidy/internal/jsonrpc.py::_get_params
+    // in 3.x; `params: list | dict` pydantic field in 4.x) rejects
+    // `"params": null` with -32600 Invalid Request. Only an array, object,
+    // or omitted params are valid. `send_and_await` coerces Value::Null and
+    // None to an empty array; this test pins the coercion helper directly.
+    #[test]
+    fn coerce_null_params_to_empty_array() {
+        assert_eq!(coerce_params(None), Value::Array(vec![]));
+        assert_eq!(coerce_params(Some(Value::Null)), Value::Array(vec![]));
+        // Real params pass through untouched.
+        let obj = serde_json::json!({"uris": ["x"]});
+        assert_eq!(coerce_params(Some(obj.clone())), obj);
+        let arr = serde_json::json!([1, 2]);
+        assert_eq!(coerce_params(Some(arr.clone())), arr);
+    }
+
     // ── JSON-RPC framing (task 4.1) ────────────────────────────────────
 
     /// A `JsonRpcRequest::call` serializes to valid JSON-RPC 2.0.
@@ -621,14 +721,14 @@ mod tests {
     #[test]
     fn jsonrpc_request_with_params() {
         let req = JsonRpcRequest::call_with_params(
-            "core.get_state",
+            "core.playback.get_state",
             7,
             serde_json::json!({"tracklist_index": 0}),
         );
         let value = serde_json::to_value(&req).expect("serialize");
 
         assert_eq!(value["id"], 7);
-        assert_eq!(value["method"], "core.get_state");
+        assert_eq!(value["method"], "core.playback.get_state");
         assert_eq!(value["params"]["tracklist_index"], 0);
     }
 

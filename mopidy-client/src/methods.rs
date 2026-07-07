@@ -62,9 +62,9 @@ impl<'de> serde::Deserialize<'de> for VersionInfo {
     }
 }
 
-// ── core.get_state ───────────────────────────────────────────────────────────
+// ── core.playback.get_state ───────────────────────────────────────────────
 
-/// Request struct for `core.get_state`. No arguments are needed.
+/// Request struct for `core.playback.get_state`. No arguments are needed.
 #[derive(Debug, Clone, Default)]
 pub struct GetStateRequest;
 
@@ -75,7 +75,7 @@ impl GetStateRequest {
     }
 }
 
-/// Typed playback-state reply from `core.get_state`.
+/// Typed playback-state reply from `core.playback.get_state`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaybackState {
     /// A track is actively playing.
@@ -222,7 +222,7 @@ pub trait CoreApi {
     /// Return the server version by calling `core.get_version`.
     fn get_version(&self) -> impl std::future::Future<Output = Result<VersionInfo, MopidyClientError>> + Send;
 
-    /// Return the current playback state by calling `core.get_state`.
+    /// Return the current playback state by calling `core.playback.get_state`.
     fn get_state(&self) -> impl std::future::Future<Output = Result<PlaybackState, MopidyClientError>> + Send;
 }
 
@@ -274,7 +274,7 @@ impl CoreApi for MopidyWsClient {
             return Err(MopidyClientError::NotConnected);
         }
         let _req = GetStateRequest::default();
-        let reply_msg = self.send_and_await("core.get_state", None).await?;
+        let reply_msg = self.send_and_await("core.playback.get_state", None).await?;
         Ok(parse_or_error::<PlaybackState>(reply_msg)?)
     }
 }

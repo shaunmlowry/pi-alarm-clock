@@ -9,6 +9,7 @@ axum.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 mopidy-client = { path = "../mopidy-client" }
+qrcode = "0.14"
 reqwest = { version = "0.11", features = ["json"] }
 resvg = "0.47"
 usvg = "0.47"

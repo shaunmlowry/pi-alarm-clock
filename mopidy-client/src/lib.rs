@@ -1,7 +1,7 @@
 //! Mopidy WebSocket client library.
 //!
 //! Handles JSON-RPC 2.0 communication over WebSocket with reconnect logic.
-//! Typed RPC method wrappers (`core.get_version`, `core.get_state`) and
+//! Typed RPC method wrappers (`core.get_version`, `core.playback.get_state`) and
 //! connection-state signals are provided out of the box.
 
 pub mod transport;

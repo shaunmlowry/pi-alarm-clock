@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::error::{ConfigError, Result};
+use crate::media::{AudioSource, reconcile_fallback_chain};
 use crate::schedule::Schedule;
 
 // ── Escalation step (slice 2, design D1) ───────────────────────────────────
@@ -33,6 +34,98 @@ pub struct EscalationStep {
     pub after_secs: u64,
     /// Volume 0..=100 to apply from this step onward.
     pub volume: u8,
+}
+
+// ── Holiday policy (slice 6 / D-spec) ─────────────────────────────────────
+
+/// Per-alarm policy for holiday suppression (slice 6).
+///
+/// On the scheduler tick, if a due alarm's policy is not `Ignore` and a
+/// holiday is active on the alarm's fire date, the alarm does not fire that
+/// date. `Suppress` advances to the next scheduled occurrence;
+/// `ShiftForward` advances day-by-day at the same wall-clock time until a
+/// non-holiday date (capped at 30 days, falling back to `Suppress` past the
+/// cap). See `scheduler.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum HolidayPolicy {
+    /// Fire normally regardless of holidays.
+    Ignore,
+    /// Skip on a holiday; advance `next_fire` to the next scheduled occurrence.
+    Suppress,
+    /// Skip on a holiday; advance to the next non-holiday date at the same
+    /// wall-clock time (capped at 30 days, falls back to `Suppress`).
+    ShiftForward,
+}
+
+impl Default for HolidayPolicy {
+    fn default() -> Self {
+        HolidayPolicy::Suppress
+    }
+}
+
+impl HolidayPolicy {
+    /// Stable DB string representation (matches the migration default).
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            HolidayPolicy::Ignore => "Ignore",
+            HolidayPolicy::Suppress => "Suppress",
+            HolidayPolicy::ShiftForward => "ShiftForward",
+        }
+    }
+
+    /// Parse a stored DB string back into a `HolidayPolicy`. Unknown values
+    /// fall back to the default (`Suppress`) — never fail the read of an alarm.
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "Ignore" => HolidayPolicy::Ignore,
+            "ShiftForward" => HolidayPolicy::ShiftForward,
+            _ => HolidayPolicy::Suppress,
+        }
+    }
+}
+
+// ── Calendar source (slice 6 / D-spec) ──────────────────────────────────────
+
+/// The role a configured calendar plays (slice 6).
+///
+/// `Agenda` role calendars feed the Daily-data panel agenda;
+/// `Holiday` role calendars (Google's "Holidays in Canada" + all-day
+/// personal events) feed holiday suppression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CalendarRole {
+    /// Feeds the Daily-data panel agenda card.
+    Agenda,
+    /// Feeds holiday suppression.
+    Holiday,
+}
+
+impl CalendarRole {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            CalendarRole::Agenda => "Agenda",
+            CalendarRole::Holiday => "Holiday",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "Agenda" => CalendarRole::Agenda,
+            _ => CalendarRole::Holiday,
+        }
+    }
+}
+
+/// A configured Google Calendar source (slice 6 / persistence spec).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CalendarSource {
+    /// Google Calendar `id` (e.g. "primary", or an email-style id).
+    pub google_calendar_id: String,
+    /// Human-readable label shown in the UI.
+    pub display_name: String,
+    /// Agenda or Holiday role tag.
+    pub role: CalendarRole,
 }
 
 // ── Alarm model ─────────────────────────────────────────────────────────────
@@ -82,6 +175,8 @@ pub struct Alarm {
     /// Maximum number of snoozes allowed per alarm episode (default 3).
     /// 0 = snooze disabled entirely; reached cap hides Snooze button.
     pub max_snoozes: i64,
+    /// Per-alarm holiday suppression policy (slice 6). Defaults to `Suppress`.
+    pub holiday_policy: HolidayPolicy,
     /// Cached next fire time (ISO-8601 UTC); derived, may be stale.
     pub next_fire: Option<String>,
     /// Creation timestamp (ISO-8601).
@@ -91,6 +186,17 @@ pub struct Alarm {
 }
 
 // ── AlarmStore ──────────────────────────────────────────────────────────────
+
+/// Reconciled fallback chain access for an [`Alarm`] (slice 7 / task 1.4).
+///
+/// The stored column stays `Vec<String>` (text); interpretation to typed
+/// [`AudioSource`] values happens at the read boundary (design D1, no
+/// destructive migration). Returns `None` for `None`/empty chains.
+impl Alarm {
+    pub fn fallback_chain_sources(&self) -> Option<Vec<AudioSource>> {
+        reconcile_fallback_chain(self.fallback_chain.as_ref())
+    }
+}
 
 /// Alarm persistence, owned by main, borrowing the single `Connection`.
 ///
@@ -120,7 +226,8 @@ impl<'a> AlarmStore<'a> {
             .prepare(
                 "SELECT id, enabled, name, time_local, timezone, rrule, once_at, \
                  source_uri, max_volume, escalation_steps, fallback_chain, \
-                 visual_config, snooze_minutes, max_snoozes, next_fire, created_at, updated_at \
+                 visual_config, snooze_minutes, max_snoozes, holiday_policy, \
+                 next_fire, created_at, updated_at \
                  FROM alarms ORDER BY id",
             )
             .map_err(ConfigError::Database)?;
@@ -139,7 +246,8 @@ impl<'a> AlarmStore<'a> {
             .query_row(
                 "SELECT id, enabled, name, time_local, timezone, rrule, once_at, \
                  source_uri, max_volume, escalation_steps, fallback_chain, \
-                 visual_config, snooze_minutes, max_snoozes, next_fire, created_at, updated_at \
+                 visual_config, snooze_minutes, max_snoozes, holiday_policy, \
+                 next_fire, created_at, updated_at \
                  FROM alarms WHERE id = ?",
                 [id],
                 row_to_alarm,
@@ -177,8 +285,8 @@ impl<'a> AlarmStore<'a> {
             "INSERT OR REPLACE INTO alarms \
              (id, enabled, name, time_local, timezone, rrule, once_at, \
               source_uri, max_volume, escalation_steps, fallback_chain, \
-              visual_config, snooze_minutes, max_snoozes, next_fire, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              visual_config, snooze_minutes, max_snoozes, holiday_policy, next_fire, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 alarm.id,
                 enabled_i,
@@ -194,6 +302,7 @@ impl<'a> AlarmStore<'a> {
                 alarm.visual_config,
                 alarm.snooze_minutes,
                 alarm.max_snoozes,
+                alarm.holiday_policy.as_db_str(),
                 alarm.next_fire,
                 alarm.created_at,
                 alarm.updated_at,
@@ -207,6 +316,30 @@ impl<'a> AlarmStore<'a> {
 
         tx.commit().map_err(ConfigError::Database)?;
         Ok(())
+    }
+
+    /// Override a single alarm's `next_fire` cache to a specific UTC datetime
+    /// (slice 6 `ShiftForward`). The rule remains the source of truth — this
+    /// only writes the cache — but the scheduler will not fire the alarm
+    /// until the shifted date. Runs in a single transaction.
+    pub fn set_next_fire(&self, id: &str, next_fire_utc: DateTime<Utc>) -> Result<bool> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(ConfigError::Database)?;
+        let updated = match tx.execute(
+            "UPDATE alarms SET next_fire = ? WHERE id = ?",
+            params![next_fire_utc.to_rfc3339(), id],
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                error!(alarm_id = id, error = %e, "set_next_fire failed; rolling back");
+                let _ = tx.rollback();
+                return Err(ConfigError::Database(e));
+            }
+        };
+        tx.commit().map_err(ConfigError::Database)?;
+        Ok(updated > 0)
     }
 
     /// Delete an alarm by `id` in a single transaction.
@@ -311,6 +444,113 @@ impl<'a> AlarmStore<'a> {
     }
 }
 
+// ── CalendarStore (slice 6) ─────────────────────────────────────────────────
+
+/// Persistence for configured [`CalendarSource`] rows (slice 6), owned by
+/// main and borrowing the single `Connection` (mirroring [`AlarmStore`]).
+///
+/// All mutations run inside a single transaction; a partial failure rolls
+/// back, logs `error!`, and leaves the database unchanged.
+pub struct CalendarStore<'a> {
+    conn: &'a Connection,
+}
+
+impl<'a> CalendarStore<'a> {
+    /// Create a `CalendarStore` borrowing *conn*.
+    pub fn new(conn: &'a Connection) -> Self {
+        Self { conn }
+    }
+
+    /// List all configured calendar sources, ordered by `google_calendar_id`
+    /// for stable iteration.
+    pub fn list(&self) -> Result<Vec<CalendarSource>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT google_calendar_id, display_name, role \
+                 FROM calendars ORDER BY google_calendar_id",
+            )
+            .map_err(ConfigError::Database)?;
+        let rows = stmt
+            .query_map([], |row| {
+                let role_str: String = row.get(2)?;
+                Ok(CalendarSource {
+                    google_calendar_id: row.get(0)?,
+                    display_name: row.get(1)?,
+                    role: CalendarRole::from_db_str(&role_str),
+                })
+            })
+            .map_err(ConfigError::Database)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ConfigError::Database)?;
+        Ok(rows)
+    }
+
+    /// Insert or update a calendar source by `google_calendar_id` (idempotent).
+    pub fn upsert(&self, cal: &CalendarSource) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(ConfigError::Database)?;
+        if let Err(e) = tx.execute(
+            "INSERT OR REPLACE INTO calendars \
+             (google_calendar_id, display_name, role) VALUES (?, ?, ?)",
+            params![cal.google_calendar_id, cal.display_name, cal.role.as_db_str()],
+        ) {
+            error!(calendar_id = %cal.google_calendar_id, error = %e, "calendar upsert failed; rolling back");
+            let _ = tx.rollback();
+            return Err(ConfigError::Database(e));
+        }
+        tx.commit().map_err(ConfigError::Database)?;
+        Ok(())
+    }
+
+    /// Delete a calendar source by `google_calendar_id`. Returns `true` if a
+    /// row was deleted, `false` if the id was not present.
+    pub fn delete(&self, google_calendar_id: &str) -> Result<bool> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(ConfigError::Database)?;
+        let removed = match tx.execute(
+            "DELETE FROM calendars WHERE google_calendar_id = ?",
+            [google_calendar_id],
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                error!(calendar_id = google_calendar_id, error = %e, "calendar delete failed; rolling back");
+                let _ = tx.rollback();
+                return Err(ConfigError::Database(e));
+            }
+        };
+        tx.commit().map_err(ConfigError::Database)?;
+        Ok(removed > 0)
+    }
+
+    /// Read a single calendar source by id, or `None` if not present.
+    pub fn get(&self, google_calendar_id: &str) -> Result<Option<CalendarSource>> {
+        self.conn
+            .query_row(
+                "SELECT google_calendar_id, display_name, role \
+                 FROM calendars WHERE google_calendar_id = ?",
+                [google_calendar_id],
+                |row| {
+                    let role_str: String = row.get(2)?;
+                    Ok(CalendarSource {
+                        google_calendar_id: row.get(0)?,
+                        display_name: row.get(1)?,
+                        role: CalendarRole::from_db_str(&role_str),
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|err| match err {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(ConfigError::Database(other)),
+            })
+    }
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Map a `rusqlite::Row` to an [`Alarm`].
@@ -341,6 +581,12 @@ fn row_to_alarm(row: &rusqlite::Row<'_>) -> rusqlite::Result<Alarm> {
         visual_config: row.get("visual_config")?,
         snooze_minutes: row.get("snooze_minutes").unwrap_or(10),
         max_snoozes: row.get("max_snoozes").unwrap_or(3),
+        holiday_policy: row
+            .get::<_, Option<String>>("holiday_policy")
+            .ok()
+            .flatten()
+            .map(|s| HolidayPolicy::from_db_str(&s))
+            .unwrap_or_default(),
         next_fire: row.get("next_fire")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -511,6 +757,7 @@ mod tests {
             fallback_chain: None,
             snooze_minutes: 10,
             max_snoozes: 3,
+            holiday_policy: crate::alarm_store::HolidayPolicy::default(),
             next_fire: None,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),
@@ -857,6 +1104,7 @@ mod tests {
             visual_config: None,
             snooze_minutes: 10,
             max_snoozes: 3,
+            holiday_policy: crate::alarm_store::HolidayPolicy::default(),
             next_fire: None,
             created_at: "2026-01-01T00:00:00+00:00".to_string(),
             updated_at: "2026-01-01T00:00:00+00:00".to_string(),
@@ -927,5 +1175,113 @@ mod tests {
         );
 
         cleanup(path);
+    }
+
+    // ── Slice 6: holiday_policy round-trip ──────────────────────────────
+
+    /// Scenario: an alarm with `HolidayPolicy::Ignore` is upserted and read
+    /// back — the policy is preserved.
+    #[test]
+    fn holiday_policy_round_trips() {
+        let (path, store) = fresh_store();
+        let mut a = sample_alarm("policy-rt");
+        a.holiday_policy = HolidayPolicy::Ignore;
+        store.upsert(&a).expect("upsert");
+
+        let got = store.get("policy-rt").unwrap().unwrap();
+        assert_eq!(got.holiday_policy, HolidayPolicy::Ignore);
+
+        // ShiftForward round-trips too.
+        let mut b = sample_alarm("policy-rt2");
+        b.holiday_policy = HolidayPolicy::ShiftForward;
+        store.upsert(&b).unwrap();
+        let got2 = store.get("policy-rt2").unwrap().unwrap();
+        assert_eq!(got2.holiday_policy, HolidayPolicy::ShiftForward);
+
+        // Default (Suppress) round-trips.
+        let c = sample_alarm("policy-rt3"); // default = Suppress
+        store.upsert(&c).unwrap();
+        let got3 = store.get("policy-rt3").unwrap().unwrap();
+        assert_eq!(got3.holiday_policy, HolidayPolicy::Suppress);
+
+        cleanup(path);
+    }
+
+    // ── Slice 6: CalendarStore CRUD ─────────────────────────────────────
+
+    /// Scenario: calendars can be upserted, listed, fetched, and deleted;
+    /// unknown DB values fall back to Holiday; upsert is idempotent by id.
+    #[test]
+    fn calendar_store_crud() {
+        use crate::database::open_connection;
+        use crate::database::run_migrations;
+
+        let path = std::env::temp_dir().join(format!(
+            "calendars_crud_{}_{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = open_connection(path.to_str().unwrap()).unwrap();
+        run_migrations(&conn).unwrap();
+        let store = CalendarStore::new(&conn);
+
+        // Empty initially.
+        assert!(store.list().unwrap().is_empty());
+        assert!(store.get("primary").unwrap().is_none());
+
+        // Upsert two calendars.
+        store
+            .upsert(&CalendarSource {
+                google_calendar_id: "primary".to_string(),
+                display_name: "My Agenda".to_string(),
+                role: CalendarRole::Agenda,
+            })
+            .unwrap();
+        store
+            .upsert(&CalendarSource {
+                google_calendar_id: "en.canadian#holiday@group.v.calendar.google.com".to_string(),
+                display_name: "Holidays in Canada".to_string(),
+                role: CalendarRole::Holiday,
+            })
+            .unwrap();
+
+        // List returns both, ordered by id.
+        let all = store.list().unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].google_calendar_id, "en.canadian#holiday@group.v.calendar.google.com");
+        assert_eq!(all[0].role, CalendarRole::Holiday);
+        assert_eq!(all[1].google_calendar_id, "primary");
+        assert_eq!(all[1].role, CalendarRole::Agenda);
+
+        // Get by id round-trips role + display name.
+        let got = store.get("primary").unwrap().unwrap();
+        assert_eq!(got.display_name, "My Agenda");
+        assert_eq!(got.role, CalendarRole::Agenda);
+
+        // Upsert is idempotent by id — second upsert updates rather than
+        // inserting a duplicate.
+        store
+            .upsert(&CalendarSource {
+                google_calendar_id: "primary".to_string(),
+                display_name: "Renamed Agenda".to_string(),
+                role: CalendarRole::Holiday,
+            })
+            .unwrap();
+        let all2 = store.list().unwrap();
+        assert_eq!(all2.len(), 2, "no duplicate row");
+        let updated = store.get("primary").unwrap().unwrap();
+        assert_eq!(updated.display_name, "Renamed Agenda");
+        assert_eq!(updated.role, CalendarRole::Holiday);
+
+        // Delete removes the row; returns true when present, false when not.
+        assert!(store.delete("primary").unwrap(), "delete existing returns true");
+        assert!(!store.delete("primary").unwrap(), "delete missing returns false");
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

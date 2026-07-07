@@ -1,0 +1,53 @@
+{
+  "_comment": "Curated internet-radio station catalog for the web UI tap-to-add (slice 8). The Pi ships CBC Radio 1 Calgary + CKUA as pre-populated favorites (see src/media.rs::DEFAULT_FAVORITES); this catalog offers a broader set for tap-to-add. Stream URLs MUST be re-verified before each release (see docs/release-checklist.md).",
+  "stations": [
+    {
+      "id": "cbc-radio-one-calgary",
+      "name": "CBC Radio One Calgary",
+      "url": "tunein:station:s31103",
+      "category": "Public Radio"
+    },
+    {
+      "id": "ckua",
+      "name": "CKUA",
+      "url": "BROKEN: https://stream.ckua.com:8000/ckua-128k-mp3 (verify before re-adding; TuneIn stream also intermittent)",
+      "category": "Public Radio"
+    },
+    {
+      "id": "cbc-music",
+      "name": "CBC Music",
+      "url": "https://cbcmusiccb.akamaized.net/rlcgw2_cbc_music_mp3",
+      "category": "Public Radio"
+    },
+    {
+      "id": "cbc-radio-one-edmonton",
+      "name": "CBC Radio One Edmonton",
+      "url": "https://cbcrc1ed.akamaized.net/rlcgw2_cbc_radio_one_edmonton_mp3",
+      "category": "Public Radio"
+    },
+    {
+      "id": "ckua-jazz",
+      "name": "CKUA Jazz",
+      "url": "BROKEN: CKUA streams currently down (verify before re-adding)",
+      "category": "Jazz"
+    },
+    {
+      "id": "soma-groove-salad",
+      "name": "SomaFM Groove Salad",
+      "url": "https://ice1.somafm.com/groovesalad-128-mp3",
+      "category": "Ambient"
+    },
+    {
+      "id": "soma-drone-zone",
+      "name": "SomaFM Drone Zone",
+      "url": "https://ice1.somafm.com/dronezone-128-mp3",
+      "category": "Ambient"
+    },
+    {
+      "id": "fip-paris",
+      "name": "FIP Paris",
+      "url": "https://icecast.radiofrance.fr/fip-hifi.aac",
+      "category": "Eclectic"
+    }
+  ]
+}

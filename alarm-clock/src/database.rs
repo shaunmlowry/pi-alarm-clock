@@ -96,6 +96,40 @@ fn migrations() -> &'static [Migration] {
                 -- Keys: weather_city, weather_lat, weather_lon
             ",
         },
+        // Slice 6: add per-alarm holiday_policy and a calendars table.
+        // Non-destructive: existing alarms get `Suppress` (default); no
+        // calendars are configured until the user pairs via device flow.
+        // (The slice-6 spec text calls this "migration v6", but slice 5's
+        // weather migration already occupies v6; this is the next available
+        // version, v7.)
+        Migration {
+            version: 7,
+            sql: "
+                ALTER TABLE alarms ADD COLUMN holiday_policy TEXT NOT NULL DEFAULT 'Suppress';
+                CREATE TABLE IF NOT EXISTS calendars (
+                    google_calendar_id TEXT PRIMARY KEY,
+                    display_name       TEXT NOT NULL,
+                    role                TEXT NOT NULL
+                );
+            ",
+        },
+        // Slice 7: favorites table (media-player).
+        // Non-destructive: creates an empty `favorites` table; existing
+        // alarms are untouched. The slice-7 spec text calls this "migration
+        // v7", but slice 6's calendars migration already occupies v7; this is
+        // the next available version, v8.
+        Migration {
+            version: 8,
+            sql: "
+                CREATE TABLE IF NOT EXISTS favorites (
+                    id            TEXT PRIMARY KEY,
+                    name          TEXT NOT NULL,
+                    source_type   TEXT NOT NULL,
+                    source_uri    TEXT NOT NULL,
+                    display_order INTEGER NOT NULL
+                );
+            ",
+        },
     ]
 }
 
@@ -506,12 +540,13 @@ mod tests {
         assert_eq!(alarm_count_before, 1);
 
         // Run migrations — v2 is skipped (user_version already 2); the
-        // additive v3, v4, and v5 migrations apply (escalation_steps, fallback_chain,
-        // visual_config, snooze_minutes, max_snoozes columns added) and user_version advances to 5.
+        // additive v3..v7 migrations apply (escalation_steps, fallback_chain,
+        // visual_config, snooze_minutes, max_snoozes, holiday_policy columns +
+        // calendars table) and user_version advances to the latest.
         run_migrations(&conn).expect("migrations should succeed");
 
-        // user_version is now 5 (v3+v4+v5 applied); v2 was not re-applied.
-        assert_eq!(read_user_version(&conn).unwrap(), 5);
+        // user_version is now the latest (v3..v7 applied); v2 was not re-applied.
+        assert_eq!(read_user_version(&conn).unwrap(), migrations().last().unwrap().version);
 
         // alarms table intact — row count unchanged.
         let alarm_count_after: i64 = conn
@@ -664,11 +699,11 @@ mod tests {
         )
         .expect("should insert v4 alarm");
 
-        // Run all migrations (should apply v5)
+        // Run all migrations (should apply v5..v7)
         run_migrations(&conn).expect("migrations should succeed");
 
-        // Verify user_version is now 5
-        assert_eq!(read_user_version(&conn).unwrap(), 5);
+        // Verify user_version is now the latest
+        assert_eq!(read_user_version(&conn).unwrap(), migrations().last().unwrap().version);
 
         // Verify the v4 alarm now has snooze defaults
         let mut stmt = conn.prepare("SELECT id, snooze_minutes, max_snoozes FROM alarms").unwrap();
@@ -678,6 +713,123 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0], ("test-v4-alarm".to_string(), 10, 3));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// ── Slice 6: Migration v7 (holiday_policy + calendars table) ────────
+
+    /// Scenario: Fresh database migrates to v7 — `alarms` has a
+    /// `holiday_policy` column (default `Suppress`) and a `calendars` table exists.
+    #[test]
+    fn fresh_database_migrates_to_v7() {
+        let path = format!(
+            "{}{}fresh_v7_migration_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).expect("open connection");
+        run_migrations(&conn).expect("migrations should succeed");
+
+        let latest = migrations().last().unwrap().version;
+        assert_eq!(latest, 8);
+        assert_eq!(read_user_version(&conn).unwrap(), 8);
+
+        // `holiday_policy` column exists on alarms with default Suppress.
+        // Insert a row without specifying holiday_policy and read the default.
+        conn.execute(
+            "INSERT INTO alarms (id, name, time_local, timezone, source_uri, max_volume, created_at, updated_at) \
+             VALUES ('t','t','07:00:00','America/Edmonton','coreaudio://x.mp3',40,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let default_pol: String = conn
+            .query_row("SELECT holiday_policy FROM alarms WHERE id='t'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(default_pol, "Suppress");
+
+        // `calendars` table exists and is empty.
+        let has_calendars: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='calendars'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(has_calendars, "calendars table should exist after v7 migration");
+        let calendars_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calendars", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calendars_count, 0, "calendars table should be empty");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Scenario: v6 database upgrades to v7 — all alarm rows survive with
+    /// `holiday_policy = Suppress`, the `calendars` table is created (empty),
+    /// and `user_version` becomes `7`.
+    #[test]
+    fn v6_database_upgrades_to_v7() {
+        let path = format!(
+            "{}{}v6_to_v7_upgrade_test.db",
+            std::env::temp_dir().display(),
+            std::path::MAIN_SEPARATOR,
+        );
+
+        let _ = std::fs::remove_file(&path);
+
+        let conn = open_connection(&path).expect("open connection");
+
+        // Manually apply v1–v6 migrations to simulate an existing slice-5 DB.
+        for version in 1..=6 {
+            let mig = migrations().iter().find(|m| m.version == version).unwrap();
+            conn.execute_batch(mig.sql).expect(&format!("migration v{} should succeed", version));
+            set_user_version(&conn, version).expect(&format!("setting user_version to {}", version));
+        }
+
+        // Insert a pre-v7 alarm (no holiday_policy column yet).
+        conn.execute(
+            "INSERT INTO alarms (id, name, time_local, timezone, source_uri, max_volume, created_at, updated_at) \
+             VALUES ('pre-v7','Morning','07:00:00','America/Edmonton','coreaudio://alarm.mp3',40,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            [],
+        )
+        .expect("insert pre-v7 alarm");
+
+        // Run migrations — should apply v7 and v8.
+        run_migrations(&conn).expect("migrations should succeed");
+
+        assert_eq!(read_user_version(&conn).unwrap(), 8);
+
+        // The pre-v7 alarm survives with default Suppress.
+        let pol: String = conn
+            .query_row(
+                "SELECT holiday_policy FROM alarms WHERE id='pre-v7'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pol, "Suppress", "pre-v7 alarm gets default holiday_policy");
+
+        // calendars table exists and is empty.
+        let calendars_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM calendars", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calendars_count, 0);
+
+        // v7/v8 are idempotent — running migrations again is a no-op.
+        run_migrations(&conn).expect("second run should succeed");
+        assert_eq!(read_user_version(&conn).unwrap(), 8);
+        let pol2: String = conn
+            .query_row(
+                "SELECT holiday_policy FROM alarms WHERE id='pre-v7'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(pol2, "Suppress");
 
         let _ = std::fs::remove_file(&path);
     }

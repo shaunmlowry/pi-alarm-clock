@@ -31,8 +31,11 @@
 //! placeholders are wired into the live `slint::Timer` on main until the real
 //! types arrive.
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, NaiveDate, TimeZone, Utc};
+use chrono_tz::Tz;
 use tracing::{info, info_span};
+
+use crate::alarm_store::HolidayPolicy;
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -55,12 +58,17 @@ pub type AlarmId = String;
 /// Carries the alarm's stored `next_fire` so the scheduler can distinguish a
 /// normal due fire (`now >= next_fire` and not a boot catch-up) from a missed
 /// boot alarm (`now > next_fire` on the first tick) without a second round-trip
-/// to the store.
+/// to the store. Also carries the alarm's `HolidayPolicy` and stored IANA
+/// timezone (slice 6) so the tick can apply holiday suppression.
 #[derive(Debug, Clone)]
 pub struct DueAlarm {
     pub id: AlarmId,
     /// Stored next-fire time, in local time.
     pub next_fire: DateTime<Local>,
+    /// Per-alarm holiday suppression policy (slice 6).
+    pub policy: HolidayPolicy,
+    /// Stored IANA timezone of the alarm (for holiday date membership).
+    pub timezone: String,
 }
 
 // ── Seams ───────────────────────────────────────────────────────────────────
@@ -73,6 +81,37 @@ pub struct DueAlarm {
 pub trait AlarmSource {
     fn due_alarms(&mut self, now: DateTime<Local>) -> Vec<DueAlarm>;
     fn recompute_next_fire(&mut self, id: AlarmId, now: DateTime<Local>);
+    /// Override the alarm's `next_fire` cache to a specific local datetime
+    /// (slice 6 `ShiftForward`). The default impl falls back to recomputing
+    /// from the rule (equivalent to `Suppress`) so mock seams compile
+    /// unchanged.
+    fn set_next_fire(&mut self, id: AlarmId, _target: DateTime<Local>, now: DateTime<Local>) {
+        // Default: ignore the specific target, recompute from rule.
+        self.recompute_next_fire(id, now);
+    }
+}
+
+/// Holiday-lookup seam (slice 6). The scheduler consults this on each due
+/// alarm to decide whether a holiday is active on the alarm's fire date.
+///
+/// Implementations hold a set of holiday dates (from Holiday-role calendars'
+/// all-day events) refreshed on the shared 30-min tick. The check is an O(1)
+/// set lookup — no per-tick API call.
+pub trait HolidayLookup: Send + Sync {
+    /// True if *date* is a holiday (a Holiday-role calendar has an all-day
+    /// event that day).
+    fn is_holiday(&self, date: NaiveDate) -> bool;
+}
+
+/// `HolidayLookup` that reports no holidays — used when no Holiday-role
+/// calendar is configured (or in tests that exercise pre-slice-6 behavior).
+#[derive(Default, Debug, Clone, Copy)]
+pub struct NoHolidays;
+
+impl HolidayLookup for NoHolidays {
+    fn is_holiday(&self, _date: NaiveDate) -> bool {
+        false
+    }
 }
 
 /// Episode-FSM seam (filled by the real `EpisodeController` in group 5).
@@ -143,31 +182,60 @@ pub struct TickReport {
     pub fired: usize,
     /// Number of alarms skipped as missed-on-boot (next_fire advanced).
     pub skipped_missed: usize,
+    /// Number of alarms skipped due to a holiday (slice 6).
+    pub skipped_holiday: usize,
 }
 
-/// The scheduler: owns the alarm source, episode FSM, a clock, and a `booted`
+/// The scheduler: owns the alarm source, episode FSM, a clock, a `booted`
 /// flag (false until the first tick completes, driving the missed-alarm-on-boot
-/// policy of task 1.2).
-pub struct Scheduler<S, F, C> {
+/// policy of task 1.2), and an optional holiday lookup (slice 6).
+pub struct Scheduler<S, F, C, H = NoHolidays> {
     source: S,
     fsm: F,
     clock: C,
     booted: bool,
+    holidays: H,
 }
 
-impl<S, F, C> Scheduler<S, F, C>
+impl<S, F, C> Scheduler<S, F, C, NoHolidays>
 where
     S: AlarmSource,
     F: EpisodeFsm,
     C: Clock,
 {
-    /// Construct a scheduler around its three seams. `booted` starts `false`.
+    /// Construct a scheduler around its three seams with no holiday lookup.
+    /// `booted` starts `false`. (Use [`with_holidays`](Scheduler::with_holidays)
+    /// to attach a `HolidayLookup` for slice 6 holiday suppression.)
     pub fn new(source: S, fsm: F, clock: C) -> Self {
         Self {
             source,
             fsm,
             clock,
             booted: false,
+            holidays: NoHolidays,
+        }
+    }
+}
+
+impl<S, F, C, H> Scheduler<S, F, C, H>
+where
+    S: AlarmSource,
+    F: EpisodeFsm,
+    C: Clock,
+    H: HolidayLookup,
+{
+    /// Attach a holiday lookup to this scheduler (slice 6), replacing any
+    /// previous lookup. Consumes the scheduler and returns one parameterised
+    /// over the new holiday type.
+    pub fn with_holidays<H2: HolidayLookup>(mut self, holidays: H2) -> Scheduler<S, F, C, H2> {
+        // We re-construct rather than mutate so the type parameter changes
+        // from `H` to `H2`.
+        Scheduler {
+            source: self.source,
+            fsm: self.fsm,
+            clock: self.clock,
+            booted: self.booted,
+            holidays,
         }
     }
 
@@ -191,6 +259,7 @@ where
         let alarms_evaluated = due.len();
         let mut fired = 0usize;
         let mut skipped_missed = 0usize;
+        let mut skipped_holiday = 0usize;
 
         // Task 1.3: enter the scheduler_tick span with structured fields. The
         // fields are recorded with their final values once the body is done so
@@ -200,6 +269,7 @@ where
             alarms_evaluated,
             fired,
             skipped_missed,
+            skipped_holiday,
         );
         let _guard = span.enter();
 
@@ -218,10 +288,19 @@ where
                 self.source.recompute_next_fire(alarm.id.clone(), now);
                 skipped_missed += 1;
             } else if alarm.next_fire <= now {
-                // Task 1.1: fire the episode FSM and recompute next_fire.
-                self.fsm.fire(alarm.id.clone());
-                self.source.recompute_next_fire(alarm.id.clone(), now);
-                fired += 1;
+                // Slice 6: holiday suppression. If the alarm's policy is not
+                // `Ignore` and a holiday is active on the alarm's fire date,
+                // the alarm does not fire on that date.
+                let fire_date = alarm.next_fire.date_naive();
+                if alarm.policy != HolidayPolicy::Ignore && self.holidays.is_holiday(fire_date) {
+                    self.suppress_alarm(alarm, now);
+                    skipped_holiday += 1;
+                } else {
+                    // Task 1.1: fire the episode FSM and recompute next_fire.
+                    self.fsm.fire(alarm.id.clone());
+                    self.source.recompute_next_fire(alarm.id.clone(), now);
+                    fired += 1;
+                }
             }
             // Else: the source returned a not-yet-due alarm (next_fire > now).
             // It does not fire and is not recomputed this tick.
@@ -239,15 +318,103 @@ where
         // Record the final counts onto the span (task 1.3 structured fields).
         span.record("fired", fired);
         span.record("skipped_missed", skipped_missed);
+        span.record("skipped_holiday", skipped_holiday);
 
         // Emit an event under the span so the span + fields appear in
         // journald/fmt output for every tick (task 1.3).
-        info!(alarms_evaluated, fired, skipped_missed, "scheduler tick");
+        info!(alarms_evaluated, fired, skipped_missed, skipped_holiday, "scheduler tick");
 
         TickReport {
             alarms_evaluated,
             fired,
             skipped_missed,
+            skipped_holiday,
+        }
+    }
+
+    /// Slice 6: suppress a due alarm whose fire date is a holiday.
+    ///
+    /// - `Suppress`: recompute `next_fire` from the rule after `now` (advances
+    ///   to the next scheduled occurrence — the alarm does not fire today and
+    ///   resumes its normal schedule).
+    /// - `ShiftForward`: advance `next_fire` to the first non-holiday date at
+    ///   the same scheduled wall-clock time, repeating the skip until a
+    ///   non-holiday date is found. Capped at 30 days; past the cap falls back
+    ///   to `Suppress` behavior and logs.
+    fn suppress_alarm(&mut self, alarm: &DueAlarm, now: DateTime<Local>) {
+        match alarm.policy {
+            HolidayPolicy::Suppress => {
+                info!(
+                    alarm_id = %alarm.id,
+                    fire_date = %alarm.next_fire.date_naive(),
+                    policy = "Suppress",
+                    "holiday active — alarm suppressed, advancing next_fire",
+                );
+                self.source.recompute_next_fire(alarm.id.clone(), now);
+            }
+            HolidayPolicy::ShiftForward => {
+                // Resolve the alarm's stored timezone once.
+                let tz: Tz = alarm.timezone.parse().unwrap_or(chrono_tz::Canada::Mountain);
+                let wall_time = alarm.next_fire.time();
+                let fire_date = alarm.next_fire.date_naive();
+
+                // Advance day-by-day from the day after the fire date until a
+                // non-holiday date is found, capped at 30 days.
+                let mut target_date = fire_date;
+                let mut found = false;
+                for _ in 0..30 {
+                    target_date = target_date.succ_opt().unwrap_or(target_date);
+                    if !self.holidays.is_holiday(target_date) {
+                        found = true;
+                        break;
+                    }
+                }
+
+                if found {
+                    // Same scheduled wall-clock time on the first non-holiday
+                    // date, interpreted in the alarm's stored timezone.
+                    let target_local = match tz
+                        .from_local_datetime(
+                            &target_date.and_time(wall_time),
+                        )
+                        .single()
+                    {
+                        Some(dt) => dt.with_timezone(&Local),
+                        None => {
+                            // Ambiguous/nonexistent local time (DST fold);
+                            // fall back to Suppress.
+                            info!(
+                                alarm_id = %alarm.id,
+                                policy = "ShiftForward",
+                                "ambiguous local time on target date — falling back to Suppress",
+                            );
+                            self.source.recompute_next_fire(alarm.id.clone(), now);
+                            return;
+                        }
+                    };
+                    info!(
+                        alarm_id = %alarm.id,
+                        fire_date = %fire_date,
+                        target_date = %target_date,
+                        policy = "ShiftForward",
+                        "holiday active — alarm shifted forward to next non-holiday",
+                    );
+                    self.source.set_next_fire(alarm.id.clone(), target_local, now);
+                } else {
+                    // 30-day cap exceeded — fall back to Suppress.
+                    info!(
+                        alarm_id = %alarm.id,
+                        fire_date = %fire_date,
+                        policy = "ShiftForward",
+                        "holiday run exceeds 30-day cap — falling back to Suppress",
+                    );
+                    self.source.recompute_next_fire(alarm.id.clone(), now);
+                }
+            }
+            HolidayPolicy::Ignore => {
+                // Unreachable: the caller only enters suppression when
+                // policy != Ignore. Defensive no-op.
+            }
         }
     }
 }
@@ -283,10 +450,13 @@ mod tests {
     /// Mock alarm source modelling the real store: `due_alarms` filters by
     /// `next_fire <= now`, and `recompute_next_fire` advances the alarm's
     /// `next_fire` to `now + 1 day` (a stand-in for "next occurrence").
+    /// `set_next_fire` (slice 6) records the explicit target and sets
+    /// `next_fire` to it (for ShiftForward tests).
     #[derive(Default)]
     struct MockSource {
         alarms: Vec<DueAlarm>,
         recomputed: Vec<(AlarmId, DateTime<Local>)>,
+        set_fires: Vec<(AlarmId, DateTime<Local>)>,
         nows: Vec<DateTime<Local>>,
     }
     impl AlarmSource for MockSource {
@@ -299,6 +469,23 @@ mod tests {
             if let Some(a) = self.alarms.iter_mut().find(|a| a.id == id) {
                 a.next_fire = now + Duration::days(1);
             }
+        }
+        fn set_next_fire(&mut self, id: AlarmId, target: DateTime<Local>, _now: DateTime<Local>) {
+            self.set_fires.push((id.clone(), target));
+            if let Some(a) = self.alarms.iter_mut().find(|a| a.id == id) {
+                a.next_fire = target;
+            }
+        }
+    }
+
+    /// Build a `DueAlarm` with default policy (`Suppress`) and a fixed
+    /// timezone, for the pre-slice-6 tests that don't exercise holiday logic.
+    fn due(id: &str, next_fire: DateTime<Local>) -> DueAlarm {
+        DueAlarm {
+            id: id.to_string(),
+            next_fire,
+            policy: HolidayPolicy::default(),
+            timezone: "America/Edmonton".to_string(),
         }
     }
 
@@ -341,7 +528,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(fire);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: "1".to_string(), next_fire: fire });
+        source.alarms.push(due("1", fire));
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -353,7 +540,7 @@ mod tests {
         assert_eq!(report.fired, 1);
         assert_eq!(report.skipped_missed, 0);
 
-        let Scheduler { source, fsm, clock: _, booted } = sched;
+        let Scheduler { source, fsm, clock: _, booted, .. } = sched;
         assert_eq!(fsm.fired, vec!["1".to_string()], "FSM should have fired alarm 1");
         assert_eq!(
             source.recomputed, vec![("1".to_string(), fire)],
@@ -379,7 +566,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(now);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: "2".to_string(), next_fire: future });
+        source.alarms.push(due("2", future));
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -390,7 +577,7 @@ mod tests {
         assert_eq!(report.fired, 0, "nothing should fire");
         assert_eq!(report.skipped_missed, 0);
 
-        let Scheduler { source, fsm, clock: _, booted: _ } = sched;
+        let Scheduler { source, fsm, clock: _, booted: _, .. } = sched;
         assert!(fsm.fired.is_empty(), "FSM should not have fired");
         assert!(
             source.recomputed.is_empty(),
@@ -412,7 +599,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(before);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: "3".to_string(), next_fire: fire });
+        source.alarms.push(due("3", fire));
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -422,14 +609,14 @@ mod tests {
         assert_eq!(r1.fired, 0, "tick before fire time should not fire");
 
         // Advance the mock clock to the fire time and tick again.
-        let Scheduler { source, fsm, mut clock, booted } = sched;
+        let Scheduler { source, fsm, mut clock, booted, .. } = sched;
         clock.set(fire);
         // Re-bind to keep ticking the same scheduler instance.
-        let mut sched = Scheduler { source, fsm, clock, booted };
+        let mut sched = Scheduler { source, fsm, clock, booted, holidays: NoHolidays };
         let r2 = sched.tick();
         assert_eq!(r2.fired, 1, "tick at fire time should fire");
 
-        let Scheduler { source, fsm, clock: _, booted: _ } = sched;
+        let Scheduler { source, fsm, clock: _, booted: _, .. } = sched;
         // The clock was consulted twice (once per tick), proving re-read.
         assert_eq!(
             source.nows, vec![before, fire],
@@ -450,7 +637,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(now);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: "7".to_string(), next_fire: past });
+        source.alarms.push(due("7", past));
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -461,7 +648,7 @@ mod tests {
         assert_eq!(r1.fired, 0, "missed alarm must not fire");
         assert_eq!(r1.skipped_missed, 1);
 
-        let Scheduler { source, fsm, mut clock, booted } = sched;
+        let Scheduler { source, fsm, mut clock, booted, .. } = sched;
         assert!(fsm.fired.is_empty(), "FSM must not fire a missed-on-boot alarm");
         assert_eq!(
             source.recomputed, vec![("7".to_string(), now)],
@@ -477,12 +664,12 @@ mod tests {
         // Second tick at the same `now`: the alarm's next_fire is now in the
         // future, so the store does not surface it and it does not re-fire.
         clock.set(now);
-        let mut sched = Scheduler { source, fsm, clock, booted };
+        let mut sched = Scheduler { source, fsm, clock, booted, holidays: NoHolidays };
         let r2 = sched.tick();
         assert_eq!(r2.fired, 0, "second tick should not re-fire the missed alarm");
         assert_eq!(r2.skipped_missed, 0);
 
-        let Scheduler { source, fsm, clock: _, booted: _ } = sched;
+        let Scheduler { source, fsm, clock: _, booted: _, .. } = sched;
         assert!(fsm.fired.is_empty());
         // Only one recompute (from the first-tick skip) ever happened.
         assert_eq!(source.recomputed.len(), 1);
@@ -496,7 +683,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(fire);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: "9".to_string(), next_fire: fire });
+        source.alarms.push(due("9", fire));
         let fsm = MockFsm::default();
 
         let mut sched = Scheduler::new(source, fsm, clock);
@@ -504,7 +691,7 @@ mod tests {
         assert_eq!(r.fired, 1, "now == next_fire at boot should fire, not skip");
         assert_eq!(r.skipped_missed, 0);
 
-        let Scheduler { source: _, fsm, clock: _, booted: _ } = sched;
+        let Scheduler { source: _, fsm, clock: _, booted: _, .. } = sched;
         assert_eq!(fsm.fired, vec!["9".to_string()]);
     }
 
@@ -611,7 +798,7 @@ mod tests {
         let mut clock = MockClock::default();
         clock.set(fire);
         let mut source = MockSource::default();
-        source.alarms.push(DueAlarm { id: "11".to_string(), next_fire: fire });
+        source.alarms.push(due("11", fire));
         let fsm = MockFsm::default();
         let mut sched = Scheduler::new(source, fsm, clock);
 
@@ -709,7 +896,7 @@ mod tests {
         let mut sched = Scheduler::new(MockSource::default(), fsm, clock);
         sched.tick();
 
-        let Scheduler { source: _, fsm, clock: _ , booted: _ } = sched;
+        let Scheduler { source: _, fsm, clock: _, booted: _, .. } = sched;
         assert_eq!(fsm.tick_count, 1, "on_tick called once per tick");
         assert_eq!(fsm.last_now, Some(now), "on_tick received the re-read now");
     }
@@ -729,5 +916,223 @@ mod tests {
         // No panic:
         sched.tick();
         assert!(true, "noop on_tick did not panic");
+    }
+
+    // ── Slice 6: holiday suppression ─────────────────────────────────────
+
+    /// Mock holiday lookup backed by a set of holiday dates.
+    #[derive(Default)]
+    struct MockHolidays {
+        dates: std::collections::HashSet<chrono::NaiveDate>,
+    }
+    impl HolidayLookup for MockHolidays {
+        fn is_holiday(&self, date: chrono::NaiveDate) -> bool {
+            self.dates.contains(&date)
+        }
+    }
+
+    /// Build a `DueAlarm` with an explicit holiday policy.
+    fn due_pol(id: &str, next_fire: DateTime<Local>, policy: HolidayPolicy) -> DueAlarm {
+        DueAlarm {
+            id: id.to_string(),
+            next_fire,
+            policy,
+            timezone: "America/Edmonton".to_string(),
+        }
+    }
+
+    /// Scenario: a daily alarm with `Suppress` on a statutory holiday does
+    /// not fire; `next_fire` is recomputed (advanced) and the skip is logged.
+    #[test]
+    fn suppress_policy_skips_on_holiday() {
+        let fire = t(2026, 7, 1, 7, 0); // Canada Day — a holiday
+        let mut clock = MockClock::default();
+        clock.set(fire);
+        let mut source = MockSource::default();
+        source.alarms.push(due_pol("h1", fire, HolidayPolicy::Suppress));
+        let fsm = MockFsm::default();
+
+        let mut holidays = MockHolidays::default();
+        holidays.dates.insert(chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+
+        let mut sched = Scheduler::new(source, fsm, clock).with_holidays(holidays);
+        let report = sched.tick();
+
+        assert_eq!(report.fired, 0, "Suppress alarm must not fire on a holiday");
+        assert_eq!(report.skipped_holiday, 1);
+        assert_eq!(report.skipped_missed, 0);
+
+        let Scheduler { source, fsm, clock: _, booted: _, holidays: _ } = sched;
+        assert!(fsm.fired.is_empty(), "FSM must not have fired");
+        assert_eq!(
+            source.recomputed.len(), 1,
+            "Suppress advances next_fire via recompute",
+        );
+        // MockSource advances by +1 day → next_fire is the day after the
+        // holiday (the next scheduled occurrence).
+        assert_eq!(source.alarms[0].next_fire, fire + Duration::days(1));
+    }
+
+    /// Scenario: a daily alarm with `Ignore` fires normally on a holiday.
+    #[test]
+    fn ignore_policy_fires_on_holiday() {
+        let fire = t(2026, 7, 1, 7, 0);
+        let mut clock = MockClock::default();
+        clock.set(fire);
+        let mut source = MockSource::default();
+        source.alarms.push(due_pol("h2", fire, HolidayPolicy::Ignore));
+        let fsm = MockFsm::default();
+
+        let mut holidays = MockHolidays::default();
+        holidays.dates.insert(chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+
+        let mut sched = Scheduler::new(source, fsm, clock).with_holidays(holidays);
+        let report = sched.tick();
+
+        assert_eq!(report.fired, 1, "Ignore alarm fires on a holiday");
+        assert_eq!(report.skipped_holiday, 0);
+
+        let Scheduler { source, fsm, clock: _, booted: _, holidays: _ } = sched;
+        assert_eq!(fsm.fired, vec!["h2".to_string()]);
+        assert_eq!(source.recomputed.len(), 1);
+    }
+
+    /// Scenario: a daily alarm with `Suppress` on a non-holiday fires normally.
+    #[test]
+    fn suppress_policy_fires_on_non_holiday() {
+        let fire = t(2026, 7, 2, 7, 0); // not a holiday
+        let mut clock = MockClock::default();
+        clock.set(fire);
+        let mut source = MockSource::default();
+        source.alarms.push(due_pol("h3", fire, HolidayPolicy::Suppress));
+        let fsm = MockFsm::default();
+
+        let holidays = MockHolidays::default(); // no holidays
+
+        let mut sched = Scheduler::new(source, fsm, clock).with_holidays(holidays);
+        let report = sched.tick();
+
+        assert_eq!(report.fired, 1, "Suppress alarm fires on a non-holiday");
+        assert_eq!(report.skipped_holiday, 0);
+
+        let Scheduler { source, fsm, clock: _, booted: _, holidays: _ } = sched;
+        assert_eq!(fsm.fired, vec!["h3".to_string()]);
+    }
+
+    /// Scenario: a personal all-day event (modeled as a holiday date) suppresses
+    /// a `Suppress`-policy alarm — the same as a statutory holiday. (This tests
+    /// that holiday membership is date-based regardless of source.)
+    #[test]
+    fn personal_all_day_event_is_a_holiday() {
+        let fire = t(2026, 7, 15, 7, 0); // personal vacation day
+        let mut clock = MockClock::default();
+        clock.set(fire);
+        let mut source = MockSource::default();
+        source.alarms.push(due_pol("h4", fire, HolidayPolicy::Suppress));
+        let fsm = MockFsm::default();
+
+        let mut holidays = MockHolidays::default();
+        holidays.dates.insert(chrono::NaiveDate::from_ymd_opt(2026, 7, 15).unwrap());
+
+        let mut sched = Scheduler::new(source, fsm, clock).with_holidays(holidays);
+        let report = sched.tick();
+
+        assert_eq!(report.fired, 0);
+        assert_eq!(report.skipped_holiday, 1);
+    }
+
+    /// Scenario: `ShiftForward` skips a 3-day holiday weekend to the first
+    /// non-holiday day at the same wall-clock time. `next_fire` is set to that
+    /// date via `set_next_fire` (not recomputed from the rule).
+    #[test]
+    fn shift_forward_skips_multi_day_holiday() {
+        // Fire on the first day of a 3-day holiday weekend (Jul 1–3).
+        let fire = t(2026, 7, 1, 7, 0);
+        let mut clock = MockClock::default();
+        clock.set(fire);
+        let mut source = MockSource::default();
+        source.alarms.push(due_pol("h5", fire, HolidayPolicy::ShiftForward));
+        let fsm = MockFsm::default();
+
+        let mut holidays = MockHolidays::default();
+        holidays.dates.insert(chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+        holidays.dates.insert(chrono::NaiveDate::from_ymd_opt(2026, 7, 2).unwrap());
+        holidays.dates.insert(chrono::NaiveDate::from_ymd_opt(2026, 7, 3).unwrap());
+
+        let mut sched = Scheduler::new(source, fsm, clock).with_holidays(holidays);
+        let report = sched.tick();
+
+        assert_eq!(report.fired, 0, "ShiftForward alarm must not fire on holiday days");
+        assert_eq!(report.skipped_holiday, 1);
+
+        let Scheduler { source, fsm, clock: _, booted: _, holidays: _ } = sched;
+        assert!(fsm.fired.is_empty());
+        // The source was asked to set next_fire to a specific target date (not
+        // recomputed from the rule), and no recompute happened.
+        assert_eq!(source.set_fires.len(), 1, "ShiftForward uses set_next_fire");
+        assert!(source.recomputed.is_empty(), "ShiftForward does not recompute");
+
+        let (id, target) = &source.set_fires[0];
+        assert_eq!(id, "h5");
+        // Target is the first non-holiday (Jul 4) at the same wall-clock time.
+        assert_eq!(target.date_naive(), chrono::NaiveDate::from_ymd_opt(2026, 7, 4).unwrap());
+        assert_eq!(target.time(), fire.time());
+
+        // The mock source set the alarm's next_fire to the target.
+        assert_eq!(source.alarms[0].next_fire, *target);
+    }
+
+    /// Scenario: `ShiftForward` with a holiday run longer than 30 days falls
+    /// back to `Suppress` behavior — it recomputes next_fire from the rule
+    /// instead of looping forever.
+    #[test]
+    fn shift_forward_cap_falls_back_to_suppress() {
+        let fire = t(2026, 7, 1, 7, 0);
+        let mut clock = MockClock::default();
+        clock.set(fire);
+        let mut source = MockSource::default();
+        source.alarms.push(due_pol("h6", fire, HolidayPolicy::ShiftForward));
+        let fsm = MockFsm::default();
+
+        // 31 consecutive holidays starting Jul 1.
+        let mut holidays = MockHolidays::default();
+        for i in 0..31 {
+            holidays.dates.insert(
+                chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap() + Duration::days(i),
+            );
+        }
+
+        let mut sched = Scheduler::new(source, fsm, clock).with_holidays(holidays);
+        let report = sched.tick();
+
+        assert_eq!(report.fired, 0);
+        assert_eq!(report.skipped_holiday, 1);
+
+        let Scheduler { source, fsm, clock: _, booted: _, holidays: _ } = sched;
+        // Past the 30-day cap → Suppress fallback → recompute, no set_next_fire.
+        assert!(source.set_fires.is_empty(), "cap exceeded → Suppress fallback, no set_next_fire");
+        assert_eq!(source.recomputed.len(), 1, "cap exceeded → recompute (Suppress)");
+        // MockSource advances by +1 day.
+        assert_eq!(source.alarms[0].next_fire, fire + Duration::days(1));
+    }
+
+    /// Scenario: no `HolidayLookup` attached → the scheduler behaves as before
+    /// slice 6 (a `Suppress` alarm fires even on a date that *would* be a
+    /// holiday, because nothing checks). This guards backward compatibility.
+    #[test]
+    fn no_holiday_lookup_means_normal_fire() {
+        let fire = t(2026, 7, 1, 7, 0);
+        let mut clock = MockClock::default();
+        clock.set(fire);
+        let mut source = MockSource::default();
+        source.alarms.push(due_pol("h7", fire, HolidayPolicy::Suppress));
+        let fsm = MockFsm::default();
+
+        // No with_holidays → NoHolidays (default).
+        let mut sched = Scheduler::new(source, fsm, clock);
+        let report = sched.tick();
+
+        assert_eq!(report.fired, 1);
+        assert_eq!(report.skipped_holiday, 0);
     }
 }

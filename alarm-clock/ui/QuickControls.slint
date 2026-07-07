@@ -1,0 +1,202 @@
+// Quick-controls swipe-up overlay (slice 7 / task 4.2, design D3).
+//
+// Rendered above all panels when `ThemeGlobal.quick-controls-visible` is true.
+// Contains a volume slider, a brightness slider, and play/pause + next/prev
+// (when the active source supports them). Dismissed by tap-outside or a 5 s
+// idle timer (driven from Rust). Opening suspends the bedtime idle timer;
+// dismissing re-arms it (task 4.3, wired in Rust).
+
+import { ThemeGlobal } from "ThemeGlobal.slint";
+
+export component QuickControls inherits Rectangle {
+    // Transport control tapped: "play" | "pause" | "stop" | "next" | "previous".
+    callback transport-tapped(string);
+    // Volume / brightness slider dragged to a new value (0..=100).
+    callback volume-changed(int);
+    callback brightness-changed(int);
+    // Tap-outside dismiss.
+    callback dismiss-requested();
+
+    background: rgba(0, 0, 0, 0.55);
+
+    // Tap-outside area: a tap on the backdrop dismisses the overlay.
+    backdrop := TouchArea {
+        width: root.width;
+        height: root.height;
+        clicked => { root.dismiss-requested(); }
+    }
+
+    // The overlay card itself (centered, ~70% width).
+    Rectangle {
+        width: root.width * 0.78;
+        height: 280px;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        border-radius: ThemeGlobal.card-radius * 1px;
+        background: ThemeGlobal.card-background;
+        border-color: ThemeGlobal.card-border;
+        border-width: ThemeGlobal.card-border-width * 1px;
+        drop-shadow-color: ThemeGlobal.card-shadow-color;
+        drop-shadow-blur: ThemeGlobal.card-shadow-blur * 1px;
+        drop-shadow-offset-y: ThemeGlobal.card-shadow-offset * 1px;
+
+        // Eat taps inside the card so they don't bubble to the backdrop.
+        card-ta := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { }
+        }
+
+        VerticalLayout {
+            x: 0; y: 0;
+            width: parent.width;
+            height: parent.height;
+            padding: 22px;
+            spacing: 20px;
+            alignment: center;
+
+            Text {
+                text: "Quick Controls";
+                font-size: 18px;
+                color: ThemeGlobal.text-color;
+                font-family: ThemeGlobal.font-family;
+                horizontal-alignment: center;
+            }
+
+            // ── Volume slider ─────────────────────────────────────────
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: "Volume  " + ThemeGlobal.quick-volume + "%";
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                }
+                vol-track := Rectangle {
+                    height: 36px;
+                    width: parent.width;
+                    border-radius: 8px;
+                    background: rgba(128, 128, 128, 0.25);
+                    vol-ta := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        moved => {
+                            if vol-ta.pressed {
+                                let fx = max(0, vol-ta.mouse_x / 1px);
+                                let w = vol-track.width / 1px;
+                                root.volume-changed(clamp(fx * 100 / max(1, w), 0, 100));
+                            }
+                        }
+                        clicked => {
+                            let fx = max(0, vol-ta.mouse_x / 1px);
+                            let w = vol-track.width / 1px;
+                            root.volume-changed(clamp(fx * 100 / max(1, w), 0, 100));
+                        }
+                    }
+                    Rectangle {
+                        height: parent.height;
+                        width: parent.width * (ThemeGlobal.quick-volume / 100);
+                        border-radius: 8px;
+                        background: ThemeGlobal.accent-color;
+                    }
+                }
+            }
+
+            // ── Brightness slider ─────────────────────────────────────
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: "Brightness  " + ThemeGlobal.quick-brightness + "%";
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                }
+                bright-track := Rectangle {
+                    height: 36px;
+                    width: parent.width;
+                    border-radius: 8px;
+                    background: rgba(128, 128, 128, 0.25);
+                    bright-ta := TouchArea {
+                        width: parent.width;
+                        height: parent.height;
+                        moved => {
+                            if bright-ta.pressed {
+                                let fx = max(0, bright-ta.mouse_x / 1px);
+                                let w = bright-track.width / 1px;
+                                root.brightness-changed(clamp(fx * 100 / max(1, w), 0, 100));
+                            }
+                        }
+                        clicked => {
+                            let fx = max(0, bright-ta.mouse_x / 1px);
+                            let w = bright-track.width / 1px;
+                            root.brightness-changed(clamp(fx * 100 / max(1, w), 0, 100));
+                        }
+                    }
+                    Rectangle {
+                        height: parent.height;
+                        width: parent.width * (ThemeGlobal.quick-brightness / 100);
+                        border-radius: 8px;
+                        background: ThemeGlobal.accent-color;
+                    }
+                }
+            }
+
+            // ── Transport row (caps-driven) ───────────────────────────
+            HorizontalLayout {
+                alignment: center;
+                spacing: 24px;
+
+                if ThemeGlobal.media-caps-prev: Text {
+                    text: "⏮";
+                    font-size: 28px;
+                    color: ThemeGlobal.text-color;
+                    vertical-alignment: center;
+                    prev-ta := TouchArea {
+                        width: parent.width; height: parent.height;
+                        clicked => { root.transport-tapped("previous"); }
+                    }
+                }
+
+                Rectangle {
+                    width: 56px; height: 56px;
+                    border-radius: 28px;
+                    background: ThemeGlobal.accent-color;
+                    play-ta := TouchArea {
+                        width: parent.width; height: parent.height;
+                        enabled: !ThemeGlobal.media-buffering;
+                        clicked => {
+                            if ThemeGlobal.media-playing {
+                                // Radio: stop. Full source: pause.
+                                root.transport-tapped(ThemeGlobal.media-caps-pause ? "pause" : "stop");
+                            } else {
+                                root.transport-tapped("play");
+                            }
+                        }
+                    }
+                    Text {
+                        text: ThemeGlobal.media-buffering
+                            ? ["|", "/", "–", "\\"][ThemeGlobal.media-spinner-frame]
+                            : (ThemeGlobal.media-playing
+                                ? (ThemeGlobal.media-caps-pause ? "⏸" : "⏹")
+                                : "▶");
+                        font-size: 30px;
+                        color: ThemeGlobal.text-color;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+
+                if ThemeGlobal.media-caps-next: Text {
+                    text: "⏭";
+                    font-size: 28px;
+                    color: ThemeGlobal.text-color;
+                    vertical-alignment: center;
+                    next-ta := TouchArea {
+                        width: parent.width; height: parent.height;
+                        clicked => { root.transport-tapped("next"); }
+                    }
+                }
+            }
+        }
+    }
+}
