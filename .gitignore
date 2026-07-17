@@ -7,5 +7,7 @@ target/**
 # temp data
 data/
 
+.kilo/
+
 # Local config override (secrets, e.g. PirateWeather API key)
 config.local.toml
