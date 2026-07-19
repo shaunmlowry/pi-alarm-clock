@@ -38,8 +38,9 @@ use crate::alarm_store::{CalendarRole, CalendarSource};
 ///
 /// Fields are named per Google's OAuth2 device-flow spec. The Pi displays
 /// `user_code` and `verification_url` (often `google.com/device`) and a QR
-/// encoding `verification_url?user_code=...`; it then polls `expires_in`
-/// seconds at `interval` cadence.
+/// encoding only `verification_url`; it then polls `expires_in`
+/// seconds at `interval` cadence. The `user_code` is shown separately for the
+/// user to type in — Google's device page does not accept it as a query param.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceCode {
     /// The device verification code — the Pi displays this.
@@ -235,8 +236,9 @@ pub async fn poll_token_once(
 /// Live device-flow pairing driver: requests a code, polls until the user
 /// consents or the device code expires, and returns the tokens to persist.
 ///
-/// The QR to display is `format!("{}/?user_code={}", device.verification_url,
-/// device.user_code)` — the [`crate::ui`] QR component renders it.
+/// The QR to display encodes only `device.verification_url` — the
+/// [`crate::ui`] QR component renders it and shows `device.user_code`
+/// separately for the user to type in.
 pub async fn pair_device_flow(
     client: &reqwest::Client,
     device_url: &str,

@@ -34,7 +34,14 @@ async function api(method, path, body) {
         renderUnpaired('Session expired — please scan the QR again.');
         throw new Error('unauthorized');
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try {
+            const err = await res.json();
+            if (err && err.message) msg = err.message;
+        } catch (_) {}
+        throw new Error(msg);
+    }
     return res.json();
 }
 
@@ -95,6 +102,40 @@ function renderConfig() {
             <input id="brightnessFloor" type="range" min="0" max="100" value="10">
             <button id="saveBrightnessBtn">Save</button>
         </section>
+        <section id="calendarsSection">
+            <h2>Google Calendars</h2>
+            <div id="pairWrap">
+                <button id="pairBtn">Pair Google Account</button>
+                <div id="pairCode" hidden>
+                    <p>On another device, visit <a id="pairUrl" target="_blank" rel="noopener"></a>
+                    and enter code <strong id="pairUserCode"></strong>.</p>
+                    <p class="muted" id="pairStatus">Waiting for you to authorize…</p>
+                </div>
+            </div>
+            <div id="calendarsList"></div>
+            <button id="discoverBtn">Discover Google Calendars</button>
+            <div id="discoverWrap" hidden>
+                <h3>Add a Calendar</h3>
+                <select id="discoverSelect"></select>
+                <div class="row">
+                    <select id="calRole">
+                        <option value="Agenda">Agenda</option>
+                        <option value="Holiday">Holiday</option>
+                    </select>
+                    <button id="addDiscoveredBtn">Add</button>
+                </div>
+            </div>
+            <h3>Add by ID</h3>
+            <input id="calId" placeholder="Google Calendar ID (e.g. primary)">
+            <input id="calName" placeholder="Display name">
+            <div class="row">
+                <select id="calRoleManual">
+                    <option value="Agenda">Agenda</option>
+                    <option value="Holiday">Holiday</option>
+                </select>
+                <button id="addCalBtn">Add</button>
+            </div>
+        </section>
     `;
 
     document.getElementById('addAlarmBtn').onclick = async () => {
@@ -144,6 +185,85 @@ function renderConfig() {
         await api('PUT', '/display', { brightness_floor: parseInt(document.getElementById('brightnessFloor').value, 10) });
     };
 
+    let pairPoll = null;
+    document.getElementById('pairBtn').onclick = async () => {
+        const codeWrap = document.getElementById('pairCode');
+        try {
+            const data = await api('POST', '/calendars/pair', {});
+            if (data.verification_url) {
+                document.getElementById('pairUrl').textContent = data.verification_url;
+                document.getElementById('pairUrl').href = data.verification_url;
+                document.getElementById('pairUserCode').textContent = data.user_code;
+                document.getElementById('pairStatus').textContent = 'Waiting for you to authorize…';
+                codeWrap.hidden = false;
+                // Poll for completion, then refresh the calendar list.
+                if (pairPoll) clearInterval(pairPoll);
+                pairPoll = setInterval(async () => {
+                    try {
+                        const st = await api('GET', '/calendars/pair/status');
+                        document.getElementById('pairStatus').textContent =
+                            st.state === 'paired' ? 'Paired! Refreshing calendars…'
+                            : st.state === 'error' ? ('Error: ' + (st.message || 'failed'))
+                            : 'Waiting for you to authorize…';
+                        if (st.state === 'paired' || st.state === 'error') {
+                            clearInterval(pairPoll);
+                            pairPoll = null;
+                            codeWrap.hidden = true;
+                            loadCalendars();
+                        }
+                    } catch (_) { /* ignore transient poll errors */ }
+                }, 3000);
+            } else {
+                // Surface the backend's error reason instead of a generic message.
+                alert('Pairing failed: ' + (data.message || 'unexpected pairing response.'));
+            }
+        } catch (e) {
+            alert('Pairing failed: ' + (e && e.message ? e.message : 'could not reach the device'));
+        }
+    };
+
+    loadCalendars();
+
+    document.getElementById('addCalBtn').onclick = async () => {
+        const id = document.getElementById('calId').value.trim();
+        const name = document.getElementById('calName').value.trim();
+        const role = document.getElementById('calRoleManual').value;
+        if (!id || !name) return alert('Fill calendar ID and name');
+        await api('POST', '/calendars', { google_calendar_id: id, display_name: name, role });
+        document.getElementById('calId').value = '';
+        document.getElementById('calName').value = '';
+        loadCalendars();
+    };
+
+    document.getElementById('discoverBtn').onclick = async () => {
+        const btn = document.getElementById('discoverBtn');
+        btn.disabled = true;
+        try {
+            const data = await api('POST', '/calendars/discover', {});
+            const list = data.calendars || [];
+            const sel = document.getElementById('discoverSelect');
+            sel.innerHTML = list.map(c => `<option value="${c[0]}">${c[1]} (${c[0]})</option>`).join('');
+            const wrap = document.getElementById('discoverWrap');
+            wrap.hidden = list.length === 0;
+            if (list.length === 0) alert('No Google calendars found, or the account is not paired on the Pi.');
+        } catch (e) {
+            alert('Discovery failed — is the Google account paired on the Pi?');
+        } finally {
+            btn.disabled = false;
+        }
+    };
+
+    document.getElementById('addDiscoveredBtn').onclick = async () => {
+        const sel = document.getElementById('discoverSelect');
+        const id = sel.value;
+        const name = sel.options[sel.selectedIndex].text.split(' (')[0];
+        const role = document.getElementById('calRole').value;
+        if (!id) return;
+        await api('POST', '/calendars', { google_calendar_id: id, display_name: name, role });
+        document.getElementById('discoverWrap').hidden = true;
+        loadCalendars();
+    };
+
     loadAlarms();
     loadFavorites();
 }
@@ -166,6 +286,26 @@ async function loadFavorites() {
     list.innerHTML = favorites.length === 0
         ? '<p class="muted">No favorites yet.</p>'
         : favorites.map(f => `<div class="item"><strong>${f.name}</strong> <span class="muted">(${f.source_type})</span></div>`).join('');
+}
+
+async function loadCalendars() {
+    const data = await api('GET', '/calendars');
+    const list = document.getElementById('calendarsList');
+    if (!list) return;
+    const calendars = data.calendars || [];
+    list.innerHTML = calendars.length === 0
+        ? '<p class="muted">No calendars configured.</p>'
+        : calendars.map(c => `<div class="item"><strong>${escapeHtml(c.display_name)}</strong> <span class="muted">(${escapeHtml(c.role)})</span> <button data-id="${encodeURIComponent(c.google_calendar_id)}">Remove</button></div>`).join('');
+    list.querySelectorAll('button[data-id]').forEach(btn => {
+        btn.onclick = async () => {
+            await api('DELETE', '/calendars/' + btn.dataset.id);
+            loadCalendars();
+        };
+    });
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
 }
 
 document.getElementById('revokeBtn').onclick = async () => {

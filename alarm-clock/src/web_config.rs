@@ -55,6 +55,29 @@ pub enum WebCmd {
     /// List configured calendars
     ListCalendars { reply: oneshot::Sender<WebReply> },
 
+    /// Add or update a calendar source
+    UpsertCalendar {
+        calendar: CalendarSource,
+        reply: oneshot::Sender<WebReply>,
+    },
+
+    /// Delete a calendar source by Google calendar id
+    DeleteCalendar {
+        google_calendar_id: String,
+        reply: oneshot::Sender<WebReply>,
+    },
+
+    /// Discover the user's Google calendars (requires an active Google pairing)
+    DiscoverCalendars { reply: oneshot::Sender<WebReply> },
+
+    /// Initiate Google OAuth2 device-flow pairing (triggered from the web UI).
+    /// The device code (verification URL + user code) is returned so the web
+    /// client can display it for the user to consent on another device.
+    PairCalendar { reply: oneshot::Sender<WebReply> },
+
+    /// Read the current status of a web-initiated Google account pairing.
+    CalendarPairStatus { reply: oneshot::Sender<WebReply> },
+
     /// Set weather city
     SetWeatherCity {
         city: String,
@@ -102,6 +125,11 @@ impl WebCmd {
             WebCmd::UpsertFavorite { reply, .. } => reply,
             WebCmd::DeleteFavorite { reply, .. } => reply,
             WebCmd::ListCalendars { reply } => reply,
+            WebCmd::UpsertCalendar { reply, .. } => reply,
+            WebCmd::DeleteCalendar { reply, .. } => reply,
+            WebCmd::DiscoverCalendars { reply } => reply,
+            WebCmd::PairCalendar { reply, .. } => reply,
+            WebCmd::CalendarPairStatus { reply } => reply,
             WebCmd::SetWeatherCity { reply, .. } => reply,
             WebCmd::SetBedtime { reply, .. } => reply,
             WebCmd::SetTheme { reply, .. } => reply,
@@ -132,6 +160,25 @@ pub enum WebReply {
     /// Successful calendar list
     Calendars {
         calendars: Vec<CalendarSource>,
+    },
+
+    /// Successful discovered Google calendar list (from the user's account)
+    DiscoveredCalendars {
+        calendars: Vec<(String, String)>,
+    },
+
+    /// Device-flow pairing device code (web-initiated pairing). The web client
+    /// displays `verification_url` + `user_code` for the user to consent.
+    CalendarPairingCode {
+        verification_url: String,
+        user_code: String,
+    },
+
+    /// Current status of a web-initiated Google account pairing.
+    CalendarPairStatus {
+        #[serde(rename = "state")]
+        pair_status: String,
+        message: Option<String>,
     },
 
     /// Pairing successful
@@ -199,6 +246,21 @@ impl WebCommandSender {
                 WebCmd::DeleteFavorite { favorite_id, reply: reply_tx }
             }
             WebCmd::ListCalendars { reply: _ } => WebCmd::ListCalendars { reply: reply_tx },
+            WebCmd::UpsertCalendar { calendar, .. } => {
+                WebCmd::UpsertCalendar { calendar, reply: reply_tx }
+            }
+            WebCmd::DeleteCalendar { google_calendar_id, .. } => {
+                WebCmd::DeleteCalendar { google_calendar_id, reply: reply_tx }
+            }
+            WebCmd::DiscoverCalendars { reply: _ } => {
+                WebCmd::DiscoverCalendars { reply: reply_tx }
+            }
+            WebCmd::PairCalendar { reply: _ } => {
+                WebCmd::PairCalendar { reply: reply_tx }
+            }
+            WebCmd::CalendarPairStatus { reply: _ } => {
+                WebCmd::CalendarPairStatus { reply: reply_tx }
+            }
             WebCmd::SetWeatherCity { city, .. } => {
                 WebCmd::SetWeatherCity { city, reply: reply_tx }
             }
@@ -444,7 +506,11 @@ pub fn web_routes(state: WebCommandSender) -> Router {
         .route("/api/alarms/{id}", put(update_alarm).delete(delete_alarm))
         .route("/api/favorites", get(list_favorites).post(create_favorite))
         .route("/api/favorites/{id}", put(update_favorite).delete(delete_favorite))
-        .route("/api/calendars", get(list_calendars))
+        .route("/api/calendars", get(list_calendars).post(create_calendar))
+        .route("/api/calendars/discover", post(discover_calendars))
+        .route("/api/calendars/pair", post(pair_calendar))
+        .route("/api/calendars/pair/status", get(calendar_pair_status))
+        .route("/api/calendars/{id}", delete(delete_calendar))
         .route("/api/weather-city", put(set_weather_city))
         .route("/api/bedtime", put(set_bedtime))
         .route("/api/theme", put(set_theme))
@@ -599,6 +665,74 @@ async fn delete_favorite(
 async fn list_calendars(State(sender): State<WebCommandSender>) -> impl IntoResponse {
     let (reply_tx, reply_rx) = oneshot::channel();
     match sender.sender.send(WebCmd::ListCalendars { reply: reply_tx }).await {
+        Ok(()) => match reply_rx.await {
+            Ok(reply) => (StatusCode::OK, Json(reply)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+    }
+}
+
+async fn discover_calendars(State(sender): State<WebCommandSender>) -> impl IntoResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match sender.sender.send(WebCmd::DiscoverCalendars { reply: reply_tx }).await {
+        Ok(()) => match reply_rx.await {
+            Ok(reply) => (StatusCode::OK, Json(reply)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+    }
+}
+
+async fn create_calendar(
+    State(sender): State<WebCommandSender>,
+    JsonExtractor(dto): JsonExtractor<CalendarDto>,
+) -> impl IntoResponse {
+    if dto.google_calendar_id.trim().is_empty() || dto.display_name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(WebReply::Error { message: "google_calendar_id and display_name are required".into() }),
+        );
+    }
+    let cal: CalendarSource = dto.into();
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match sender.sender.send(WebCmd::UpsertCalendar { calendar: cal, reply: reply_tx }).await {
+        Ok(()) => match reply_rx.await {
+            Ok(reply) => (StatusCode::CREATED, Json(reply)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+    }
+}
+
+async fn delete_calendar(
+    State(sender): State<WebCommandSender>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match sender.sender.send(WebCmd::DeleteCalendar { google_calendar_id: id, reply: reply_tx }).await {
+        Ok(()) => match reply_rx.await {
+            Ok(reply) => (StatusCode::OK, Json(reply)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+    }
+}
+
+async fn pair_calendar(State(sender): State<WebCommandSender>) -> impl IntoResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match sender.sender.send(WebCmd::PairCalendar { reply: reply_tx }).await {
+        Ok(()) => match reply_rx.await {
+            Ok(reply) => (StatusCode::OK, Json(reply)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),
+    }
+}
+
+async fn calendar_pair_status(State(sender): State<WebCommandSender>) -> impl IntoResponse {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    match sender.sender.send(WebCmd::CalendarPairStatus { reply: reply_tx }).await {
         Ok(()) => match reply_rx.await {
             Ok(reply) => (StatusCode::OK, Json(reply)),
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(WebReply::Error { message: e.to_string() })),

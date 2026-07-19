@@ -1,10 +1,10 @@
 //! QR code rendering (slice 6 / task 5.3).
 //!
-//! Renders the Google device-flow pairing URL (`verification_url?user_code=…`)
-//! to a [`slint::Image`] for display on the Settings panel. Uses the `qrcode`
+//! Renders the Google device-flow pairing URL (`verification_url`) to a
+//! [`slint::Image`] for display on the Settings panel. Uses the `qrcode`
 //! crate to build the matrix; the app renders it to an RGB pixel buffer at a
 //! configurable scale with a quiet zone, so it scans reliably on the Pi's
-//! display.
+//! display. The `user_code` is shown separately for the user to type in.
 
 use slint::{Image, SharedPixelBuffer, Rgb8Pixel};
 

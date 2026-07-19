@@ -67,6 +67,28 @@ use reqwest;
 use serde_json::Value as JsonValue;
 use serde::{Deserialize, Serialize};
 
+/// Shared slot holding the web reply sender for an in-flight calendar
+/// discovery (web `POST /api/calendars/discover`). Set by `dispatch_web_cmd`
+/// and consumed by the `Reply::CalendarList` drain arm, which ships the
+/// read-only list of the user's Google calendars back to the web client
+/// instead of auto-seeding them into the `calendars` table.
+static PENDING_DISCOVERY: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<crate::web_config::WebReply>>> =
+    std::sync::Mutex::new(None);
+
+/// Shared slot holding the web reply sender for an in-flight Google account
+/// pairing (web `POST /api/calendars/pair`). Set by `dispatch_web_cmd` and
+/// consumed by the `Reply::DeviceCode` drain arm, which ships the device code
+/// (verification URL + user code) back to the web client for the user to
+/// consent on another device.
+static PENDING_CALENDAR_PAIR: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<crate::web_config::WebReply>>> =
+    std::sync::Mutex::new(None);
+
+/// Tracks the progress of a web-initiated Google account pairing so the web
+/// client can poll `GET /api/calendars/pair/status` while the user consents.
+/// States: `idle`, `pending`, `paired`, `error`.
+static CALENDAR_PAIR_STATUS: std::sync::Mutex<(&'static str, Option<String>)> =
+    std::sync::Mutex::new(("idle", None));
+
 // Generated Slint UI module (ui.slint + AlarmPanel.slint). Exposes `AppWindow`
 // with the `episode-firing` property and `dismiss-requested` callback
 // (tasks 7.1–7.3).
@@ -2180,46 +2202,42 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
         }
     }
 
-    // Slice 5: Initialize weather configuration with the defaults from the
-    // loaded config (`[weather]` in config.toml / config.local.toml). The DB
-    // remains the source of truth after first boot — this only seeds initial
-    // values when the keys are absent, so a later config change does not
-    // override a city the user set via the web UI.
+    // Slice 5: Sync weather configuration from the loaded config
+    // (`[weather]` in config.toml / config.local.toml) into the persistent
+    // store on every process start. The config file is the source of truth
+    // for the weather location: any lat/lon/city in `config.toml` overrides
+    // whatever was previously persisted (e.g. a city resolved via geocoding
+    // or set through the web UI), so editing the config always takes effect
+    // on the next boot.
     //
-    // When the config provides only a city (no lat/lon), the city is seeded
+    // When the config provides only a city (no lat/lon), the city is synced
     // but the coordinates are left unset; the weather scheduler then geocodes
     // the city at boot to resolve them (see `maybe_dispatch_weather`).
     {
         if let Ok(conn_guard) = conn.lock() {
             let store = crate::database::ConfigStore::new(&*conn_guard);
+            let w = &cfg.weather;
 
-            // Check if weather city is already configured.
-            let city = store.get("weather_city").ok().flatten();
-
-            // If not configured, seed defaults from the config.
-            if city.is_none() {
-                let w = &cfg.weather;
-                let _ = store.set("weather_city", &w.city);
-                match (w.lat, w.lon) {
-                    (Some(lat), Some(lon)) => {
-                        let _ = store.set("weather_lat", &lat.to_string());
-                        let _ = store.set("weather_lon", &lon.to_string());
-                        info!(
-                            city = %w.city, lat, lon,
-                            "weather: initialized default city+coords from config"
-                        );
-                    }
-                    _ => {
-                        // City only — coordinates will be resolved by
-                        // geocoding the city at boot.
-                        info!(
-                            city = %w.city,
-                            "weather: initialized default city from config (coords will be geocoded)"
-                        );
-                    }
+            let _ = store.set("weather_city", &w.city);
+            match (w.lat, w.lon) {
+                (Some(lat), Some(lon)) => {
+                    let _ = store.set("weather_lat", &lat.to_string());
+                    let _ = store.set("weather_lon", &lon.to_string());
+                    info!(
+                        city = %w.city, lat, lon,
+                        "weather: synced city+coords from config (override every boot)"
+                    );
                 }
-            } else {
-                info!("weather: using persisted city configuration");
+                _ => {
+                    // City only — clear any previously persisted coordinates so
+                    // the scheduler geocodes the (possibly changed) city at boot.
+                    let _ = store.delete("weather_lat");
+                    let _ = store.delete("weather_lon");
+                    info!(
+                        city = %w.city,
+                        "weather: synced city from config (coords will be geocoded)"
+                    );
+                }
             }
         }
     }
@@ -2870,6 +2888,9 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
                     web_port_for_drain,
                     &ui_weak_for_drain,
                     &ui_web_sender_for_drain,
+                    &cmd_sender_for_drain,
+                    &calendar_cfg_for_drain,
+                    &calendar_state_for_drain,
                 );
             }
 
@@ -3260,13 +3281,25 @@ fn dispatch_reply_to_domain(
             }
         }
         // Slice 6: device-flow device code received — display the QR + user
-        // code on the Pi while the worker polls for consent.
+        // code on the Pi while the worker polls for consent. If a web-initiated
+        // pairing is pending, ship the device code to the web client instead
+        // (the web UI shows the verification URL + user code for the user to
+        // consent on another device).
         Reply::DeviceCode(code) => {
+            if let Some(tx) = PENDING_CALENDAR_PAIR.lock().expect("pair slot poisoned").take() {
+                let _ = tx.send(crate::web_config::WebReply::CalendarPairingCode {
+                    verification_url: code.verification_url.clone(),
+                    user_code: code.user_code.clone(),
+                });
+                return;
+            }
             info!(user_code = %code.user_code, "device code received — rendering QR");
-            let qr = crate::qr::render_qr_image(&format!(
-                "{}/?user_code={}",
-                code.verification_url, code.user_code
-            ));
+            // Encode only the verification URL in the QR. Google's device page
+            // (`google.com/device`) does not accept the user code as a query
+            // parameter — appending `?user_code=…` lands on a non-existent page.
+            // The user scans to reach the page, then types the `user_code` shown
+            // separately on the Pi (set below).
+            let qr = crate::qr::render_qr_image(&code.verification_url);
             if let Some(w) = ui_weak.upgrade() {
                 let global = w.global::<ThemeGlobal>();
                 global.set_pairing_user_code(slint::SharedString::from(code.user_code.clone()));
@@ -3283,6 +3316,7 @@ fn dispatch_reply_to_domain(
             match result {
                 Ok(refresh_token) => {
                     info!("device-flow pairing successful — persisting refresh token");
+                    let persisted_token = refresh_token.clone();
                     let saved = if let Ok(mut s) = secrets.lock() {
                         s.set_google_refresh_token(
                             refresh_token,
@@ -3298,6 +3332,10 @@ fn dispatch_reply_to_domain(
                             st.clear_pairing_in_flight();
                             st.clear_fetch_in_flight();
                         }
+                        {
+                            let mut status = CALENDAR_PAIR_STATUS.lock().expect("pair status poisoned");
+                            *status = ("paired", None);
+                        }
                         if let Some(w) = ui_weak.upgrade() {
                             let global = w.global::<ThemeGlobal>();
                             global.set_pairing_in_progress(false);
@@ -3305,20 +3343,39 @@ fn dispatch_reply_to_domain(
                             global.set_pairing_url(slint::SharedString::from(""));
                             global.set_calendar_repair_needed(false);
                         }
-                        // Trigger an immediate fetch.
-                        maybe_dispatch_calendar_fetch(
-                            cmd_tx,
-                            conn,
-                            calendar_cfg,
-                            secrets,
-                            calendar_state,
-                        );
+                        // Auto-seed the user's calendars (sets the configured
+                        // count so the Settings card flips to "Paired") and then
+                        // trigger an immediate fetch. Dispatch `ListCalendars`
+                        // rather than a bare fetch: with no calendars seeded yet
+                        // the fetch early-returns and the count would stay 0.
+                        let (client_id, client_secret) =
+                            match (&calendar_cfg.client_id, &calendar_cfg.client_secret) {
+                                (Some(id), Some(sec)) => (id.clone(), sec.clone()),
+                                _ => (String::new(), String::new()),
+                            };
+                        let _ = cmd_tx.try_send(crate::channel::Cmd::ListCalendars {
+                            refresh_token: persisted_token,
+                            client_id,
+                            client_secret,
+                            oauth_token_url: calendar_cfg.oauth_token_url.clone(),
+                            calendar_api_url: calendar_cfg.calendar_api_url.clone(),
+                        });
+                    } else {
+                        let mut status = CALENDAR_PAIR_STATUS.lock().expect("pair status poisoned");
+                        *status = ("error", Some("failed to save refresh token".into()));
                     }
                 }
                 Err(msg) => {
                     warn!(error = %msg, "device-flow pairing failed");
                     if let Ok(mut st) = calendar_state.lock() {
                         st.clear_pairing_in_flight();
+                    }
+                    if let Some(tx) = PENDING_CALENDAR_PAIR.lock().expect("pair slot poisoned").take() {
+                        let _ = tx.send(crate::web_config::WebReply::Error { message: msg.clone() });
+                    }
+                    {
+                        let mut status = CALENDAR_PAIR_STATUS.lock().expect("pair status poisoned");
+                        *status = ("error", Some(msg.clone()));
                     }
                     if let Some(w) = ui_weak.upgrade() {
                         let global = w.global::<ThemeGlobal>();
@@ -3331,6 +3388,21 @@ fn dispatch_reply_to_domain(
         // user's `primary` calendar as Agenda and the Canadian holidays
         // calendar (by id prefix) as Holiday, then trigger an immediate fetch.
         Reply::CalendarList(result) => {
+            // Web-initiated discovery: if a discover request is pending, ship
+            // the read-only list back to it instead of auto-seeding.
+            if let Some(tx) = PENDING_DISCOVERY.lock().expect("discovery slot poisoned").take() {
+                match result {
+                    Ok(list) => {
+                        let _ = tx.send(crate::web_config::WebReply::DiscoveredCalendars {
+                            calendars: list,
+                        });
+                    }
+                    Err(e) => {
+                        let _ = tx.send(crate::web_config::WebReply::Error { message: e });
+                    }
+                }
+                return;
+            }
             match result {
                 Ok(list) => {
                     info!(count = list.len(), "calendar list received — auto-seeding");
@@ -3421,6 +3493,9 @@ fn dispatch_web_cmd(
     web_port: u16,
     ui_weak: &slint::Weak<AppWindow>,
     web_sender: &crate::web_config::WebCommandSender,
+    cmd_tx: &crate::channel::CmdSender,
+    calendar_cfg: &Arc<crate::config::CalendarConfig>,
+    calendar_state: &Arc<Mutex<CalendarState>>,
 ) {
     use crate::web_config::{WebCmd, WebReply};
     let path = std::path::Path::new(secrets_path);
@@ -3527,6 +3602,141 @@ fn dispatch_web_cmd(
                 crate::alarm_store::CalendarStore::new(&*g).list().ok()
             }).unwrap_or_default();
             let _ = reply.send(WebReply::Calendars { calendars });
+        }
+        WebCmd::UpsertCalendar { calendar, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::alarm_store::CalendarStore::new(&*g).upsert(&calendar).ok()
+            }).is_some();
+            let _ = reply.send(if ok {
+                WebReply::Success
+            } else {
+                WebReply::Error { message: "upsert calendar failed".into() }
+            });
+        }
+        WebCmd::DeleteCalendar { google_calendar_id, reply } => {
+            let ok = conn.lock().ok().and_then(|g| {
+                crate::alarm_store::CalendarStore::new(&*g)
+                    .delete(&google_calendar_id)
+                    .ok()
+            }).unwrap_or(false);
+            let _ = reply.send(if ok {
+                WebReply::Success
+            } else {
+                WebReply::Error { message: "delete calendar failed (not found?)".into() }
+            });
+        }
+        WebCmd::DiscoverCalendars { reply } => {
+            // Requires an active Google pairing (refresh token) and configured
+            // OAuth credentials. Dispatch `Cmd::ListCalendars` to the tokio
+            // worker; the reply is routed back to this web reply via the shared
+            // `PENDING_DISCOVERY` slot in the `Reply::CalendarList` drain arm
+            // (read-only — no auto-seeding of calendars).
+            let refresh_token = secrets.lock().ok().and_then(|s| s.google_refresh_token.clone());
+            let (client_id, client_secret) = match (&calendar_cfg.client_id, &calendar_cfg.client_secret) {
+                (Some(id), Some(sec)) => (id.clone(), sec.clone()),
+                _ => {
+                    let _ = reply.send(WebReply::Error {
+                        message: "Google calendar pairing not configured".into(),
+                    });
+                    return;
+                }
+            };
+            let refresh_token = match refresh_token {
+                Some(t) => t,
+                None => {
+                    let _ = reply.send(WebReply::Error {
+                        message: "Google account not paired — pair on the Pi touchscreen first".into(),
+                    });
+                    return;
+                }
+            };
+            // Park the web reply sender; the drain loop fills it when the
+            // worker's `Reply::CalendarList` arrives.
+            {
+                let mut slot = PENDING_DISCOVERY.lock().expect("discovery slot poisoned");
+                *slot = Some(reply);
+            }
+            match cmd_tx.try_send(crate::channel::Cmd::ListCalendars {
+                refresh_token,
+                client_id,
+                client_secret,
+                oauth_token_url: calendar_cfg.oauth_token_url.clone(),
+                calendar_api_url: calendar_cfg.calendar_api_url.clone(),
+            }) {
+                Ok(()) => {}
+                Err(e) => {
+                    let mut slot = PENDING_DISCOVERY.lock().expect("discovery slot poisoned");
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(WebReply::Error {
+                            message: format!("could not dispatch calendar discovery: {e}"),
+                        });
+                    }
+                }
+            }
+        }
+        WebCmd::PairCalendar { reply } => {
+            // Start Google OAuth2 device-flow pairing from the web UI. Dispatch
+            // `Cmd::PairDeviceFlow` to the tokio worker; the worker emits
+            // `Reply::DeviceCode` (parked into `PENDING_CALENDAR_PAIR` for this
+            // web reply, which the drain arm turns into `CalendarPairingCode`)
+            // and later `Reply::DeviceFlowResult` (which persists the token and
+            // updates `CALENDAR_PAIR_STATUS` for the status poll).
+            if calendar_state.lock().map(|s| s.pairing_in_flight() || s.fetch_in_flight()).unwrap_or(false) {
+                let _ = reply.send(WebReply::Error {
+                    message: "A calendar pairing or fetch is already in progress".into(),
+                });
+                return;
+            }
+            let (client_id, client_secret) = match (&calendar_cfg.client_id, &calendar_cfg.client_secret) {
+                (Some(id), Some(sec)) => (id.clone(), sec.clone()),
+                _ => {
+                    let _ = reply.send(WebReply::Error {
+                        message: "Google calendar pairing not configured on this device".into(),
+                    });
+                    return;
+                }
+            };
+            {
+                let mut status = CALENDAR_PAIR_STATUS.lock().expect("pair status poisoned");
+                *status = ("pending", None);
+            }
+            {
+                let mut slot = PENDING_CALENDAR_PAIR.lock().expect("pair slot poisoned");
+                *slot = Some(reply);
+            }
+            if let Ok(mut st) = calendar_state.lock() {
+                st.mark_pairing_in_flight();
+            }
+            match cmd_tx.try_send(crate::channel::Cmd::PairDeviceFlow {
+                client_id,
+                client_secret,
+                oauth_device_url: calendar_cfg.oauth_device_url.clone(),
+                oauth_token_url: calendar_cfg.oauth_token_url.clone(),
+            }) {
+                Ok(()) => {
+                    info!("calendar: web-initiated device-flow pairing dispatched");
+                }
+                Err(e) => {
+                    if let Ok(mut st) = calendar_state.lock() {
+                        st.clear_pairing_in_flight();
+                    }
+                    let mut slot = PENDING_CALENDAR_PAIR.lock().expect("pair slot poisoned");
+                    if let Some(tx) = slot.take() {
+                        let _ = tx.send(WebReply::Error {
+                            message: format!("could not dispatch pairing: {e}"),
+                        });
+                    }
+                    let mut status = CALENDAR_PAIR_STATUS.lock().expect("pair status poisoned");
+                    *status = ("error", Some(format!("could not dispatch pairing: {e}")));
+                }
+            }
+        }
+        WebCmd::CalendarPairStatus { reply } => {
+            let status = CALENDAR_PAIR_STATUS.lock().expect("pair status poisoned").clone();
+            let _ = reply.send(WebReply::CalendarPairStatus {
+                pair_status: status.0.to_string(),
+                message: status.1,
+            });
         }
         WebCmd::SetWeatherCity { city, reply } => {
             let ok = conn.lock().ok().and_then(|g| {

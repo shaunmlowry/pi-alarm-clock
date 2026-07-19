@@ -241,27 +241,12 @@ impl<'a> ConfigStore<'a> {
         Ok(())
     }
 
-    /// Execute multiple key-value writes inside a single transaction.
-    ///
-    /// If any statement fails the **entire** transaction rolls back, leaving
-    /// the database unchanged. This satisfies PRD § D3: *"multi-statement
-    /// mutations roll back on partial failure."*
-    pub fn set_multi(&self, pairs: &[(&str, &str)]) -> DomainResult<()> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(ConfigError::Database)?;
-
-        for (k, v) in pairs {
-            tx.execute(
-                "INSERT OR REPLACE INTO kv_config (key, value) VALUES (?, ?)",
-                [k, v],
-            )
-            .map_err(ConfigError::Database)?;
-        }
-
-        tx.commit().map_err(ConfigError::Database)?;
-        Ok(())
+    /// Remove *key* from the store (a no-op if it does not exist).
+    pub fn delete(&self, key: &str) -> DomainResult<()> {
+        self.conn
+            .execute("DELETE FROM kv_config WHERE key = ?", [key])
+            .map(|_| ())
+            .map_err(ConfigError::Database)
     }
 }
 
