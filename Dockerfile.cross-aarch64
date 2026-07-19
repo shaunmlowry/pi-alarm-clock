@@ -1,0 +1,14 @@
+FROM ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main
+
+# Enable multi-arch support for arm64 in apt
+RUN dpkg --add-architecture arm64 &&     apt-get update &&     apt-get install -y --no-install-recommends qemu-user-static
+
+# Install SLint runtime dependencies and development headers for aarch64.
+# OpenSSL is NOT required: reqwest uses rustls-tls (see alarm-clock/Cargo.toml),
+# so the binary carries no libssl dependency and runs on any Pi OpenSSL version.
+RUN apt-get update && apt-get install -y --no-install-recommends     curl     pkg-config     libfontconfig1-dev:arm64     libfreetype6-dev:arm64     libwayland-dev:arm64     libegl1-mesa-dev:arm64     libgbm-dev:arm64     libinput-dev:arm64     libglib2.0-dev:arm64     libxkbcommon-dev:arm64     build-essential     ca-certificates     && rm -rf /var/lib/apt/lists/*
+
+# NOTE: Do NOT install a separate Rust toolchain here. `cross` provides and
+# mounts its own Rust toolchain (matching the project's `.rust-toolchain`
+# pin) into the container, so a second rustup install is redundant and can
+# drift from the pinned version.
