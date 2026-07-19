@@ -96,14 +96,54 @@ component ClockPanel inherits Rectangle {
 
         Card {
             title: "Up Next";
-            height: 72px;
-            Text {
-                text: "Next event slot — populated by calendar slice";
-                font-size: 14px;
-                color: ThemeGlobal.text-color;
-                font-family: ThemeGlobal.font-family;
-                opacity: 0.6;
-                wrap: word-wrap;
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+                alignment: start;
+
+                // Fallback when no agenda data is available.
+                Text {
+                    text: "No agenda";
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    opacity: 0.6;
+                    visible: !ThemeGlobal.agenda_available;
+                }
+
+                // Up to 4 agenda items (cap 4); past events are dimmed.
+                Text {
+                    text: "• " + ThemeGlobal.agenda_item0;
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    opacity: ThemeGlobal.agenda_past0 ? 0.4 : 1.0;
+                    visible: ThemeGlobal.agenda_count > 0;
+                }
+                Text {
+                    text: "• " + ThemeGlobal.agenda_item1;
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    opacity: ThemeGlobal.agenda_past1 ? 0.4 : 1.0;
+                    visible: ThemeGlobal.agenda_count > 1;
+                }
+                Text {
+                    text: "• " + ThemeGlobal.agenda_item2;
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    opacity: ThemeGlobal.agenda_past2 ? 0.4 : 1.0;
+                    visible: ThemeGlobal.agenda_count > 2;
+                }
+                Text {
+                    text: "• " + ThemeGlobal.agenda_item3;
+                    font-size: 14px;
+                    color: ThemeGlobal.text-color;
+                    font-family: ThemeGlobal.font-family;
+                    opacity: ThemeGlobal.agenda_past3 ? 0.4 : 1.0;
+                    visible: ThemeGlobal.agenda_count > 3;
+                }
             }
         }
     }
