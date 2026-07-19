@@ -372,7 +372,6 @@ component SettingsPanel inherits Rectangle {
 
         Card {
             title: "Theme";
-            height: 96px;
             tappable: true;
             tapped => { root.theme-tapped(); }
 
@@ -384,7 +383,6 @@ component SettingsPanel inherits Rectangle {
 
         Card {
             title: "Mode";
-            height: 96px;
             tappable: true;
             tapped => { root.mode-tapped(); }
 
@@ -395,8 +393,42 @@ component SettingsPanel inherits Rectangle {
         }
 
         Card {
+            title: "Alarms";
+            InfoRow { label: "Active Alarms"; value: "—"; }
+            InfoRow { label: "Next Alarm"; value: "—"; }
+        }
+
+        Card {
+            title: "Display";
+            InfoRow { label: "Brightness"; value: "Auto (75%)"; }
+            InfoRow { label: "Bedtime"; value: "10:00 PM - 6:00 AM"; }
+        }
+    }
+}
+
+// ── Advanced Panel ───────────────────────────────────────────────────────
+component AdvancedPanel inherits Rectangle {
+    callback pair-calendars-tapped();
+
+    VerticalLayout {
+        width: root.width;
+        height: root.height;
+        padding: 12px;
+        spacing: 14px;
+        alignment: start;
+
+        PanelTabs {}
+
+        Text {
+            text: "Advanced";
+            font-size: 22px;
+            color: ThemeGlobal.text-color;
+            font-family: ThemeGlobal.font-family;
+            horizontal-alignment: center;
+        }
+
+        Card {
             title: "Calendars";
-            height: 180px;
             tappable: true;
             tapped => { root.pair-calendars-tapped(); }
 
@@ -455,20 +487,6 @@ component SettingsPanel inherits Rectangle {
                     }
                 }
             }
-        }
-
-        Card {
-            title: "Alarms";
-            height: 96px;
-            InfoRow { label: "Active Alarms"; value: "—"; }
-            InfoRow { label: "Next Alarm"; value: "—"; }
-        }
-
-        Card {
-            title: "Display";
-            height: 96px;
-            InfoRow { label: "Brightness"; value: "Auto (75%)"; }
-            InfoRow { label: "Bedtime"; value: "10:00 PM - 6:00 AM"; }
         }
     }
 }
@@ -546,6 +564,8 @@ component PanelContainer {
     if ThemeGlobal.current-panel == 3: SettingsPanel {
         theme-tapped => { root.theme-tapped(); }
         mode-tapped => { root.mode-tapped(); }
+    }
+    if ThemeGlobal.current-panel == 4: AdvancedPanel {
         pair-calendars-tapped => { root.pair-calendars-tapped(); }
     }
 }
@@ -580,7 +600,7 @@ export component AppWindow inherits Window {
         height: parent.height;
         visible: !root.episode-firing;
         swipe-enabled: !root.episode-firing;
-        max-panels: 4;
+        max-panels: 5;
         theme-tapped => { root.theme-tapped(); }
         mode-tapped => { root.mode-tapped(); }
         pair-calendars-tapped => { root.pair-calendars-tapped(); }

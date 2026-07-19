@@ -3,6 +3,7 @@ openspec/changes/*/.apply/
 
 # build
 target/**
+dist/**
 
 # temp data
 data/
