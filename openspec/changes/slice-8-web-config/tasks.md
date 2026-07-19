@@ -9,13 +9,13 @@
 
 - [x] 2.1 Bearer-token middleware (stateless); reject 401 without a valid token.
 - [x] 2.2 Generate self-signed cert at first boot (`rcgen`), store in `tls/` (0600); serve axum over TLS (rustls).
-- [x] 2.3 Encode `token` + `fp` in the pairing QR (`https://alarm.local:port/#token=...&fp=...`); the fingerprint is for manual user verification only (v1 does NOT perform in-browser programmatic pinning — v1 relies on network segmentation + browser TOFU). Document this v1 limitation.
+- [x] 2.3 Encode `token` + `fp` in the pairing QR (`https://pialarm.local:port/#token=...&fp=...`); the fingerprint is for manual user verification only (v1 does NOT perform in-browser programmatic pinning — v1 relies on network segmentation + browser TOFU). Document this v1 limitation.
 - [x] 2.4 Revoke & re-pair: rotate bearer token, invalidate old, show new QR.
 - [x] 2.5 Unit-test: bearer rejection; revoke invalidates; cert generation + 0600 mode.
 
 ## 3. mDNS discovery & IP fallback (alarm-clock/src/web/mdns.rs, ui.slint)
 
-- [x] 3.1 Advertise `alarm.local` via `mdns-sd` on the tokio worker.
+- [x] 3.1 Advertise `pialarm.local` via `mdns-sd` on the tokio worker.
 - [x] 3.2 Show current IP URL on the Pi pairing screen for manual fallback.
 - [x] 3.3 Unit-test: mDNS advertisement registers the service.
 

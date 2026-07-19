@@ -449,6 +449,7 @@ component SettingsPanel inherits Rectangle {
 // ── Advanced Panel ───────────────────────────────────────────────────────
 component AdvancedPanel inherits Rectangle {
     callback pair-calendars-tapped();
+    callback pair-web-tapped();
 
     VerticalLayout {
         width: root.width;
@@ -528,6 +529,63 @@ component AdvancedPanel inherits Rectangle {
                 }
             }
         }
+
+        Card {
+            title: "Web Config";
+            tappable: true;
+            tapped => { root.pair-web-tapped(); }
+
+            VerticalLayout {
+                padding: 8px;
+                spacing: 6px;
+                alignment: start;
+
+                InfoRow {
+                    label: "Web Pairing";
+                    value: ThemeGlobal.web_pairing_in_progress ? "Tap to show QR · scan with phone" : "Tap to pair";
+                }
+
+                // QR (token + cert fingerprint) and IP fallback URL shown while
+                // web pairing is in progress (slice 8, tasks 2.3 + 3.2).
+                HorizontalLayout {
+                    padding: 0px;
+                    spacing: 12px;
+                    alignment: start;
+                    visible: ThemeGlobal.web_pairing_in_progress;
+
+                    Image {
+                        source: ThemeGlobal.web_pairing_qr_image;
+                        image-fit: contain;
+                        width: 128px;
+                        height: 128px;
+                    }
+                    VerticalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        Text {
+                            text: "Scan to pair:";
+                            font-size: 13px;
+                            color: ThemeGlobal.text-color;
+                            font-family: ThemeGlobal.font-family;
+                        }
+                        Text {
+                            text: ThemeGlobal.web_pairing_url;
+                            font-size: 12px;
+                            color: ThemeGlobal.text-color;
+                            font-family: ThemeGlobal.font-family;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "IP fallback: " + ThemeGlobal.web_pairing_ip_url;
+                            font-size: 12px;
+                            color: ThemeGlobal.text-color;
+                            font-family: ThemeGlobal.font-family;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -545,6 +603,7 @@ component PanelContainer {
     callback theme-tapped();
     callback mode-tapped();
     callback pair-calendars-tapped();
+    callback pair-web-tapped();
     callback quick-controls-requested();
     callback favorite-tapped(int);
     callback episode-tapped(string);
@@ -607,6 +666,7 @@ component PanelContainer {
     }
     if ThemeGlobal.current-panel == 4: AdvancedPanel {
         pair-calendars-tapped => { root.pair-calendars-tapped(); }
+        pair-web-tapped => { root.pair-web-tapped(); }
     }
 }
 
@@ -627,6 +687,7 @@ export component AppWindow inherits Window {
     callback theme-tapped();
     callback mode-tapped();
     callback pair-calendars-tapped();
+    callback pair-web-tapped();
     callback quick-controls-requested();
     callback favorite-tapped(int);
     callback episode-tapped(string);
@@ -644,6 +705,7 @@ export component AppWindow inherits Window {
         theme-tapped => { root.theme-tapped(); }
         mode-tapped => { root.mode-tapped(); }
         pair-calendars-tapped => { root.pair-calendars-tapped(); }
+        pair-web-tapped => { root.pair-web-tapped(); }
         quick-controls-requested => { root.quick-controls-requested(); }
         favorite-tapped(idx) => { root.favorite-tapped(idx); }
         episode-tapped(uri) => { root.episode-tapped(uri); }

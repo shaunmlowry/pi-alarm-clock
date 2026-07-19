@@ -4,7 +4,7 @@ Slice 0 bound axum but served nothing. Slice 8 makes the web a real config clien
 
 ## Goals / Non-Goals
 
-**Goals:** REST API over the domain (Cmd→Reply); bearer/QR auth; self-signed TLS + fingerprint pin; mDNS `alarm.local` + IP fallback; SPA config-split; revoke & re-pair; config-only.
+**Goals:** REST API over the domain (Cmd→Reply); bearer/QR auth; self-signed TLS + fingerprint pin; mDNS `pialarm.local` + IP fallback; SPA config-split; revoke & re-pair; config-only.
 
 **Non-Goals:** live media control / alarm dismiss-snooze from web (v2); remote access / Let's Encrypt (v2); custom-theme upload UI (v2); a WS event channel (v2).
 
@@ -16,13 +16,13 @@ Every axum handler serializes a `Cmd`, sends it over the `CmdSender`, and awaits
 **Rationale.** The alternative (a `Mutex<Connection>` shared with axum) breaks the single-threaded DB model and reintroduces the contention slice 0 avoided. The channel pattern is already proven for the Mopidy path.
 
 ### D2. Pairing QR carries token + fingerprint; v1 security is network segmentation + TOFU
-The QR encodes `https://alarm.local:port/#token=<bearer>&fp=<sha256-of-cert>`. The token is used programmatically; the fingerprint is shown for **manual user verification** only. **In-browser programmatic TLS-fingerprint pinning is deferred to v2** — browsers don't expose raw cert bytes to `fetch`, making true pinning non-trivial. v1 relies on **network segmentation** (the LAN is the trust boundary) plus the browser's trust-on-first-use self-signed-cert acceptance. The PRD's "MITM-resistant on untrusted WiFi" goal is acknowledged as a v2 open question; v1 documents the network-segmentation assumption.
+The QR encodes `https://pialarm.local:port/#token=<bearer>&fp=<sha256-of-cert>`. The token is used programmatically; the fingerprint is shown for **manual user verification** only. **In-browser programmatic TLS-fingerprint pinning is deferred to v2** — browsers don't expose raw cert bytes to `fetch`, making true pinning non-trivial. v1 relies on **network segmentation** (the LAN is the trust boundary) plus the browser's trust-on-first-use self-signed-cert acceptance. The PRD's "MITM-resistant on untrusted WiFi" goal is acknowledged as a v2 open question; v1 documents the network-segmentation assumption.
 
 ### D3. Self-signed cert via rcgen at first boot
 `rcgen` generates a self-signed cert + key at first boot, written to `tls/` (0600). axum serves TLS via `axum-server` + `rustls`. No Let's Encrypt (wrong tool for a LAN appliance; remote access is v2).
 
 ### D4. mDNS via mdns-sd
-`mdns-sd` advertises `alarm.local` on the tokio worker. The Pi screen shows the IP URL as fallback (queried from the OS). After first pairing, the phone uses `localStorage` — repeat visits don't re-scan.
+`mdns-sd` advertises `pialarm.local` on the tokio worker. The Pi screen shows the IP URL as fallback (queried from the OS). After first pairing, the phone uses `localStorage` — repeat visits don't re-scan.
 
 ### D5. SPA framework: minimal
 Vanilla JS or a tiny framework (Preact/similar) — the SPA is a config form surface, not an app. Served as a static bundle by axum. The complex RRULE builder is the most involved piece; everything else is CRUD forms over the REST API.

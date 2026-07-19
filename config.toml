@@ -22,8 +22,10 @@ db_path = "./data/alarm-clock.db"
 mopidy_ws_url = "ws://localhost:6680/mopidy/ws"
 
 # axum HTTP server bind address.
+# Must bind to a LAN-reachable interface (0.0.0.0) for phones to pair over
+# WiFi — 127.0.0.1 only accepts connections from the Pi itself.
 # default: 127.0.0.1:8080
-axum_bind_addr = "127.0.0.1:8080"
+axum_bind_addr = "0.0.0.0:8080"
 
 # tracing log level directive.
 # default: info

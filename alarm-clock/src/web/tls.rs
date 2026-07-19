@@ -39,10 +39,22 @@ impl TlsCert {
     /// Load an existing certificate from disk or generate a new self-signed one.
     ///
     /// On first boot the `<data_dir>/tls/` directory does not exist; a fresh
-    /// ECDSA P-256 certificate for `alarm.local` (and a few common LAN aliases)
-    /// is generated and written with mode 0600. On subsequent boots the existing
-    /// files are reused so the fingerprint stays stable.
+    /// ECDSA P-256 certificate for `pialarm.local` (and a few common LAN aliases)
+    /// is generated and written with mode 0600. `lan_ip`, when provided, is also
+    /// added as a Subject Alternative Name so the self-signed cert is valid when
+    /// the phone connects via the IP fallback URL (`https://<lan_ip>:<port>/…`)
+    /// rather than the mDNS hostname. On subsequent boots the existing files are
+    /// reused so the fingerprint stays stable.
     pub fn ensure(data_dir: &Path) -> Result<Self, String> {
+        Self::ensure_with_lan_ip(data_dir, None)
+    }
+
+    /// Like [`Self::ensure`] but allows the LAN IP to be baked into the cert's
+    /// SANs at first-boot generation (see its doc comment for why).
+    pub fn ensure_with_lan_ip(
+        data_dir: &Path,
+        lan_ip: Option<&str>,
+    ) -> Result<Self, String> {
         let cert_path = Self::cert_path(data_dir);
         let key_path = Self::key_path(data_dir);
 
@@ -59,10 +71,15 @@ impl TlsCert {
             .map_err(|e| format!("failed to create tls dir: {e}"))?;
 
         let mut params = CertificateParams::new(vec![
-            "alarm.local".to_string(),
+            "pialarm.local".to_string(),
             "localhost".to_string(),
             "127.0.0.1".to_string(),
         ]);
+        if let Some(ip) = lan_ip {
+            params.subject_alt_names.push(rcgen::SanType::IpAddress(ip.parse().map_err(
+                |e| format!("invalid LAN IP for cert SAN: {e}"),
+            )?));
+        }
         params.distinguished_name.push(
             rcgen::DnType::CommonName,
             rcgen::DnValue::Utf8String("Pi Alarm Clock".to_string()),
@@ -213,11 +230,22 @@ mod tests {
     }
 
     #[test]
-    fn rustls_config_loads() {
+    fn lan_ip_added_to_sans_on_first_boot() {
         let dir = temp_data_dir();
-        let cert = TlsCert::ensure(&dir).unwrap();
-        let config = rustls_server_config(&cert.cert_pem, &cert.key_pem);
-        assert!(config.is_ok(), "{config:?}");
+        let cert = TlsCert::ensure_with_lan_ip(&dir, Some("10.0.1.61"))
+            .expect("ensure should generate cert");
+        // Decode the PEM to DER and look for the LAN IP as a DER-encoded
+        // IPAddress SAN (4 octets: 0a 00 01 3d) so the IP fallback URL
+        // (https://<ip>:<port>/…) validates without a hostname mismatch.
+        let der = rustls_pemfile::certs(&mut cert.cert_pem.as_slice())
+            .filter_map(|r| r.ok())
+            .collect::<Vec<_>>()
+            .pop()
+            .expect("at least one cert");
+        assert!(
+            der.as_ref().windows(4).any(|w| w == [0x0a, 0x00, 0x01, 0x3d]),
+            "LAN IP 10.0.1.61 should be in cert SANs"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

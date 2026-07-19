@@ -1976,10 +1976,10 @@ fn spawn_tokio_worker(
                     info!("TLS certificate unavailable — axum web server not started");
                 }
 
-                // Slice 8: advertise `alarm.local` over mDNS.
-                let _mdns = match crate::web::mdns::advertise_alarm_local(axum_bind_addr.port()) {
+                // Slice 8: advertise `pialarm.local` over mDNS.
+                let _mdns = match crate::web::mdns::advertise_pialarm_local(axum_bind_addr.port()) {
                     Ok(daemon) => {
-                        info!("mDNS advertisement started for alarm.local");
+                        info!("mDNS advertisement started for pialarm.local");
                         Some(daemon)
                     }
                     Err(e) => {
@@ -2065,12 +2065,18 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
 
     // Slice 8: web config channel (tokio → main) and TLS certificate.
     let (web_sender, mut web_cmd_rx) = crate::web_config::create_web_channels();
+    // Clone kept on the main thread for UI-initiated pairing (Pi "Pair Web"
+    // button); the original is moved into the tokio worker below.
+    let ui_web_sender = web_sender.clone();
     let axum_bind_addr: std::net::SocketAddr = cfg
         .axum_bind_addr
         .parse()
         .expect("invalid axum_bind_addr in config");
     let web_port = axum_bind_addr.port();
-    let tls_cert = match crate::web::tls::TlsCert::ensure(std::path::Path::new(&cfg.data_dir)) {
+    let tls_cert = match crate::web::tls::TlsCert::ensure_with_lan_ip(
+        std::path::Path::new(&cfg.data_dir),
+        crate::web_config::local_ip().as_deref(),
+    ) {
         Ok(cert) => {
             info!(fingerprint = %cert.fingerprint(), "TLS certificate ready");
             Some(cert)
@@ -2143,6 +2149,14 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
             }
         }
     };
+
+    // Slice 8: seed the web server's bearer-token cache from `secrets.json` at
+    // startup so a previously-paired phone (token in localStorage) is accepted
+    // without re-scanning the QR.
+    if let Some(token) = secrets.lock().ok().and_then(|s| s.web_bearer_token.clone()) {
+        ui_web_sender.set_bearer_token_blocking(token);
+        info!("restored web bearer token from secrets.json");
+    }
 
     // Slice 4 / task 3.3: load persisted bedtime config and brightness floor.
     {
@@ -2368,6 +2382,26 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
                     }
                 }
             });
+        });
+    }
+
+    // Slice 8: Settings → Advanced → tap "Web Config" to generate a pairing
+    // QR on the Pi screen. The phone scans it (token + cert fingerprint) to
+    // pair. We only send `WebCmd::Pair`; the existing main-thread
+    // `dispatch_web_cmd` (reached via the main loop's `web_cmd_rx.try_recv`)
+    // generates the token, renders the QR, and pushes it to the Slint globals.
+    // This runs on the Slint UI thread, so it must NOT touch the Tokio runtime.
+    {
+        let web_sender_ref = ui_web_sender.clone();
+        app_window.on_pair_web_tapped(move || {
+            if web_sender_ref
+                .try_send(crate::web_config::WebCmd::Pair {
+                    reply: tokio::sync::oneshot::channel().0,
+                })
+                .is_err()
+            {
+                warn!("web: could not dispatch WebCmd::Pair (channel closed)");
+            }
         });
     }
 
@@ -2793,6 +2827,7 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
     let ui_weak_for_drain = app_window.as_weak();
     let tls_cert_for_drain = tls_cert.clone();
     let web_port_for_drain = web_port;
+    let ui_web_sender_for_drain = ui_web_sender.clone();
 
     let timer = slint::Timer::default();
     timer.start(slint::TimerMode::Repeated, Duration::from_millis(50), move || {
@@ -2834,6 +2869,7 @@ pub fn bootstrap(conn: SharedConnection) -> (JoinHandle<()>, AppWindow, AppTimer
                     tls_cert_for_drain.as_ref().map(|c| c.fingerprint()).unwrap_or_default(),
                     web_port_for_drain,
                     &ui_weak_for_drain,
+                    &ui_web_sender_for_drain,
                 );
             }
 
@@ -3384,6 +3420,7 @@ fn dispatch_web_cmd(
     fingerprint: String,
     web_port: u16,
     ui_weak: &slint::Weak<AppWindow>,
+    web_sender: &crate::web_config::WebCommandSender,
 ) {
     use crate::web_config::{WebCmd, WebReply};
     let path = std::path::Path::new(secrets_path);
@@ -3397,10 +3434,22 @@ fn dispatch_web_cmd(
                 .and_then(|mut s| s.set_web_bearer_token(token.clone(), path).ok())
                 .is_some();
             if saved {
-                let url = crate::web_config::pairing_url("alarm.local", web_port, &token, &fingerprint);
+                // Activate the token immediately so the QR's token is accepted
+                // by the auth middleware without the phone first hitting
+                // `/api/pair`. (The SPA never calls `/api/pair`; it reads the
+                // token from the URL and goes straight to protected endpoints.)
+                let _ = web_sender.set_bearer_token_blocking(token.clone());
+                info!(token = %token, "web bearer token activated");
+                let url = crate::web_config::pairing_url("pialarm.local", web_port, &token, &fingerprint);
                 let ip_url = crate::web_config::ip_pairing_url(web_port, &token, &fingerprint);
+                // Encode the IP URL in the QR: mDNS `.local` resolution is
+                // unreliable on phones (no built-in resolver on Android, blocked
+                // on many guest networks), so the IP is what actually connects.
+                // The `pialarm.local` URL is shown as secondary text for setups
+                // where mDNS does work.
+                let qr_url = ip_url.clone().unwrap_or_else(|| url.clone());
                 info!(url = %url, ip_url = ?ip_url, "web pairing initiated");
-                if let Some(img) = crate::qr::render_qr_image(&url) {
+                if let Some(img) = crate::qr::render_qr_image(&qr_url) {
                     if let Some(w) = ui_weak.upgrade() {
                         let global = w.global::<crate::ThemeGlobal>();
                         global.set_web_pairing_qr_image(img);

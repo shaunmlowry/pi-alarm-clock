@@ -38,7 +38,7 @@ pub const RELEASE_LOCAL_CONFIG_PATH: &str = "/etc/alarm-clock/config.local.toml"
 
 pub const DEFAULT_DB_PATH: &str = "./data/alarm-clock.db";
 pub const DEFAULT_MOPIDY_WS_URL: &str = "ws://localhost:6680/mopidy/ws";
-pub const DEFAULT_AXUM_BIND_ADDR: &str = "127.0.0.1:8080";
+pub const DEFAULT_AXUM_BIND_ADDR: &str = "0.0.0.0:8080";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_DATA_DIR: &str = "./data";
 

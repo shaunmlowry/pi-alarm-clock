@@ -1,20 +1,21 @@
 //! mDNS discovery for the embedded web config server (slice 8).
 //!
-//! Advertises `alarm.local` as a `_https._tcp` service on the tokio worker so
-//! phones on the same LAN can discover the Pi without knowing its IP address.
+//! Advertises `pialarm.local` as a `_https._tcp` service on the tokio worker
+//! so phones on the same LAN can discover the Pi without knowing its IP
+//! address.
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 
-/// Start advertising `alarm.local` over mDNS.
+/// Start advertising `pialarm.local` over mDNS.
 ///
 /// Returns the mDNS daemon handle so the caller can keep it alive for the
 /// lifetime of the application. Dropping the daemon stops the advertisement.
-pub fn advertise_alarm_local(port: u16) -> Result<ServiceDaemon, String> {
+pub fn advertise_pialarm_local(port: u16) -> Result<ServiceDaemon, String> {
     let mdns = ServiceDaemon::new().map_err(|e| format!("failed to create mDNS daemon: {e}"))?;
 
     let service_type = "_https._tcp.local.";
-    let instance_name = "alarm";
-    let host_name = "alarm.local.";
+    let instance_name = "pialarm";
+    let host_name = "pialarm.local.";
 
     let service = ServiceInfo::new(
         service_type,
@@ -40,7 +41,7 @@ mod tests {
 
     #[test]
     fn mdns_advertisement_starts() {
-        let daemon = advertise_alarm_local(8443);
+        let daemon = advertise_pialarm_local(8443);
         assert!(daemon.is_ok(), "mDNS advertisement should start");
         // The daemon handle is dropped here, unregistering the service.
     }

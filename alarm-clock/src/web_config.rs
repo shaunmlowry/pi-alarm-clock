@@ -231,6 +231,12 @@ impl WebCommandSender {
         *self.bearer_token.write().await = Some(token);
     }
 
+    /// Synchronous variant of [`Self::set_bearer_token`] for callers that run
+    /// outside an async runtime (main thread, UI callbacks).
+    pub fn set_bearer_token_blocking(&self, token: String) {
+        *self.bearer_token.blocking_write() = Some(token);
+    }
+
     /// Clear the cached bearer token (called after a successful revoke).
     pub async fn clear_bearer_token(&self) {
         *self.bearer_token.write().await = None;
@@ -239,6 +245,13 @@ impl WebCommandSender {
     /// Read the cached bearer token.
     pub async fn bearer_token(&self) -> Option<String> {
         self.bearer_token.read().await.clone()
+    }
+
+    /// Non-blocking send of a `WebCmd`, used by UI callbacks that run outside
+    /// the async handler path (e.g. the Pi "Pair Web" button). Returns an error
+    /// if the channel is full or closed.
+    pub fn try_send(&self, cmd: WebCmd) -> Result<(), tokio::sync::mpsc::error::TrySendError<WebCmd>> {
+        self.sender.try_send(cmd)
     }
 }
 
@@ -1012,8 +1025,8 @@ mod tests {
 
     #[test]
     fn pairing_url_includes_token_and_fingerprint() {
-        let url = pairing_url("alarm.local", 8443, "abc123", "de:ad:be:ef");
-        assert!(url.starts_with("https://alarm.local:8443/#"));
+        let url = pairing_url("pialarm.local", 8443, "abc123", "de:ad:be:ef");
+        assert!(url.starts_with("https://pialarm.local:8443/#"));
         assert!(url.contains("token=abc123"));
         assert!(url.contains("fp=de:ad:be:ef"));
     }

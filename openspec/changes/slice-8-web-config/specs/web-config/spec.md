@@ -16,7 +16,7 @@ The application SHALL authenticate web requests with a shared bearer token, pair
 
 #### Scenario: First pairing shows a QR
 - **WHEN** the user opens Settings → Web/pairing on the Pi and initiates pairing
-- **THEN** a QR encoding `https://alarm.local:port/#token=...&fp=...` is displayed
+- **THEN** a QR encoding `https://pialarm.local:port/#token=...&fp=...` is displayed
 
 #### Scenario: Bearer required for all config endpoints
 - **WHEN** a web request lacks a valid bearer token
@@ -38,11 +38,11 @@ The application SHALL generate a self-signed TLS certificate at first boot (priv
 - **THEN** the browser presents a self-signed-cert warning, the user accepts it (trust-on-first-use), and the QR-carried fingerprint is available for manual verification; programmatic fingerprint pinning is not performed in v1
 
 ### Requirement: mDNS discovery with IP fallback
-The application SHALL advertise `alarm.local` via mDNS (`mdns-sd`). The Pi screen SHALL also show the current IP URL for manual fallback on platforms that don't resolve `.local`.
+The application SHALL advertise `pialarm.local` via mDNS (`mdns-sd`). The Pi screen SHALL also show the current IP URL for manual fallback on platforms that don't resolve `.local`.
 
 #### Scenario: Phone discovers the Pi via mDNS
 - **WHEN** the phone is on the same LAN and the Pi is advertising
-- **THEN** `alarm.local` resolves to the Pi
+- **THEN** `pialarm.local` resolves to the Pi
 
 #### Scenario: IP fallback shown on the Pi
 - **WHEN** the user opens the pairing screen

@@ -228,8 +228,8 @@ Bedtime requires an explicit toggle to disable; a brightness override does **not
 * No Let's Encrypt (wrong tool for a LAN appliance; noted as a future "remote access" path).
 
 #### Discovery
-* **mDNS advertisement** (`alarm.local`) via `avahi`/`mdns-sd` — primary, durable across IP changes on supporting platforms.
-* **Pairing QR** encodes `https://alarm.local:port/#token=...&fp=...` — scanned once on the phone.
+* **mDNS advertisement** (`pialarm.local`) via `avahi`/`mdns-sd` — primary, durable across IP changes on supporting platforms.
+* **Pairing QR** encodes `https://pialarm.local:port/#token=...&fp=...` — scanned once on the phone.
 * Pi screen also shows the **current IP URL** for manual fallback (platforms that don't resolve `.local`).
 * After first pairing, the phone stores token + pinned fingerprint in SPA local storage; repeat visits don't require re-scanning.
 
